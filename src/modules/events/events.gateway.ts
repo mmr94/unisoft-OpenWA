@@ -230,15 +230,8 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   }
 
   /**
-   * Emit message ack (delivery/read receipt) notification.
+   * Emit message acknowledgment (delivery/read receipt).
    * ack: 1 sent (✓), 2 delivered (✓✓), 3 read (✓✓ blue), 4 played.
-   */
-  emitMessageAck(sessionId: string, messageId: string, ack: number) {
-    this.emitToRooms(sessionId, 'message.ack', { messageId, ack });
-  }
-
-  /**
-   * Emit message acknowledgment
    */
   emitMessageAck(sessionId: string, data: { messageId: string; ack: number; ackName: string }) {
     this.emitToRooms(sessionId, 'message.ack', data);

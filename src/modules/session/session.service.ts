@@ -352,14 +352,23 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
       // 1 envoyé serveur (✓), 2 reçu appareil (✓✓), 3 lu (✓✓ bleu), 4 audio écouté.
       // Dispatché aux webhooks abonnés à 'message.ack' + temps réel WebSocket.
       onMessageAck: (messageId: string, ack: number): void => {
-        this.logger.debug(`Message ack ${ack} for ${messageId}`, {
+        const ackNames: Record<number, string> = {
+          [-1]: 'error',
+          0: 'pending',
+          1: 'sent',
+          2: 'delivered',
+          3: 'read',
+          4: 'played',
+        };
+        const ackName = ackNames[ack] || 'unknown';
+        this.logger.debug(`Message ack ${ack} (${ackName}) for ${messageId}`, {
           sessionId: id,
           messageId,
           ack,
           action: 'message_ack',
         });
-        void this.webhookService.dispatch(id, 'message.ack', { messageId, ack });
-        this.eventsGateway.emitMessageAck(id, messageId, ack);
+        void this.webhookService.dispatch(id, 'message.ack', { messageId, ack, ackName });
+        this.eventsGateway.emitMessageAck(id, { messageId, ack, ackName });
       },
     });
 
