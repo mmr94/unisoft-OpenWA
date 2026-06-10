@@ -348,6 +348,19 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
           void this.updateStatus(id, newStatus);
         }
       },
+      // Accusés de réception/lecture (delivery receipts). ack : -1 erreur, 0 pending,
+      // 1 envoyé serveur (✓), 2 reçu appareil (✓✓), 3 lu (✓✓ bleu), 4 audio écouté.
+      // Dispatché aux webhooks abonnés à 'message.ack' + temps réel WebSocket.
+      onMessageAck: (messageId: string, ack: number): void => {
+        this.logger.debug(`Message ack ${ack} for ${messageId}`, {
+          sessionId: id,
+          messageId,
+          ack,
+          action: 'message_ack',
+        });
+        void this.webhookService.dispatch(id, 'message.ack', { messageId, ack });
+        this.eventsGateway.emitMessageAck(id, messageId, ack);
+      },
     });
 
     await this.updateStatus(id, SessionStatus.INITIALIZING);
