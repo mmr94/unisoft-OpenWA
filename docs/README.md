@@ -54,6 +54,7 @@
 | 20  | [Community Guidelines](./20-community-guidelines.md)             | Contribution and governance                       |
 | 21  | [Glossary](./21-glossary.md)                                     | Terms and definitions                             |
 | 22  | [n8n Integration](./22-n8n-integration.md)                       | n8n community nodes for OpenWA                    |
+| 23  | [Session Hibernation](./23-session-hibernation.md)               | Idle session unloading & on-demand resume         |
 
 ## Quick Start
 
