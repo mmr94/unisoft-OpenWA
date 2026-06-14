@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Session hibernation (idle RAM saving)**: sessions that have not **sent** a message within a
+  configurable idle window are now hibernated — their Chromium engine is destroyed to free RAM.
+  Because `LocalAuth` keeps the WhatsApp auth data on disk, resuming does **not** require scanning
+  the QR code again. Resume is client-driven (`POST /sessions/:id/wake`, then poll status or listen
+  to the `session.status` WebSocket event) with a server-side safety net that transparently wakes a
+  hibernated session on the next message send. New `HIBERNATED` status, `lastSentAt` column
+  (+ migration), `session:hibernated` / `session:resuming` / `session:resumed` hooks, and SDK
+  `wake` + `ensureReady` helpers (JS & Python). Configurable via `SESSION_HIBERNATION_ENABLED`,
+  `SESSION_IDLE_TIMEOUT_MS`, `SESSION_IDLE_CHECK_INTERVAL_MS`, `SESSION_WAKE_TIMEOUT_MS`, with
+  per-session `keepAlive` / `idleTimeoutMs` overrides. See
+  [docs/23-session-hibernation.md](./docs/23-session-hibernation.md).
+
 ## [0.1.6] - 2026-05-17
 
 ### Fixed
