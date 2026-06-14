@@ -11,6 +11,9 @@ export type HookEvent =
   | 'session:qr'
   | 'session:disconnected'
   | 'session:deleted'
+  | 'session:hibernated' // Engine unloaded after inactivity (RAM freed)
+  | 'session:resuming' // Engine being reloaded after hibernation
+  | 'session:resumed' // Engine reloaded and resuming connection
   // Message lifecycle
   | 'message:received'
   | 'message:sending'

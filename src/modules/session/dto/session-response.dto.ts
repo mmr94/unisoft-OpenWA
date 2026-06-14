@@ -23,6 +23,12 @@ export class SessionResponseDto {
   @ApiPropertyOptional({ example: '2025-02-02T10:30:00Z' })
   lastActive?: Date | null;
 
+  @ApiPropertyOptional({
+    description: 'Timestamp of the last outgoing message (used for idle hibernation)',
+    example: '2025-02-02T10:25:00Z',
+  })
+  lastSent?: Date | null;
+
   @ApiProperty({ example: '2025-02-02T09:00:00Z' })
   createdAt: Date;
 

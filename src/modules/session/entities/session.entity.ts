@@ -10,6 +10,9 @@ export enum SessionStatus {
   READY = 'ready',
   DISCONNECTED = 'disconnected',
   FAILED = 'failed',
+  // Engine intentionally unloaded after inactivity to free RAM.
+  // The WhatsApp auth data is kept on disk, so resuming does NOT require a new QR scan.
+  HIBERNATED = 'hibernated',
 }
 
 @Entity('sessions')
@@ -48,6 +51,11 @@ export class Session {
 
   @Column({ type: dateColumnType(), nullable: true, transformer: DateTransformer })
   lastActiveAt: Date | null;
+
+  // Timestamp of the last OUTGOING message. Used to detect idle sessions for
+  // hibernation. Distinct from lastActiveAt (which also tracks incoming activity).
+  @Column({ type: dateColumnType(), nullable: true, transformer: DateTransformer })
+  lastSentAt: Date | null;
 
   @CreateDateColumn()
   createdAt: Date;

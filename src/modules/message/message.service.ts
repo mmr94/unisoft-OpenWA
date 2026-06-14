@@ -37,7 +37,7 @@ export class MessageService {
     // Use potentially modified input
     const finalDto = (hookData as { input: SendTextMessageDto }).input;
 
-    const engine = this.getEngine(sessionId);
+    const engine = await this.getEngine(sessionId);
 
     // Save message as pending BEFORE sending
     const message = await this.saveOutgoingMessage(sessionId, {
@@ -83,7 +83,7 @@ export class MessageService {
   }
 
   async sendImage(sessionId: string, dto: SendMediaMessageDto): Promise<MessageResponseDto> {
-    const engine = this.getEngine(sessionId);
+    const engine = await this.getEngine(sessionId);
     const media = this.buildMediaInput(dto);
 
     // Save message as pending BEFORE sending
@@ -114,7 +114,7 @@ export class MessageService {
   }
 
   async sendVideo(sessionId: string, dto: SendMediaMessageDto): Promise<MessageResponseDto> {
-    const engine = this.getEngine(sessionId);
+    const engine = await this.getEngine(sessionId);
     const media = this.buildMediaInput(dto);
 
     // Save message as pending BEFORE sending
@@ -145,7 +145,7 @@ export class MessageService {
   }
 
   async sendAudio(sessionId: string, dto: SendMediaMessageDto): Promise<MessageResponseDto> {
-    const engine = this.getEngine(sessionId);
+    const engine = await this.getEngine(sessionId);
     const media = this.buildMediaInput(dto);
 
     // Save message as pending BEFORE sending
@@ -175,7 +175,7 @@ export class MessageService {
   }
 
   async sendDocument(sessionId: string, dto: SendMediaMessageDto): Promise<MessageResponseDto> {
-    const engine = this.getEngine(sessionId);
+    const engine = await this.getEngine(sessionId);
     const media = this.buildMediaInput(dto);
 
     // Save message as pending BEFORE sending
@@ -235,7 +235,7 @@ export class MessageService {
     sessionId: string,
     dto: { chatId: string; latitude: number; longitude: number; description?: string; address?: string },
   ): Promise<MessageResponseDto> {
-    const engine = this.getEngine(sessionId);
+    const engine = await this.getEngine(sessionId);
 
     // Save message as pending BEFORE sending
     const message = await this.saveOutgoingMessage(sessionId, {
@@ -273,7 +273,7 @@ export class MessageService {
     sessionId: string,
     dto: { chatId: string; contactName: string; contactNumber: string },
   ): Promise<MessageResponseDto> {
-    const engine = this.getEngine(sessionId);
+    const engine = await this.getEngine(sessionId);
 
     // Save message as pending BEFORE sending
     const message = await this.saveOutgoingMessage(sessionId, {
@@ -306,7 +306,7 @@ export class MessageService {
   }
 
   async sendSticker(sessionId: string, dto: SendMediaMessageDto): Promise<MessageResponseDto> {
-    const engine = this.getEngine(sessionId);
+    const engine = await this.getEngine(sessionId);
     const media = this.buildMediaInput(dto);
 
     // Save message as pending BEFORE sending
@@ -339,7 +339,7 @@ export class MessageService {
     sessionId: string,
     dto: { chatId: string; quotedMessageId: string; text: string },
   ): Promise<MessageResponseDto> {
-    const engine = this.getEngine(sessionId);
+    const engine = await this.getEngine(sessionId);
 
     // Save message as pending BEFORE sending
     const message = await this.saveOutgoingMessage(sessionId, {
@@ -372,7 +372,7 @@ export class MessageService {
     sessionId: string,
     dto: { fromChatId: string; toChatId: string; messageId: string },
   ): Promise<MessageResponseDto> {
-    const engine = this.getEngine(sessionId);
+    const engine = await this.getEngine(sessionId);
 
     // Save message as pending BEFORE sending
     const message = await this.saveOutgoingMessage(sessionId, {
@@ -447,12 +447,12 @@ export class MessageService {
   // ========== Phase 3: Reactions ==========
 
   async reactToMessage(sessionId: string, dto: { chatId: string; messageId: string; emoji: string }): Promise<void> {
-    const engine = this.getEngine(sessionId);
+    const engine = await this.getEngine(sessionId);
     await engine.reactToMessage(dto.chatId, dto.messageId, dto.emoji);
   }
 
   async getMessageReactions(sessionId: string, chatId: string, messageId: string) {
-    const engine = this.getEngine(sessionId);
+    const engine = await this.getEngine(sessionId);
     return engine.getMessageReactions(chatId, messageId);
   }
 
@@ -462,15 +462,18 @@ export class MessageService {
     sessionId: string,
     dto: { chatId: string; messageId: string; forEveryone?: boolean },
   ): Promise<void> {
-    const engine = this.getEngine(sessionId);
+    const engine = await this.getEngine(sessionId);
     await engine.deleteMessage(dto.chatId, dto.messageId, dto.forEveryone ?? true);
   }
 
-  private getEngine(sessionId: string) {
-    const engine = this.sessionService.getEngine(sessionId);
-    if (!engine) {
-      throw new BadRequestException(`Session '${sessionId}' is not active. Start the session first.`);
-    }
+  /**
+   * Resolve a READY engine for an outgoing operation. Transparently wakes a
+   * hibernated session (server-side safety net) and records the activity so the
+   * idle checker keeps actively-used sessions alive.
+   */
+  private async getEngine(sessionId: string) {
+    const engine = await this.sessionService.ensureEngineReady(sessionId);
+    void this.sessionService.markActivity(sessionId);
     return engine;
   }
 

@@ -55,6 +55,20 @@ export default () => ({
     sessionDataPath: process.env.SESSION_DATA_PATH || './data/sessions',
   },
 
+  // Session lifecycle / hibernation configuration
+  session: {
+    // When enabled, sessions that have not SENT a message for `idleTimeoutMs`
+    // are hibernated (engine/Chromium destroyed to free RAM). The WhatsApp auth
+    // data stays on disk, so resuming does not require a new QR scan.
+    hibernationEnabled: process.env.SESSION_HIBERNATION_ENABLED === 'true',
+    // Idle window before hibernation (default: 90 min, between the 1-2h range).
+    idleTimeoutMs: parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '5400000', 10),
+    // How often the idle checker runs (default: 5 min).
+    checkIntervalMs: parseInt(process.env.SESSION_IDLE_CHECK_INTERVAL_MS || '300000', 10),
+    // Max time to wait for a session to become READY when waking it transparently.
+    wakeTimeoutMs: parseInt(process.env.SESSION_WAKE_TIMEOUT_MS || '45000', 10),
+  },
+
   // Webhook configuration
   webhook: {
     timeout: parseInt(process.env.WEBHOOK_TIMEOUT || '10000', 10),

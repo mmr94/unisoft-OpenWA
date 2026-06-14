@@ -3,9 +3,11 @@ import {
   NotFoundException,
   ConflictException,
   BadRequestException,
+  ServiceUnavailableException,
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
 import { Repository, In, DataSource } from 'typeorm';
 import { Session, SessionStatus } from './entities/session.entity';
@@ -24,6 +26,15 @@ interface ReconnectState {
   baseDelay: number;
 }
 
+/** Per-session overrides read from Session.config */
+interface SessionRuntimeConfig {
+  maxReconnectAttempts?: number;
+  reconnectBaseDelay?: number;
+  // Hibernation overrides
+  keepAlive?: boolean; // never hibernate this session
+  idleTimeoutMs?: number; // override the global idle window
+}
+
 @Injectable()
 export class SessionService implements OnModuleDestroy, OnModuleInit {
   private readonly logger = createLogger('SessionService');
@@ -34,6 +45,14 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
   // Reconnection state per session
   private reconnectStates: Map<string, ReconnectState> = new Map();
 
+  // Sessions being stopped/hibernated on purpose. Used to suppress the
+  // engine's `disconnected` event from triggering a reconnect or overwriting
+  // the intentional status (e.g. HIBERNATED).
+  private intentionalStops: Set<string> = new Set();
+
+  // Timer for the periodic idle-session check (hibernation).
+  private idleCheckTimer: NodeJS.Timeout | null = null;
+
   constructor(
     @InjectRepository(Session, 'data')
     private readonly sessionRepository: Repository<Session>,
@@ -43,6 +62,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
     private readonly eventsGateway: EventsGateway,
     private readonly webhookService: WebhookService,
     private readonly hookManager: HookManager,
+    private readonly configService: ConfigService,
   ) {}
 
   /**
@@ -68,9 +88,89 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
         affected: result.affected,
       });
     }
+
+    this.startIdleChecker();
+  }
+
+  /**
+   * Start the periodic idle-session checker that hibernates sessions which
+   * have not sent a message within the configured idle window. No-op unless
+   * SESSION_HIBERNATION_ENABLED is true.
+   */
+  private startIdleChecker(): void {
+    if (!this.configService.get<boolean>('session.hibernationEnabled')) {
+      return;
+    }
+
+    const intervalMs = this.configService.get<number>('session.checkIntervalMs') ?? 300000;
+    this.idleCheckTimer = setInterval(() => {
+      void this.hibernateIdleSessions();
+    }, intervalMs);
+    // Don't keep the event loop alive solely for this timer.
+    this.idleCheckTimer.unref?.();
+
+    this.logger.log('Idle session hibernation enabled', {
+      action: 'idle_checker_started',
+      intervalMs,
+      idleTimeoutMs: this.configService.get<number>('session.idleTimeoutMs'),
+    });
+  }
+
+  /**
+   * Inspect all loaded engines and hibernate the ones that have been idle
+   * (no outgoing message) for longer than their idle window.
+   */
+  private async hibernateIdleSessions(): Promise<void> {
+    const defaultIdleMs = this.configService.get<number>('session.idleTimeoutMs') ?? 5400000;
+    const now = Date.now();
+
+    // Only loaded engines can be hibernated.
+    for (const sessionId of Array.from(this.engines.keys())) {
+      try {
+        const session = await this.sessionRepository.findOne({ where: { id: sessionId } });
+        if (!session || session.status !== SessionStatus.READY) {
+          continue;
+        }
+
+        const config = (session.config as SessionRuntimeConfig | null) ?? {};
+        if (config.keepAlive === true) {
+          continue;
+        }
+
+        const idleThreshold = config.idleTimeoutMs ?? defaultIdleMs;
+        const reference = session.lastSentAt ?? session.connectedAt;
+        if (!reference) {
+          continue;
+        }
+
+        const idleMs = now - new Date(reference).getTime();
+        if (idleMs > idleThreshold) {
+          this.logger.log(`Hibernating idle session: ${session.name}`, {
+            sessionId,
+            action: 'idle_hibernate',
+            idleMs,
+            idleThreshold,
+          });
+          await this.hibernate(sessionId);
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.logger.error('Error during idle check', message, {
+          sessionId,
+          action: 'idle_check_error',
+        });
+      }
+    }
   }
 
   async onModuleDestroy(): Promise<void> {
+    // Stop the idle checker
+    if (this.idleCheckTimer) {
+      clearInterval(this.idleCheckTimer);
+      this.idleCheckTimer = null;
+    }
+    this.intentionalStops.clear();
+
     // Clean up all engines on shutdown
     for (const [sessionId, engine] of this.engines) {
       this.logger.log(`Destroying engine for session ${sessionId}`, {
@@ -202,10 +302,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
     );
 
     // Initialize reconnect state
-    const config = session.config as {
-      maxReconnectAttempts?: number;
-      reconnectBaseDelay?: number;
-    } | null;
+    const config = (session.config as SessionRuntimeConfig | null) ?? null;
     this.reconnectStates.set(id, {
       attempts: 0,
       timer: null,
@@ -307,12 +404,23 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
             }
 
             // Dispatch to webhooks with potentially modified message
-            void this.webhookService.dispatch(id, 'message.received', finalMessage as Record<string, unknown>);
+            void this.webhookService.dispatch(id, 'message.received', finalMessage);
             // Emit real-time event to WebSocket clients
-            this.eventsGateway.emitMessage(id, finalMessage as Record<string, unknown>);
+            this.eventsGateway.emitMessage(id, finalMessage);
           });
       },
       onDisconnected: (reason: string): void => {
+        // Ignore disconnects we triggered ourselves (stop/hibernate) so we
+        // don't reconnect or overwrite the intentional status.
+        if (this.intentionalStops.has(id)) {
+          this.logger.debug('Ignoring disconnect during intentional stop/hibernate', {
+            sessionId: id,
+            reason,
+            action: 'disconnected_ignored',
+          });
+          return;
+        }
+
         this.logger.warn(`Session disconnected: ${reason}`, {
           sessionId: id,
           reason,
@@ -425,7 +533,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
     const engine = this.engines.get(id);
 
     if (engine) {
-      await engine.disconnect();
+      this.intentionalStops.add(id);
+      try {
+        await engine.disconnect();
+      } finally {
+        this.intentionalStops.delete(id);
+      }
       this.engines.delete(id);
     }
 
@@ -435,6 +548,136 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
     });
     await this.updateStatus(id, SessionStatus.DISCONNECTED);
     return this.findOne(id);
+  }
+
+  /**
+   * Hibernate a session: destroy its engine (frees the Chromium instance and
+   * its RAM) but keep the WhatsApp auth data on disk. The session can later be
+   * resumed without scanning a QR code again. Status becomes HIBERNATED.
+   */
+  async hibernate(id: string): Promise<Session> {
+    const session = await this.findOne(id);
+    const engine = this.engines.get(id);
+
+    // Cancel any reconnection attempts so hibernation isn't undone
+    this.cancelReconnect(id);
+
+    if (engine) {
+      this.intentionalStops.add(id);
+      try {
+        await engine.destroy();
+      } finally {
+        this.intentionalStops.delete(id);
+      }
+      this.engines.delete(id);
+    }
+
+    await this.updateStatus(id, SessionStatus.HIBERNATED);
+
+    this.logger.log(`Session hibernated: ${session.name}`, {
+      sessionId: id,
+      action: 'hibernate',
+    });
+
+    await this.hookManager.execute(
+      'session:hibernated',
+      { sessionId: id },
+      { sessionId: id, source: 'SessionService' },
+    );
+
+    return this.findOne(id);
+  }
+
+  /**
+   * Resume a hibernated (or otherwise stopped) session. Idempotent: if the
+   * engine is already loaded this is a no-op. Reloading reuses the persisted
+   * auth data, so no QR scan is required.
+   */
+  async wake(id: string): Promise<Session> {
+    const session = await this.findOne(id);
+
+    // Already loaded (running or starting) — nothing to do.
+    if (this.engines.has(id)) {
+      return session;
+    }
+
+    await this.hookManager.execute('session:resuming', { sessionId: id }, { sessionId: id, source: 'SessionService' });
+
+    this.logger.log(`Resuming session: ${session.name}`, {
+      sessionId: id,
+      action: 'wake',
+    });
+
+    // Reuse the normal start path (reconnect state + engine init).
+    await this.start(id);
+
+    // Give the freshly-resumed session a grace window before it can be
+    // considered idle again.
+    await this.sessionRepository.update(id, { lastSentAt: new Date() });
+
+    await this.hookManager.execute('session:resumed', { sessionId: id }, { sessionId: id, source: 'SessionService' });
+
+    return this.findOne(id);
+  }
+
+  /**
+   * Return a READY engine for a session, transparently waking it if it was
+   * hibernated. This is the server-side safety net behind the client-driven
+   * wake flow: callers (e.g. message sending) get a usable engine even if the
+   * client forgot to wake the session first.
+   *
+   * Only HIBERNATED sessions are auto-resumed (their auth data is on disk).
+   * Sessions that were never authenticated still throw so the client knows a
+   * QR scan / explicit start is required.
+   */
+  async ensureEngineReady(id: string): Promise<IWhatsAppEngine> {
+    const existing = this.engines.get(id);
+    if (existing) {
+      // Preserve prior behaviour: a loaded engine is returned as-is.
+      return existing;
+    }
+
+    const session = await this.findOne(id);
+    if (session.status !== SessionStatus.HIBERNATED) {
+      throw new BadRequestException(`Session '${id}' is not active. Start the session first.`);
+    }
+
+    await this.wake(id);
+
+    const timeoutMs = this.configService.get<number>('session.wakeTimeoutMs') ?? 45000;
+    await this.waitForReady(id, timeoutMs);
+
+    const engine = this.engines.get(id);
+    if (!engine || engine.getStatus() !== EngineStatus.READY) {
+      throw new ServiceUnavailableException(`Session '${id}' is resuming from hibernation. Please retry shortly.`);
+    }
+    return engine;
+  }
+
+  /** Poll until the session's engine reports READY or the timeout elapses. */
+  private async waitForReady(id: string, timeoutMs: number): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const engine = this.engines.get(id);
+      if (engine && engine.getStatus() === EngineStatus.READY) {
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+  }
+
+  /**
+   * Record outgoing activity for idle detection. Best-effort: failures are
+   * swallowed so they never break message sending.
+   */
+  async markActivity(id: string): Promise<void> {
+    try {
+      const now = new Date();
+      await this.sessionRepository.update(id, { lastSentAt: now, lastActiveAt: now });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.debug('Failed to record session activity', { sessionId: id, error: message });
+    }
   }
 
   async getQRCode(id: string): Promise<{ qrCode: string; status: SessionStatus }> {

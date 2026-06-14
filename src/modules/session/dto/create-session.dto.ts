@@ -17,8 +17,12 @@ export class CreateSessionDto {
   name: string;
 
   @ApiPropertyOptional({
-    description: 'Session configuration options',
-    example: { autoReconnect: true },
+    description:
+      'Session configuration options. Supported keys: ' +
+      'maxReconnectAttempts (number), reconnectBaseDelay (ms), ' +
+      'keepAlive (boolean — exclude this session from idle hibernation), ' +
+      'idleTimeoutMs (number — per-session override of the global idle window before hibernation).',
+    example: { autoReconnect: true, keepAlive: false, idleTimeoutMs: 5400000 },
   })
   @IsOptional()
   config?: Record<string, unknown>;
