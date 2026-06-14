@@ -26,6 +26,7 @@ export class SessionController {
       pushName: session.pushName,
       connectedAt: session.connectedAt,
       lastActive: session.lastActiveAt,
+      lastSent: session.lastSentAt,
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
     };
@@ -126,6 +127,31 @@ export class SessionController {
   async stop(@Param('id') id: string): Promise<SessionResponseDto> {
     const session = await this.sessionService.stop(id);
     await this.auditService.logInfo(AuditAction.SESSION_STOPPED, {
+      sessionId: session.id,
+      sessionName: session.name,
+    });
+    return this.transformSession(session);
+  }
+
+  @Post(':id/wake')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({
+    summary: 'Resume a hibernated session (no QR scan required)',
+    description:
+      'Reloads the engine for a session that was hibernated due to inactivity. ' +
+      'Returns immediately with status INITIALIZING; poll GET /sessions/:id or ' +
+      'listen to the session.status WebSocket event until it becomes READY.',
+  })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({
+    status: 200,
+    description: 'Session resuming',
+    type: SessionResponseDto,
+  })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async wake(@Param('id') id: string): Promise<SessionResponseDto> {
+    const session = await this.sessionService.wake(id);
+    await this.auditService.logInfo(AuditAction.SESSION_RESUMED, {
       sessionId: session.id,
       sessionName: session.name,
     });

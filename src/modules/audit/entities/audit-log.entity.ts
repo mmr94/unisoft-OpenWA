@@ -16,6 +16,8 @@ export enum AuditAction {
   SESSION_QR_GENERATED = 'session_qr_generated',
   SESSION_CONNECTED = 'session_connected',
   SESSION_DISCONNECTED = 'session_disconnected',
+  SESSION_HIBERNATED = 'session_hibernated',
+  SESSION_RESUMED = 'session_resumed',
 
   // Message events
   MESSAGE_SENT = 'message_sent',

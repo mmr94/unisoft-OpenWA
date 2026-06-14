@@ -111,8 +111,45 @@ class _SessionsResource:
     def stop(self, session_id: str) -> dict:
         return self._client._request("POST", f"/api/sessions/{session_id}/stop")
 
+    def wake(self, session_id: str) -> dict:
+        """Resume a session hibernated due to inactivity (no QR scan needed)."""
+        return self._client._request("POST", f"/api/sessions/{session_id}/wake")
+
     def delete(self, session_id: str) -> None:
         self._client._request("DELETE", f"/api/sessions/{session_id}")
+
+    def ensure_ready(
+        self,
+        session_id: str,
+        timeout: float = 60.0,
+        poll_interval: float = 1.0,
+    ) -> dict:
+        """Ensure a session is READY, resuming it if it was hibernated.
+
+        Recommended before sending to a session that may have been hibernated
+        for inactivity. Polls until the session reaches READY or ``timeout``
+        (seconds) elapses.
+        """
+        import time
+
+        session = self.get(session_id)
+        if session.get("status") == "ready":
+            return session
+
+        if session.get("status") in ("hibernated", "disconnected"):
+            self.wake(session_id)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            session = self.get(session_id)
+            if session.get("status") == "ready":
+                return session
+            time.sleep(poll_interval)
+
+        raise TimeoutError(
+            f"Session '{session_id}' did not become ready within {timeout}s "
+            f"(status: {session.get('status')})"
+        )
 
 
 class _MessagesResource:

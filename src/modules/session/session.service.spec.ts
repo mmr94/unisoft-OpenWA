@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken, getDataSourceToken } from '@nestjs/typeorm';
+import { ConfigService } from '@nestjs/config';
 import { Repository, DataSource } from 'typeorm';
 import { NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { SessionService } from './session.service';
@@ -21,6 +22,7 @@ function createMockSession(overrides: Partial<Session> = {}): Session {
     proxyType: null,
     connectedAt: null,
     lastActiveAt: null,
+    lastSentAt: null,
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,
@@ -35,6 +37,7 @@ describe('SessionService', () => {
   let eventsGateway: jest.Mocked<Partial<EventsGateway>>;
   let webhookService: jest.Mocked<Partial<WebhookService>>;
   let hookManager: jest.Mocked<Partial<HookManager>>;
+  let configService: jest.Mocked<Partial<ConfigService>>;
   let mockEngine: Record<string, jest.Mock>;
 
   beforeEach(async () => {
@@ -64,6 +67,7 @@ describe('SessionService', () => {
       disconnect: jest.fn().mockResolvedValue(undefined),
       getQRCode: jest.fn().mockReturnValue(null),
       getGroups: jest.fn().mockResolvedValue([]),
+      getStatus: jest.fn().mockReturnValue('ready'),
     };
 
     engineFactory = {
@@ -83,6 +87,11 @@ describe('SessionService', () => {
       execute: jest.fn().mockResolvedValue({ continue: true, data: {} }),
     };
 
+    // Hibernation disabled by default so the idle checker interval never starts in tests.
+    configService = {
+      get: jest.fn().mockReturnValue(undefined),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         SessionService,
@@ -98,6 +107,7 @@ describe('SessionService', () => {
         { provide: EventsGateway, useValue: eventsGateway },
         { provide: WebhookService, useValue: webhookService },
         { provide: HookManager, useValue: hookManager },
+        { provide: ConfigService, useValue: configService },
       ],
     }).compile();
 
@@ -361,6 +371,116 @@ describe('SessionService', () => {
       await service.start('sess-uuid-1');
 
       expect(service.isActive('sess-uuid-1')).toBe(true);
+    });
+  });
+
+  // ── hibernate ─────────────────────────────────────────────────────
+
+  describe('hibernate', () => {
+    it('should destroy the engine and set status to HIBERNATED', async () => {
+      const session = createMockSession({ status: SessionStatus.READY });
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.start('sess-uuid-1');
+      await service.hibernate('sess-uuid-1');
+
+      expect(mockEngine.destroy).toHaveBeenCalled();
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+      expect(repository.update).toHaveBeenCalledWith('sess-uuid-1', {
+        status: SessionStatus.HIBERNATED,
+      });
+      expect(hookManager.execute).toHaveBeenCalledWith(
+        'session:hibernated',
+        expect.objectContaining({ sessionId: 'sess-uuid-1' }),
+        expect.any(Object),
+      );
+    });
+  });
+
+  // ── wake ──────────────────────────────────────────────────────────
+
+  describe('wake', () => {
+    it('should reload the engine for a hibernated session', async () => {
+      const session = createMockSession({ status: SessionStatus.HIBERNATED });
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.wake('sess-uuid-1');
+
+      expect(mockEngine.initialize).toHaveBeenCalled();
+      expect(service.isActive('sess-uuid-1')).toBe(true);
+      expect(hookManager.execute).toHaveBeenCalledWith(
+        'session:resuming',
+        expect.objectContaining({ sessionId: 'sess-uuid-1' }),
+        expect.any(Object),
+      );
+      expect(hookManager.execute).toHaveBeenCalledWith(
+        'session:resumed',
+        expect.objectContaining({ sessionId: 'sess-uuid-1' }),
+        expect.any(Object),
+      );
+    });
+
+    it('should be a no-op if the engine is already loaded', async () => {
+      const session = createMockSession({ status: SessionStatus.READY });
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.start('sess-uuid-1');
+      mockEngine.initialize.mockClear();
+
+      await service.wake('sess-uuid-1');
+
+      expect(mockEngine.initialize).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── ensureEngineReady ─────────────────────────────────────────────
+
+  describe('ensureEngineReady', () => {
+    it('should return the existing engine when already loaded', async () => {
+      const session = createMockSession({ status: SessionStatus.READY });
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.start('sess-uuid-1');
+      const engine = await service.ensureEngineReady('sess-uuid-1');
+
+      expect(engine).toBe(mockEngine);
+    });
+
+    it('should transparently wake a hibernated session', async () => {
+      const session = createMockSession({ status: SessionStatus.HIBERNATED });
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      const engine = await service.ensureEngineReady('sess-uuid-1');
+
+      expect(mockEngine.initialize).toHaveBeenCalled();
+      expect(engine).toBe(mockEngine);
+    });
+
+    it('should throw for a session that is not active and not hibernated', async () => {
+      const session = createMockSession({ status: SessionStatus.DISCONNECTED });
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+
+      await expect(service.ensureEngineReady('sess-uuid-1')).rejects.toThrow(BadRequestException);
+    });
+  });
+
+  // ── markActivity ──────────────────────────────────────────────────
+
+  describe('markActivity', () => {
+    it('should update lastSentAt and lastActiveAt', async () => {
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.markActivity('sess-uuid-1');
+
+      expect(repository.update).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        expect.objectContaining({ lastSentAt: expect.any(Date) as Date }),
+      );
     });
   });
 

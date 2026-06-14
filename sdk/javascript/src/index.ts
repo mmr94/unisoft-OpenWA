@@ -45,9 +45,14 @@ export interface MessageResponse {
 export interface Session {
   id: string;
   name: string;
+  /** e.g. 'ready' | 'hibernated' | 'disconnected' | 'initializing' | ... */
   status: string;
   phone: string | null;
   pushName: string | null;
+  connectedAt?: string | null;
+  lastActive?: string | null;
+  /** Timestamp of the last outgoing message (used for idle hibernation). */
+  lastSent?: string | null;
 }
 
 // ── Client Class ──────────────────────────────────────────────────
@@ -70,8 +75,48 @@ export class OpenWAClient {
       create: (data: { name: string }) => this.request<Session>('POST', '/api/sessions', data),
       start: (id: string) => this.request<Session>('POST', `/api/sessions/${id}/start`),
       stop: (id: string) => this.request<Session>('POST', `/api/sessions/${id}/stop`),
+      /** Resume a session that was hibernated due to inactivity (no QR scan needed). */
+      wake: (id: string) => this.request<Session>('POST', `/api/sessions/${id}/wake`),
       delete: (id: string) => this.request<void>('DELETE', `/api/sessions/${id}`),
     };
+  }
+
+  /**
+   * Ensure a session is READY before sending, resuming it if it was hibernated.
+   *
+   * Recommended before sending to a session that may have been hibernated for
+   * inactivity. Polls until the session reaches READY or the timeout elapses.
+   *
+   * @example
+   * ```typescript
+   * await client.ensureReady('session-1');
+   * await client.messages.sendText('session-1', { chatId, text });
+   * ```
+   */
+  async ensureReady(id: string, options: { timeoutMs?: number; pollIntervalMs?: number } = {}): Promise<Session> {
+    const timeoutMs = options.timeoutMs ?? 60000;
+    const pollIntervalMs = options.pollIntervalMs ?? 1000;
+
+    let session = await this.sessions.get(id);
+    if (session.status === 'ready') {
+      return session;
+    }
+
+    // Wake hibernated/stopped sessions.
+    if (session.status === 'hibernated' || session.status === 'disconnected') {
+      await this.sessions.wake(id);
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      session = await this.sessions.get(id);
+      if (session.status === 'ready') {
+        return session;
+      }
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    }
+
+    throw new Error(`Session '${id}' did not become ready within ${timeoutMs}ms (status: ${session.status})`);
   }
 
   get messages() {

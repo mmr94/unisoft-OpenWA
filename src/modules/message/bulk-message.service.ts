@@ -35,11 +35,8 @@ export class BulkMessageService {
   ) {}
 
   async createBatch(sessionId: string, dto: SendBulkMessageDto): Promise<MessageBatch> {
-    // Validate session exists
-    const engine = this.sessionService.getEngine(sessionId);
-    if (!engine) {
-      throw new BadRequestException(`Session '${sessionId}' is not active`);
-    }
+    // Validate session is usable (transparently wakes a hibernated session).
+    await this.sessionService.ensureEngineReady(sessionId);
 
     const batchId = dto.batchId || `batch_${randomUUID().split('-')[0]}`;
 
@@ -136,8 +133,11 @@ export class BulkMessageService {
     batch.startedAt = new Date();
     await this.batchRepository.save(batch);
 
-    const engine = this.sessionService.getEngine(batch.sessionId);
-    if (!engine) {
+    let engine: IWhatsAppEngine;
+    try {
+      // Transparently wakes a hibernated session before processing.
+      engine = await this.sessionService.ensureEngineReady(batch.sessionId);
+    } catch {
       batch.status = BatchStatus.FAILED;
       batch.completedAt = new Date();
       await this.batchRepository.save(batch);
@@ -161,7 +161,7 @@ export class BulkMessageService {
 
       try {
         // Apply template variables
-        const content: BulkMessageContent = this.applyVariables(msg.content as BulkMessageContent, msg.variables);
+        const content: BulkMessageContent = this.applyVariables(msg.content, msg.variables);
 
         // Send message based on type
         const messageResult = await this.sendMessage(engine, msg.chatId, msg.type, content);
@@ -171,6 +171,9 @@ export class BulkMessageService {
         result.sentAt = new Date();
         batch.progress.sent++;
         batch.progress.pending--;
+
+        // Record outgoing activity so the session isn't hibernated mid-batch.
+        void this.sessionService.markActivity(batch.sessionId);
 
         this.logger.debug(`Batch ${batch.batchId}: Sent message ${i + 1}/${batch.messages.length} to ${msg.chatId}`);
       } catch (error) {
