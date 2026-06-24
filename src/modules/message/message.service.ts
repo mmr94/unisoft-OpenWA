@@ -630,14 +630,35 @@ export class MessageService {
     }
   }
 
+  // whatsapp-web.js throws plain Errors (no typed class) from inside the WhatsApp Web page when a
+  // recipient is unreachable — e.g. "No LID for user" (the number has no WhatsApp account / its LID
+  // can't be resolved), "phone is not registered", etc. NestJS turns an untyped Error into a 500,
+  // which a calling sender (Kehila) reasonably treats as transient and retries forever on the same
+  // dead number. These are PERMANENT delivery failures: we detect them by message and surface a 400
+  // so the caller stops retrying and moves on (or falls back to SMS/email).
+  private static readonly PERMANENT_RECIPIENT_ERROR_PATTERNS: RegExp[] = [
+    /no lid for user/i,
+    /not.*registered/i,
+    /not.*on whatsapp/i,
+    /invalid.*(number|wid|jid|recipient)/i,
+    /wid error/i,
+    /phone.*invalid/i,
+  ];
+
   /**
-   * Map a blocked outbound media fetch (SSRF guard) to an HTTP 400 so a
-   * caller-supplied internal/unsafe URL returns a client error instead of a 500.
-   * All other errors pass through unchanged.
+   * Map an outbound error to a client-facing HTTP status:
+   *  - SSRF-blocked media fetch (caller-supplied internal/unsafe URL) → 400.
+   *  - Permanent recipient failure (no WhatsApp account / unresolvable identity) → 400, so the
+   *    caller stops retrying a number that can never receive the message.
+   * All other errors pass through unchanged (→ 500, treated as transient/retriable upstream).
    */
   private toClientFacingError(error: unknown): unknown {
     if (error instanceof SsrfBlockedError) {
       return new BadRequestException(error.message);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    if (MessageService.PERMANENT_RECIPIENT_ERROR_PATTERNS.some(re => re.test(message))) {
+      return new BadRequestException(message);
     }
     return error;
   }
