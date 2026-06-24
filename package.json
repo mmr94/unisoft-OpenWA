@@ -63,6 +63,7 @@
     "@nestjs/swagger": "^11.4.4",
     "@nestjs/throttler": "^6.5.0",
     "@nestjs/typeorm": "^11.0.2",
+    "@nestjs/websockets": "^11.1.27",
     "@whiskeysockets/baileys": "6.7.23",
     "adm-zip": "^0.5.17",
     "archiver": "^8.0.0",

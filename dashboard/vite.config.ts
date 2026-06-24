@@ -21,6 +21,7 @@ export default defineConfig({
   },
   server: {
     port: 2886,
+    allowedHosts: ['dashboard.openwa.syn-assist.fr'],
     proxy: {
       '/api': {
         target: 'http://localhost:2785',
