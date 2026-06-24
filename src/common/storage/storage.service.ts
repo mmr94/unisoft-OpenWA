@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as archiver from 'archiver';
+import { TarArchive } from 'archiver';
 import * as tar from 'tar-stream';
 import { createGunzip } from 'zlib';
 import { Readable, PassThrough } from 'stream';
@@ -15,6 +15,7 @@ import {
   CreateBucketCommand,
 } from '@aws-sdk/client-s3';
 import { createLogger } from '../services/logger.service';
+import { isPathWithin, isSafeStorageKey } from '../utils/path-safety';
 
 interface S3Config {
   endpoint?: string;
@@ -22,6 +23,16 @@ interface S3Config {
   secretAccessKey?: string;
   region?: string;
   bucket?: string;
+}
+
+/** Per-entry buffer cap for an import (200 MiB — 4× the inbound media cap). Bounds a decompression bomb. */
+const DEFAULT_IMPORT_MAX_BYTES = 200 * 1024 * 1024;
+/** Max number of entries an import archive may contain. Bounds an entry-count DoS. */
+const DEFAULT_IMPORT_MAX_ENTRIES = 100_000;
+
+function positiveIntFromEnv(name: string, fallback: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 @Injectable()
@@ -41,8 +52,11 @@ export class StorageService {
     if (this.storageType === 's3') {
       const s3Config = this.configService.get<S3Config>('storage.s3') || {};
       const endpoint = process.env.S3_ENDPOINT || s3Config.endpoint;
-      const accessKeyId = process.env.S3_ACCESS_KEY || s3Config.accessKeyId;
-      const secretAccessKey = process.env.S3_SECRET_KEY || s3Config.secretAccessKey;
+      // Canonical names are S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY (what configuration.ts
+      // and the dashboard write). The legacy S3_ACCESS_KEY / S3_SECRET_KEY are still read as
+      // a fallback so existing .env files keep working.
+      const accessKeyId = process.env.S3_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY || s3Config.accessKeyId;
+      const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY || process.env.S3_SECRET_KEY || s3Config.secretAccessKey;
       const region = process.env.S3_REGION || s3Config.region || 'us-east-1';
 
       if (endpoint && accessKeyId && secretAccessKey) {
@@ -110,6 +124,11 @@ export class StorageService {
   }
 
   async getFile(filePath: string): Promise<Buffer> {
+    // Mirror putFile: getLocalFile has its own isPathWithin guard, but getS3File builds
+    // `media/${filePath}` with none — contain both read backends at this boundary.
+    if (!isSafeStorageKey(filePath)) {
+      throw new Error(`Refusing to read an unsafe storage key: ${filePath}`);
+    }
     if (this.storageType === 's3' && this.s3Client && this.s3Available) {
       return this.getS3File(filePath);
     }
@@ -117,6 +136,11 @@ export class StorageService {
   }
 
   async putFile(filePath: string, data: Buffer): Promise<void> {
+    // Centralized containment so BOTH backends inherit it: putLocalFile has its own isPathWithin
+    // guard, but putS3File builds `media/${filePath}` with none — reject a traversing key here.
+    if (!isSafeStorageKey(filePath)) {
+      throw new Error(`Refusing to store an unsafe storage key: ${filePath}`);
+    }
     if (this.storageType === 's3' && this.s3Client && this.s3Available) {
       return this.putS3File(filePath, data);
     }
@@ -124,25 +148,50 @@ export class StorageService {
   }
 
   async getFileCount(): Promise<{ count: number; sizeBytes: number }> {
+    if (this.storageType === 's3' && this.s3Client && this.s3Available) {
+      // ListObjectsV2 already returns each object's Size, so report the real total instead of a
+      // 100KB-per-file estimate — no extra API calls beyond the listing we'd do anyway.
+      return this.getS3CountAndSize();
+    }
+
     const files = await this.listFiles();
     let sizeBytes = 0;
-
-    if (this.storageType === 's3' && this.s3Client && this.s3Available) {
-      // S3 size would require additional API calls, estimate
-      sizeBytes = files.length * 100000; // Estimate 100KB per file
-    } else {
-      for (const file of files) {
-        try {
-          const fullPath = path.join(this.localPath, file);
-          const stats = fs.statSync(fullPath);
-          sizeBytes += stats.size;
-        } catch (error) {
-          this.logger.debug(`Failed to stat file: ${file}`, { error: String(error) });
-        }
+    for (const file of files) {
+      try {
+        const fullPath = path.join(this.localPath, file);
+        const stats = fs.statSync(fullPath);
+        sizeBytes += stats.size;
+      } catch (error) {
+        this.logger.debug(`Failed to stat file: ${file}`, { error: String(error) });
       }
     }
 
     return { count: files.length, sizeBytes };
+  }
+
+  private async getS3CountAndSize(): Promise<{ count: number; sizeBytes: number }> {
+    let count = 0;
+    let sizeBytes = 0;
+    let continuationToken: string | undefined;
+
+    do {
+      const response = await this.s3Client!.send(
+        new ListObjectsV2Command({
+          Bucket: this.s3Bucket,
+          Prefix: 'media/',
+          ContinuationToken: continuationToken,
+        }),
+      );
+
+      for (const obj of response.Contents ?? []) {
+        count += 1;
+        sizeBytes += obj.Size ?? 0;
+      }
+
+      continuationToken = response.NextContinuationToken;
+    } while (continuationToken);
+
+    return { count, sizeBytes };
   }
 
   // ============================================================================
@@ -153,9 +202,16 @@ export class StorageService {
     const files = await this.listFiles();
     const output = new PassThrough();
 
-    const archive = archiver.default('tar', {
+    const archive = new TarArchive({
       gzip: true,
       gzipOptions: { level: 6 },
+    });
+
+    // Surface archive-level failures (gzip/finalize) on the returned stream instead of
+    // letting them become an unhandled rejection or a silently truncated download.
+    archive.on('error', (err: Error) => {
+      this.logger.error('Export archive failed', String(err));
+      output.destroy(err);
     });
 
     archive.pipe(output);
@@ -170,7 +226,9 @@ export class StorageService {
       }
     }
 
-    void archive.finalize();
+    // finalize() rejections also emit via the 'error' handler above; catch the promise so it
+    // never surfaces as an unhandled rejection.
+    archive.finalize().catch(() => undefined);
     return output;
   }
 
@@ -178,18 +236,59 @@ export class StorageService {
   // Import - Extract tar.gz stream to current storage
   // ============================================================================
 
+  // Best-effort, NOT atomic: a single bad/traversing entry is skipped and the rest still import, and a
+  // resource-cap breach aborts the rest but KEEPS the entries already written (no rollback). Callers
+  // re-running an import is safe (putFile overwrites). A staging-dir + atomic promote would make it
+  // transactional, but is out of scope here.
   async importFromStream(inputStream: Readable): Promise<number> {
     let importedCount = 0;
+    let entryCount = 0;
+    const maxEntryBytes = positiveIntFromEnv('STORAGE_IMPORT_MAX_BYTES', DEFAULT_IMPORT_MAX_BYTES);
+    const maxEntries = positiveIntFromEnv('STORAGE_IMPORT_MAX_ENTRIES', DEFAULT_IMPORT_MAX_ENTRIES);
 
     const extract = tar.extract();
     const gunzip = createGunzip();
 
     return new Promise<number>((resolve, reject) => {
-      extract.on('entry', (header, stream, next) => {
-        const chunks: Buffer[] = [];
+      let settled = false;
+      // Abort the whole import: a per-entry overflow or too many entries is a (zip-bomb) attack, not
+      // a per-file skip — tear down the pipeline and reject so nothing further is buffered or written.
+      const fail = (err: Error): void => {
+        if (settled) return;
+        settled = true;
+        extract.destroy();
+        reject(err);
+      };
 
-        stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+      extract.on('entry', (header, stream, next) => {
+        if (settled) {
+          stream.resume();
+          return;
+        }
+        if (++entryCount > maxEntries) {
+          stream.resume();
+          fail(new Error(`Import aborted: archive exceeds the ${maxEntries}-entry limit`));
+          return;
+        }
+
+        const chunks: Buffer[] = [];
+        let entryBytes = 0;
+        let entryAborted = false;
+
+        stream.on('data', (chunk: Buffer) => {
+          if (entryAborted || settled) return;
+          entryBytes += chunk.length;
+          if (entryBytes > maxEntryBytes) {
+            entryAborted = true;
+            stream.resume(); // drain the remainder so the source can end
+            fail(new Error(`Import aborted: entry "${header.name}" exceeds the ${maxEntryBytes}-byte per-entry cap`));
+          } else {
+            chunks.push(chunk);
+          }
+        });
+
         stream.on('end', () => {
+          if (entryAborted || settled) return;
           const data = Buffer.concat(chunks);
           this.putFile(header.name, data)
             .then(() => {
@@ -206,13 +305,15 @@ export class StorageService {
       });
 
       extract.on('finish', () => {
+        if (settled) return;
+        settled = true;
         this.logger.log(`Import completed: ${importedCount} files`);
         resolve(importedCount);
       });
 
       extract.on('error', (err: Error) => {
         this.logger.error('Import failed', String(err));
-        reject(err);
+        fail(err);
       });
 
       inputStream.pipe(gunzip).pipe(extract);
@@ -247,20 +348,25 @@ export class StorageService {
   }
 
   private getLocalFile(filePath: string): Promise<Buffer> {
+    if (!isPathWithin(this.localPath, filePath)) {
+      throw new Error(`Refusing to read outside storage root: ${filePath}`);
+    }
     const fullPath = path.join(this.localPath, filePath);
-    return Promise.resolve(fs.readFileSync(fullPath));
+    // Async read so the export loop (the only caller) yields the event loop per file instead of
+    // blocking it with a synchronous read for every media file.
+    return fs.promises.readFile(fullPath);
   }
 
-  private putLocalFile(filePath: string, data: Buffer): Promise<void> {
-    const fullPath = path.join(this.localPath, filePath);
-    const dir = path.dirname(fullPath);
-
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+  private async putLocalFile(filePath: string, data: Buffer): Promise<void> {
+    if (!isPathWithin(this.localPath, filePath)) {
+      throw new Error(`Refusing to write outside storage root: ${filePath}`);
     }
+    const fullPath = path.join(this.localPath, filePath);
 
-    fs.writeFileSync(fullPath, data);
-    return Promise.resolve();
+    // Async, non-blocking: a synchronous write here stalls the event loop during an import.
+    // mkdir recursive is idempotent, so it doubles as the existsSync check.
+    await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs.promises.writeFile(fullPath, data);
   }
 
   // ============================================================================

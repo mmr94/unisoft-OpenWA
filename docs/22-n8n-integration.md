@@ -73,13 +73,22 @@ Start workflows when WhatsApp events occur.
 
 #### Supported Events
 
-| Event                  | Description               | Use Case                 |
-| ---------------------- | ------------------------- | ------------------------ |
-| `message.received`     | New incoming message      | Auto-reply, lead capture |
-| `message.sent`         | Message sent successfully | Delivery confirmation    |
-| `session.connected`    | Session authenticated     | Startup notifications    |
-| `session.disconnected` | Session lost connection   | Alert monitoring         |
-| `session.qr_ready`     | QR code generated         | Reconnection alerts      |
+| Event                   | Description                         | Use Case                  |
+| ----------------------- | ----------------------------------- | ------------------------- |
+| `message.received`      | New incoming message                | Auto-reply, lead capture  |
+| `message.sent`          | Message sent successfully           | Delivery confirmation     |
+| `message.ack`           | Delivery/read status advanced       | Read receipts             |
+| `message.failed`        | Outgoing message failed             | Failure alerting          |
+| `message.revoked`       | Message deleted for everyone        | Deletion tracking         |
+| `message.reaction`      | Reaction added / changed / removed  | Reaction tracking         |
+| `session.status`        | Session status changed              | Lifecycle tracking        |
+| `session.qr`            | QR code generated                   | Reconnection alerts       |
+| `session.authenticated` | Session logged in (phone available) | Startup notifications     |
+| `session.disconnected`  | Session lost connection             | Alert monitoring          |
+
+> **Reserved:** `group.join`, `group.leave`, and `group.update` are accepted by the
+> subscription API but are not emitted yet — don't depend on them until a release notes
+> them as live.
 
 #### How It Works
 
@@ -94,8 +103,10 @@ Start workflows when WhatsApp events occur.
   "event": "message.received",
   "timestamp": "2024-01-15T10:30:00Z",
   "sessionId": "default",
+  "idempotencyKey": "a1b2c3d4e5f6...",
+  "deliveryId": "9f8e7d6c5b4a...",
   "data": {
-    "messageId": "3EB0F5A2B4C...",
+    "id": "3EB0F5A2B4C...",
     "chatId": "628123456789@c.us",
     "from": "628123456789@c.us",
     "body": "Hello!",
@@ -104,6 +115,12 @@ Start workflows when WhatsApp events occur.
   }
 }
 ```
+
+> **Deduplication.** Every delivery includes `idempotencyKey` and `deliveryId` in the body **and** as the
+> `X-OpenWA-Idempotency-Key` / `X-OpenWA-Delivery-Id` headers. `idempotencyKey` is **stable across retries**
+> of the same event, while `deliveryId` is unique per HTTP attempt. Because a webhook can be retried, add a
+> dedup step keyed on `idempotencyKey` (e.g. an n8n IF or "Remove Duplicates" node) so a retried delivery
+> isn't processed twice.
 
 ## Example Workflows
 
@@ -170,6 +187,24 @@ Send daily reminders to a list of contacts.
 [Schedule Trigger] → [Google Sheets: Get Rows] → [Loop] → [OpenWA: Send Text]
      │                      │                                    │
      └── Daily 9AM          └── Get contacts                     └── Send reminder
+```
+
+### 6. Appointment Booking
+
+Collect appointment requests over WhatsApp, check availability in an external scheduling source, and send a confirmation or alternative time slots.
+
+See [n8n Appointment Booking Workflow](./examples/n8n-appointment-booking.md) for a complete example.
+
+```
+[OpenWA Trigger] → [IF: Booking intent?] → [Set: Normalize request]
+                                               │
+                                               ▼
+                                      [Availability Source]
+                                               │
+                         ┌─────────────────────┴─────────────────────┐
+                         ▼                                           ▼
+              [Create Booking] → [OpenWA: Send Text]      [OpenWA: Send Text]
+                  confirmed confirmation                  alternative slots
 ```
 
 ## Best Practices
@@ -272,6 +307,7 @@ docker run -it --rm \
 
 - [OpenWA API Specification](./06-api-specification.md)
 - [Webhook System](./03-system-architecture.md#webhooks)
+- [n8n Appointment Booking Workflow](./examples/n8n-appointment-booking.md)
 - [n8n Documentation](https://docs.n8n.io/)
 
 ---

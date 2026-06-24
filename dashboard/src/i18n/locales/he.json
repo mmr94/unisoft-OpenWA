@@ -1,4 +1,10 @@
 {
+  "toast": {
+    "connectionLost": {
+      "title": "החיבור לשרת אבד",
+      "message": "לא ניתן להגיע לשרת העורפי. אנא בדקו אם השרת פועל."
+    }
+  },
   "common": {
     "appName": "OpenWA",
     "appSubtitle": "ממשק WhatsApp API",
@@ -9,6 +15,8 @@
     "edit": "עריכה",
     "create": "יצירה",
     "close": "סגירה",
+    "showApiKey": "הצג מפתח API",
+    "hideApiKey": "הסתר מפתח API",
     "submit": "שליחה",
     "confirm": "אישור",
     "search": "חיפוש",
@@ -51,17 +59,64 @@
     "light": "בהיר",
     "dark": "כהה",
     "system": "מערכת",
-    "label": "ערכת נושא: {{value}}"
+    "label": "ערכת נושא: {{value}}",
+    "appearance": "מראה",
+    "mode": "מצב",
+    "palette": "לוח צבעים"
   },
   "nav": {
     "dashboard": "דאשבורד",
     "sessions": "Sessions",
+    "chats": "שיחות",
     "webhooks": "Webhooks",
+    "templates": "Templates",
     "apiKeys": "מפתחות API",
     "messageTester": "בדיקת הודעות",
     "infrastructure": "תשתית",
     "plugins": "תוספים",
     "logs": "לוגים"
+  },
+  "chats": {
+    "subtitle": "שליחה ומענה להודעות WhatsApp בזמן אמת",
+    "noSessionsTitle": "אין סשנים מחוברים",
+    "noSessionsDesc": "יש לחבר סשן WhatsApp מתפריט <1>Sessions</1> תחילה כדי להשתמש בתכונת הצ'אט.",
+    "sessionLabel": "סשן WhatsApp",
+    "noPhone": "אין מספר טלפון",
+    "searchPlaceholder": "חיפוש שיחות...",
+    "loadingChats": "טוען שיחות...",
+    "empty": "אין שיחות",
+    "noMessageYet": "אין הודעות עדיין",
+    "loadingMessages": "טוען הודעות...",
+    "noMessagesInChat": "אין הודעות עדיין. שלח את ההודעה הראשונה כדי להתחיל!",
+    "downloadDocument": "הורדת מסמך",
+    "actions": {
+      "reply": "השב",
+      "react": "תגובה",
+      "delete": "מחק הודעה"
+    },
+    "replyingTo": "משיב ל-{{name}}",
+    "you": "אתה",
+    "youPrefix": "אתה: ",
+    "yesterday": "אתמול",
+    "attachTitle": "שליחת קובץ / תמונה",
+    "emojiTitle": "בחירת אימוג'י",
+    "captionPlaceholder": "הוספת כיתוב...",
+    "messagePlaceholder": "הקלד הודעה...",
+    "noPermission": "אין לך הרשאה לשלוח הודעות",
+    "send": "שלח",
+    "placeholderTitle": "התחל לשלוח הודעות",
+    "placeholderDesc": "בחר שיחה פעילה מהסרגל הצדדי כדי להתחיל לקרוא ולשלוח הודעות WhatsApp.",
+    "deleteConfirm": "למחוק הודעה זו עבור כולם?",
+    "messageDeleted": "🚫 הודעה זו נמחקה",
+    "errors": {
+      "loadSessions": "טעינת הסשנים נכשלה",
+      "loadChats": "טעינת השיחות נכשלה",
+      "loadMessages": "טעינת ההודעות נכשלה",
+      "markRead": "סימון השיחה כנקראה נכשל",
+      "send": "שליחת ההודעה נכשלה",
+      "react": "התגובה להודעה נכשלה",
+      "delete": "מחיקת ההודעה נכשלה"
+    }
   },
   "errorBoundary": {
     "title": "משהו השתבש",
@@ -88,7 +143,8 @@
       "activeSessions": "Sessions פעילים",
       "messagesToday": "הודעות היום",
       "webhooksConfigured": "Webhooks מוגדרים",
-      "apiCalls": "קריאות API (24 שעות)"
+      "apiCalls": "קריאות API (24 שעות)",
+      "totalMessages": "סה\"כ הודעות"
     },
     "sessionsOverview": "סקירת Sessions",
     "showingSessions": "מוצגים {{shown}} מתוך {{total}} Sessions",
@@ -103,7 +159,22 @@
     "view": "צפייה",
     "disconnect": "ניתוק",
     "errorPrefix": "שגיאה: {{message}}",
-    "loadError": "טעינת הנתונים נכשלה"
+    "loadError": "טעינת הנתונים נכשלה",
+    "charts": {
+      "title": "ניתוח הודעות",
+      "period": {
+        "24h": "24 ש'",
+        "7d": "7 ימים",
+        "30d": "30 יום"
+      },
+      "overTime": "הודעות לאורך זמן",
+      "byType": "הודעות לפי סוג",
+      "topChats": "צ'אטים מובילים",
+      "sent": "נשלחו",
+      "received": "התקבלו",
+      "messages": "הודעות",
+      "empty": "אין פעילות הודעות בתקופה זו."
+    }
   },
   "sessionStatus": {
     "created": "חדש",
@@ -180,18 +251,32 @@
       "start": "הפעלה",
       "stop": "עצירה",
       "reconnect": "התחברות מחדש",
-      "delete": "מחיקה"
+      "delete": "מחיקה",
+      "killStuck": "Kill Stuck"
     },
     "toasts": {
       "readyTitle": "ה-Session מוכן",
       "readyDesc": "ה-Session של WhatsApp מחובר",
       "disconnectedTitle": "ה-Session נותק",
-      "disconnectedDesc": "ה-Session של WhatsApp נותק"
+      "disconnectedDesc": "ה-Session של WhatsApp נותק",
+      "failedTitle": "ה-Session נכשל",
+      "failedDesc": "ה-Session של WhatsApp נכשל באתחול. פתחו את ה-Session כדי לראות את הסיבה."
     },
     "card": {
       "phone": "טלפון",
       "sessionId": "מזהה Session",
-      "lastActive": "פעילות אחרונה"
+      "lastActive": "פעילות אחרונה",
+      "error": "שגיאה"
+    },
+    "forceKill": {
+      "title": "Kill Stuck Session",
+      "message": "Are you sure you want to force-kill session \"{{name}}\"?",
+      "warning": "This will forcefully terminate the WhatsApp browser process. The session may need to be re-scanned on restart.",
+      "confirm": "Kill Session",
+      "successTitle": "Session Killed",
+      "success": "Session has been force-killed. You can restart it now.",
+      "failedTitle": "Force-Kill Failed",
+      "failed": "Failed to force-kill the session."
     }
   },
   "webhooks": {
@@ -207,6 +292,36 @@
     "events": "אירועים",
     "available": "אירועים זמינים",
     "saveChanges": "שמירת שינויים",
+    "filters": {
+      "title": "מסננים (אופציונלי)",
+      "hint": "הפעלה רק כאשר כל התנאים מתקיימים. חל על אירועי הודעות.",
+      "badge": "{{count}} מסנן",
+      "badge_other": "{{count}} מסננים",
+      "addCondition": "הוספת תנאי",
+      "removeCondition": "הסרת תנאי",
+      "caseSensitive": "תלוי רישיות",
+      "contactPlaceholder": "מספר או מזהה WhatsApp...",
+      "textPlaceholder": "טקסט להתאמה...",
+      "addValue": "הוספת \"{{value}}\"",
+      "yes": "כן",
+      "no": "לא",
+      "fields": {
+        "sender": "שולח",
+        "recipient": "נמען",
+        "body": "גוף ההודעה",
+        "type": "סוג הודעה",
+        "isGroup": "צ'אט קבוצתי",
+        "fromMe": "נשלח על ידי",
+        "hasMedia": "מכיל מדיה",
+        "mentions": "אזכורים"
+      },
+      "operators": {
+        "is": "הוא",
+        "isNot": "אינו",
+        "contains": "מכיל",
+        "equals": "שווה ל"
+      }
+    },
     "columns": {
       "url": "כתובת URL",
       "events": "אירועים",
@@ -241,6 +356,51 @@
       "session.disconnected": "כאשר Session מתנתק",
       "session.qr": "כאשר נוצר קוד QR",
       "all": "כל האירועים"
+    }
+  },
+  "templates": {
+    "title": "Templates",
+    "subtitle": "Create reusable message templates for each WhatsApp session",
+    "createTitle": "Create Template",
+    "editTitle": "Edit Template",
+    "newTemplate": "New Template",
+    "createTemplate": "Create Template",
+    "saveChanges": "Save Changes",
+    "viewOnly": "View Only",
+    "noSessions": "No sessions",
+    "sessionHint": "Saved under {{name}}",
+    "namePlaceholder": "e.g., order-confirmation",
+    "header": "Header",
+    "headerPlaceholder": "Optional intro line",
+    "body": "Body",
+    "bodyPlaceholder": "Hi {{customer}}, your order {{orderId}} is ready.",
+    "footer": "Footer",
+    "footerPlaceholder": "Optional closing line",
+    "previewTitle": "Preview",
+    "previewValuePlaceholder": "Sample value",
+    "previewEmpty": "Start writing a template to preview it here.",
+    "noPlaceholders": "Use {{name}} placeholders to test substitutions.",
+    "savedTitle": "Saved Templates",
+    "count": "{{count}} total",
+    "deleteTitle": "Delete Template",
+    "deleteConfirm": "Delete template \"{{name}}\"? This action cannot be undone.",
+    "actions": {
+      "copyName": "Copy template name"
+    },
+    "empty": {
+      "title": "No templates saved",
+      "description": "Create a reusable template to speed up common replies and notifications.",
+      "noSessionsTitle": "No sessions available",
+      "noSessionsDesc": "Create a WhatsApp session before adding templates."
+    },
+    "toasts": {
+      "created": "Template created successfully",
+      "createFailed": "Failed to create template: {{message}}",
+      "updated": "Template updated successfully",
+      "updateFailed": "Failed to update template: {{message}}",
+      "deleted": "Template deleted successfully",
+      "deleteFailed": "Failed to delete template: {{message}}",
+      "copied": "Template name copied"
     }
   },
   "apiKeys": {
@@ -359,7 +519,8 @@
       "messageId": "מזהה הודעה",
       "error": "שגיאה"
     },
-    "sendFailed": "שליחת ההודעה נכשלה"
+    "sendFailed": "שליחת ההודעה נכשלה",
+    "notOnWhatsApp": "מספר זה אינו רשום בוואטסאפ"
   },
   "infrastructure": {
     "title": "תשתית",
@@ -401,9 +562,22 @@
       "poolSize": "גודל Pool",
       "ssl": "חיבור SSL",
       "sslDesc": "הפעלת TLS/SSL לחיבור מאובטח למסד הנתונים",
+      "sslRejectUnauthorized": "אימות תעודת SSL",
+      "sslRejectUnauthorizedDesc": "דחיית תעודות בחתימה עצמית או לא תקפות. כבה עבור Postgres מנוהל עם תעודות בחתימה עצמית (Supabase, Heroku, Render, Railway).",
       "migrationsTitle": "Migrations של מסד הנתונים",
       "migrationsStatus": "הסכמה מסונכרנת אוטומטית עם TypeORM",
       "migrationsHint": "ה-Migrations מנוהלים אוטומטית. ניתן להשתמש ב-CLI ל-Migrations ידניים."
+    },
+    "engine": {
+      "title": "מנוע WhatsApp",
+      "subtitle": "בחר והגדר את מנוע החיבור של WhatsApp.",
+      "builtIn": "מובנה",
+      "headless": "מצב ללא ממשק",
+      "headlessDesc": "הרצת הדפדפן ללא ממשק גלוי (מומלץ לסביבת ייצור).",
+      "sessionDataPath": "נתיב נתוני הפעלה",
+      "browserArgs": "ארגומנטים של הדפדפן",
+      "noBrowser": "מנוע זה מתחבר באמצעות WebSocket — אין לו דפדפן, ולכן אין הגדרות למצב ללא ממשק או לארגומנטים של הדפדפן. המנוע הפעיל מוחל לאחר הפעלה מחדש.",
+      "restartNote": "החלפת המנוע נכנסת לתוקף לאחר הפעלה מחדש של השרת."
     },
     "redis": {
       "title": "Redis",
@@ -468,12 +642,11 @@
   },
   "plugins": {
     "title": "תוספים",
-    "subtitle": "ניהול מנועים, יעדי אחסון והרחבות",
+    "subtitle": "התקנה, הגדרה וניהול של הרחבות",
     "refresh": "רענון",
     "engineCard": "מנוע WhatsApp פעיל",
     "running": "פועל",
     "supportedFeatures": "תכונות נתמכות:",
-    "more": "+{{count}} נוספים",
     "builtIn": "מובנה",
     "noDescription": "אין תיאור זמין",
     "required": "נדרש",
@@ -483,6 +656,11 @@
     "disable": "השבתה",
     "healthCheck": "בדיקת תקינות",
     "configure": "הגדרה",
+    "available": "זמינים",
+    "install": "התקנת תוסף",
+    "uninstall": "הסרה",
+    "uninstallConfirm": "להסיר את \"{{name}}\"? פעולה זו תמחק את הקבצים שלו.",
+    "engineSwitchHint": "יש להגדיר כמנוע הפעיל בהגדרות ולאחר מכן לאתחל",
     "empty": {
       "title": "לא נמצאו תוספים",
       "description": "ניתן להתקין תוספים כדי להרחיב את היכולות של OpenWA"
@@ -496,7 +674,23 @@
       "sessionDataPath": "נתיב נתוני Session",
       "browserArgs": "ארגומנטים של הדפדפן",
       "noOptions": "אין אפשרויות הגדרה זמינות עבור תוסף זה",
-      "save": "שמירת תצורה"
+      "save": "שמירת תצורה",
+      "addItem": "הוספה",
+      "tabConfig": "הגדרות",
+      "tabSessions": "Sessions"
+    },
+    "rail": {
+      "engine": "מנוע פעיל",
+      "enabled": "מופעלים",
+      "installed": "מותקנים",
+      "active": "תוספים פעילים",
+      "none": "אף אחד אינו מופעל עדיין"
+    },
+    "installModal": {
+      "title": "התקנת תוסף",
+      "hint": "ניתן להעלות תוסף ארוז כקובץ .zip (הכולל manifest.json). הוא פועל בארגז חול לאחר ההפעלה.",
+      "choose": "בחירת קובץ ‎.zip‎…",
+      "tooLarge": "הקובץ חורג מהמגבלה של ‎5 MB‎."
     },
     "toasts": {
       "errorTitle": "שגיאת תוסף",
@@ -506,7 +700,24 @@
       "healthError": "שגיאה בבדיקת תקינות",
       "savedTitle": "התצורה נשמרה",
       "savedDesc": "נדרש אתחול שרת כדי להחיל את השינויים.",
-      "saveFailed": "השמירה נכשלה"
+      "saveFailed": "השמירה נכשלה",
+      "installed": "התוסף הותקן",
+      "installFailed": "ההתקנה נכשלה",
+      "uninstalled": "התוסף הוסר",
+      "uninstallFailed": "ההסרה נכשלה"
+    },
+    "sessions": {
+      "activationTitle": "הפעלה עבור",
+      "activationDesc": "בחרו עבור אילו sessions תוסף זה יפעל.",
+      "allSessions": "כל ה-Sessions",
+      "specificSessions": "Sessions מסוימים",
+      "noSessions": "אין Sessions עדיין.",
+      "saveActivation": "שמירת הפעלה",
+      "perSessionTitle": "הגדרות לכל Session",
+      "perSessionDesc": "דריסת ההגדרות הגלובליות עבור session; שדות שלא שונו יורשים את הערך הגלובלי.",
+      "selectSession": "בחירת session…",
+      "saveOverride": "שמירת דריסה",
+      "clearOverride": "ניקוי דריסה"
     }
   }
 }

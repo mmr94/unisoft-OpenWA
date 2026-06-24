@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { HookEvent, HookHandler, HookContext, HookRegistration } from './hook.interfaces';
 
 @Injectable()
@@ -6,6 +7,11 @@ export class HookManager {
   private readonly logger = new Logger(HookManager.name);
   private readonly hooks = new Map<HookEvent, HookRegistration[]>();
   private readonly pluginHooks = new Map<string, Set<string>>(); // pluginId -> hookIds
+  // Events in-flight on the active async context. A handler that re-fires the SAME event
+  // (e.g. a message:sending handler that sends) is short-circuited instead of recursing.
+  // NOTE: the context does not span the async engine `message_create` echo, so this guards
+  // synchronous re-entry only (the async message:sent echo loop is documented, deferred).
+  private readonly inFlightEvents = new AsyncLocalStorage<Set<HookEvent>>();
 
   /**
    * Register a hook handler
@@ -86,6 +92,24 @@ export class HookManager {
     data: T,
     options: { sessionId?: string; source: string },
   ): Promise<{ continue: boolean; data: T }> {
+    const inFlight = this.inFlightEvents.getStore();
+    if (inFlight?.has(event)) {
+      this.logger.warn(
+        `Hook re-entrancy blocked: ${event} re-fired by a handler of the same event (source: ${options.source})`,
+      );
+      return { continue: true, data };
+    }
+
+    const nextInFlight = new Set<HookEvent>(inFlight);
+    nextInFlight.add(event);
+    return this.inFlightEvents.run(nextInFlight, () => this.runHandlers(event, data, options));
+  }
+
+  private async runHandlers<T>(
+    event: HookEvent,
+    data: T,
+    options: { sessionId?: string; source: string },
+  ): Promise<{ continue: boolean; data: T }> {
     const registrations = this.hooks.get(event) || [];
 
     if (registrations.length === 0) {
@@ -106,18 +130,17 @@ export class HookManager {
         ctx.data = currentData;
         const result = await registration.handler(ctx);
 
-        // Update data if modified
-        if (result.data !== undefined) {
+        // A handler that reports an error discards its output: do NOT apply its (possibly partial or
+        // corrupted) data mutation, even though HookResult allows returning data and error together.
+        if (result.error === undefined && result.data !== undefined) {
           currentData = result.data as T;
         }
 
-        // Stop chain if continue is false
         if (!result.continue) {
           this.logger.debug(`Hook chain stopped by ${registration.pluginId} at event ${event}`);
           return { continue: false, data: currentData };
         }
 
-        // Propagate error
         if (result.error) {
           throw result.error;
         }
@@ -158,7 +181,7 @@ export class HookManager {
       }));
     }
 
-    return result as Record<HookEvent, { pluginId: string; priority: number }[]>;
+    return result;
   }
 
   /**

@@ -1,9 +1,12 @@
-import { Controller, Get, Put, Post, Body } from '@nestjs/common';
+import { Controller, Get, Put, Post, Body, BadRequestException } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBody } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { DataSource } from 'typeorm';
 import { InjectDataSource } from '@nestjs/typeorm';
-import { Public } from '../auth/decorators/auth.decorators';
+import { Public, RequireRole } from '../auth/decorators/auth.decorators';
+import { ApiKeyRole } from '../auth/entities/api-key.entity';
+import { isPathWithin } from '../../common/utils/path-safety';
+import { writeSecretFile } from '../../common/utils/secret-file';
 import { EngineFactory } from '../../engine/engine.factory';
 import { DockerService } from '../docker';
 import { CacheService } from '../../common/cache/cache.service';
@@ -12,6 +15,8 @@ import { ShutdownService } from '../../common/services/shutdown.service';
 import { createLogger } from '../../common/services/logger.service';
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
+import * as dotenv from 'dotenv';
 
 interface InfraStatus {
   database: { connected: boolean; type: string; host: string };
@@ -36,6 +41,7 @@ interface SaveConfigDto {
     database?: string;
     poolSize?: number;
     sslEnabled?: boolean;
+    sslRejectUnauthorized?: boolean;
   };
   redis?: {
     enabled?: boolean;
@@ -58,6 +64,7 @@ interface SaveConfigDto {
     s3Endpoint?: string;
   };
   engine?: {
+    type?: string;
     headless?: boolean;
     sessionDataPath?: string;
     browserArgs?: string;
@@ -87,41 +94,70 @@ interface WebhookRow {
   events: string | string[];
   secret: string | null;
   headers: string | Record<string, string>;
-  active: boolean;
+  filters: string | Record<string, unknown> | null;
+  active: boolean | number;
   retryCount: number;
   lastTriggeredAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
 
+// Shapes mirror the REAL table columns as returned by `SELECT *` (export-data), not the
+// camelCase TypeORM entity properties. `messages` columns are the property names; `message_batches`
+// columns are snake_case (the entity maps them via `name:`). Keeping these accurate is what keeps
+// the import column lists below from drifting back into "no such column" failures.
 interface MessageRow {
   id: string;
   sessionId: string;
-  messageId: string;
+  waMessageId: string | null;
   chatId: string;
-  direction: string;
+  from: string;
+  to: string;
+  body: string | null;
   type: string;
-  content: string | Record<string, unknown>;
+  direction: string;
+  timestamp: number | string | null;
+  metadata: string | Record<string, unknown> | null;
   status: string;
-  metadata: string | Record<string, unknown>;
   createdAt: string;
-  updatedAt: string;
 }
 
 interface MessageBatchRow {
   id: string;
-  batchId: string;
-  sessionId: string;
+  batch_id: string;
+  session_id: string;
   status: string;
   messages: string | unknown[];
-  options: string | Record<string, unknown>;
-  progress: string | Record<string, unknown>;
-  results: string | unknown[];
-  currentIndex: number;
+  options: string | Record<string, unknown> | null;
+  progress: string | Record<string, unknown> | null;
+  results: string | unknown[] | null;
+  current_index: number;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+// templates + baileys_stored_messages both FK sessions ON DELETE CASCADE, so import's
+// `DELETE FROM sessions` wipes them; they must be exported and re-inserted or the documented
+// backup flow loses them permanently.
+interface TemplateRow {
+  id: string;
+  sessionId: string;
+  name: string;
+  body: string;
+  header: string | null;
+  footer: string | null;
   createdAt: string;
   updatedAt: string;
-  startedAt: string | null;
-  completedAt: string | null;
+}
+
+interface BaileysStoredMessageRow {
+  id: string;
+  sessionId: string;
+  waMessageId: string;
+  serializedMessage: string;
+  createdAt: string;
 }
 
 interface MigrationTables {
@@ -129,6 +165,37 @@ interface MigrationTables {
   webhooks: WebhookRow[];
   messages: MessageRow[];
   messageBatches: MessageBatchRow[];
+  templates: TemplateRow[];
+  baileysStoredMessages: BaileysStoredMessageRow[];
+}
+
+// Saved infrastructure config returned to the dashboard form for hydration. Secret
+// values are never echoed back — a `*Set` boolean indicates whether one is stored.
+interface SavedConfigResponse {
+  database: {
+    type: 'sqlite' | 'postgres';
+    builtIn: boolean;
+    host: string;
+    port: string;
+    username: string;
+    database: string;
+    poolSize: number;
+    sslEnabled: boolean;
+    sslRejectUnauthorized: boolean;
+    passwordSet: boolean;
+  };
+  redis: { enabled: boolean; builtIn: boolean; host: string; port: string; passwordSet: boolean };
+  queue: { enabled: boolean };
+  storage: {
+    type: 'local' | 's3';
+    builtIn: boolean;
+    localPath: string;
+    s3Bucket: string;
+    s3Region: string;
+    s3Endpoint: string;
+    s3CredentialsSet: boolean;
+  };
+  engine: { type: string; headless: boolean; sessionDataPath: string; browserArgs: string };
 }
 
 @ApiTags('infrastructure')
@@ -150,6 +217,7 @@ export class InfraController {
   ) {}
 
   @Get('status')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get infrastructure status' })
   @ApiResponse({ status: 200, description: 'Infrastructure status' })
   async getStatus(): Promise<InfraStatus> {
@@ -172,9 +240,12 @@ export class InfraController {
     const storagePath = this.configService.get<string>('storage.path', './uploads');
 
     const engineType = this.configService.get<string>('engine.type', 'whatsapp-web.js');
-    const engineHeadless = this.configService.get<boolean>('engine.headless', true);
+    // configuration.ts nests these under engine.puppeteer.{headless,args}; the old flat
+    // engine.headless / engine.browserArgs keys never existed, so status always reported defaults.
+    const engineHeadless = this.configService.get<boolean>('engine.puppeteer.headless', true) ?? true;
     const sessionDataPath = this.configService.get<string>('engine.sessionDataPath', './data/sessions');
-    const browserArgs = this.configService.get<string>('engine.browserArgs', '--no-sandbox --disable-gpu');
+    const browserArgs =
+      this.configService.get<string[]>('engine.puppeteer.args')?.join(' ') || '--no-sandbox --disable-gpu';
 
     return {
       database: { connected: dbConnected, type: dbType, host: dbHost },
@@ -190,6 +261,7 @@ export class InfraController {
   }
 
   @Get('engines')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get available WhatsApp engines' })
   @ApiResponse({ status: 200, description: 'List of available engines' })
   getEngines(): Array<{ id: string; name: string; enabled: boolean; features: string[] }> {
@@ -197,124 +269,239 @@ export class InfraController {
   }
 
   @Get('engines/current')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get current active engine' })
   @ApiResponse({ status: 200, description: 'Current engine info' })
   getCurrentEngine(): { engineType: string } {
     return { engineType: this.engineFactory.getCurrentEngine() };
   }
 
+  @Get('config')
+  @RequireRole(ApiKeyRole.ADMIN)
+  @ApiOperation({ summary: 'Read the saved infrastructure configuration for the dashboard form' })
+  @ApiResponse({ status: 200, description: 'Saved configuration (secrets omitted)' })
+  getConfig(): SavedConfigResponse {
+    const envPath = path.resolve(process.cwd(), 'data', '.env.generated');
+    const saved: Record<string, string> = fs.existsSync(envPath) ? dotenv.parse(fs.readFileSync(envPath, 'utf8')) : {};
+
+    // Secrets (passwords, S3 keys) are never returned; the form shows a "set" indicator
+    // and an empty submission preserves the stored value (see saveConfig). This lets the
+    // dashboard hydrate the form so a save no longer overwrites unseen fields (#226).
+    return {
+      database: {
+        type: saved.DATABASE_TYPE === 'postgres' ? 'postgres' : 'sqlite',
+        builtIn: saved.POSTGRES_BUILTIN === 'true',
+        host: saved.DATABASE_HOST || '',
+        port: saved.DATABASE_PORT || '',
+        username: saved.DATABASE_USERNAME || '',
+        database: saved.DATABASE_NAME || '',
+        poolSize: Number(saved.DATABASE_POOL_SIZE) || 10,
+        sslEnabled: saved.DATABASE_SSL === 'true',
+        sslRejectUnauthorized: saved.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false',
+        passwordSet: Boolean(saved.DATABASE_PASSWORD),
+      },
+      redis: {
+        enabled: saved.REDIS_ENABLED === 'true',
+        builtIn: saved.REDIS_BUILTIN === 'true',
+        host: saved.REDIS_HOST || '',
+        port: saved.REDIS_PORT || '',
+        passwordSet: Boolean(saved.REDIS_PASSWORD),
+      },
+      queue: { enabled: saved.QUEUE_ENABLED === 'true' },
+      storage: {
+        type: saved.STORAGE_TYPE === 's3' ? 's3' : 'local',
+        builtIn: saved.MINIO_BUILTIN === 'true',
+        localPath: saved.STORAGE_LOCAL_PATH || '',
+        s3Bucket: saved.S3_BUCKET || '',
+        s3Region: saved.S3_REGION || '',
+        s3Endpoint: saved.S3_ENDPOINT || '',
+        s3CredentialsSet: Boolean(saved.S3_ACCESS_KEY_ID && saved.S3_SECRET_ACCESS_KEY),
+      },
+      engine: {
+        type: saved.ENGINE_TYPE || 'whatsapp-web.js',
+        headless: saved.PUPPETEER_HEADLESS !== 'false',
+        sessionDataPath: saved.SESSION_DATA_PATH || '',
+        browserArgs: saved.PUPPETEER_ARGS || '',
+      },
+    };
+  }
+
   @Put('config')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Save infrastructure configuration to .env file' })
   @ApiResponse({ status: 200, description: 'Configuration saved' })
   @ApiBody({ description: 'Configuration to save' })
   saveConfig(@Body() config: SaveConfigDto): { message: string; saved: boolean; envPath: string; profiles: string[] } {
     try {
-      // Build .env content from config
-      const envLines: string[] = [];
       const profiles: string[] = [];
 
-      // Header
-      envLines.push('# OpenWA Configuration');
-      envLines.push(`# Generated at ${new Date().toISOString()}`);
-      envLines.push('');
+      // Merge into the existing saved config rather than rebuilding from scratch, so a
+      // partial payload (the dashboard only sends the sections it renders) cannot wipe
+      // keys it didn't include (#226).
+      const envPath = path.resolve(process.cwd(), 'data', '.env.generated');
+      const existing: Record<string, string> = fs.existsSync(envPath)
+        ? dotenv.parse(fs.readFileSync(envPath, 'utf8'))
+        : {};
+      const updates: Record<string, string> = {};
+      // Keys to remove from the merged result — used to drop stale settings when the
+      // user switches mode (postgres->sqlite, s3->local) so a reload never sees the new
+      // mode alongside leftover keys from the old one.
+      const staleKeys = new Set<string>();
 
-      // Database
+      // Secret values are never echoed back to the form, so an empty submission means
+      // "unchanged" — keep whatever is already stored instead of blanking it.
+      const setSecret = (key: string, value: string | undefined): void => {
+        if (value) updates[key] = value;
+      };
+
+      // Database. NOTE: these keys must match what src/config/configuration.ts reads.
       if (config.database) {
-        envLines.push('# Database');
-        envLines.push(`DATABASE_TYPE=${config.database.type || 'sqlite'}`);
-        envLines.push(`POSTGRES_BUILTIN=${config.database.builtIn ? 'true' : 'false'}`);
+        updates.DATABASE_TYPE = config.database.type || 'sqlite';
+        updates.POSTGRES_BUILTIN = config.database.builtIn ? 'true' : 'false';
         if (config.database.type === 'postgres') {
           if (config.database.builtIn) {
             // Built-in PostgreSQL - use container name as host
-            envLines.push('DATABASE_HOST=postgres');
-            envLines.push('DATABASE_PORT=5432');
-            envLines.push('DATABASE_USERNAME=openwa');
-            envLines.push('DATABASE_PASSWORD=openwa');
-            envLines.push('DATABASE_NAME=openwa');
+            updates.DATABASE_HOST = 'postgres';
+            updates.DATABASE_PORT = '5432';
+            updates.DATABASE_USERNAME = 'openwa';
+            updates.DATABASE_PASSWORD = 'openwa';
+            updates.DATABASE_NAME = 'openwa';
             profiles.push('postgres');
           } else {
             // External PostgreSQL
-            envLines.push(`DATABASE_HOST=${config.database.host || 'localhost'}`);
-            envLines.push(`DATABASE_PORT=${config.database.port || '5432'}`);
-            envLines.push(`DATABASE_USERNAME=${config.database.username || 'postgres'}`);
-            envLines.push(`DATABASE_PASSWORD=${config.database.password || ''}`);
-            envLines.push(`DATABASE_NAME=${config.database.database || 'openwa'}`);
+            updates.DATABASE_HOST = config.database.host || 'localhost';
+            updates.DATABASE_PORT = config.database.port || '5432';
+            updates.DATABASE_USERNAME = config.database.username || 'postgres';
+            setSecret('DATABASE_PASSWORD', config.database.password);
+            updates.DATABASE_NAME = config.database.database || 'openwa';
           }
-          envLines.push(`DATABASE_POOL_SIZE=${config.database.poolSize || 10}`);
-          envLines.push(`DATABASE_SSL=${config.database.sslEnabled ? 'true' : 'false'}`);
+          updates.DATABASE_POOL_SIZE = String(config.database.poolSize || 10);
+          updates.DATABASE_SSL = config.database.sslEnabled ? 'true' : 'false';
+          if (config.database.sslEnabled) {
+            // Default to certificate verification; only relax it when the operator opts out
+            // (managed Postgres with self-signed certs: Supabase, Heroku, Render, Railway).
+            updates.DATABASE_SSL_REJECT_UNAUTHORIZED =
+              config.database.sslRejectUnauthorized === false ? 'false' : 'true';
+          }
+        } else {
+          // Switching to sqlite: drop stale postgres connection keys.
+          for (const k of [
+            'DATABASE_HOST',
+            'DATABASE_PORT',
+            'DATABASE_USERNAME',
+            'DATABASE_PASSWORD',
+            'DATABASE_NAME',
+            'DATABASE_POOL_SIZE',
+            'DATABASE_SSL',
+            'DATABASE_SSL_REJECT_UNAUTHORIZED',
+          ]) {
+            staleKeys.add(k);
+          }
         }
-        envLines.push('');
       }
 
       // Redis / Queue
-      envLines.push('# Redis / Queue System');
-      envLines.push(`REDIS_ENABLED=${config.redis?.enabled ? 'true' : 'false'}`);
-      envLines.push(`REDIS_BUILTIN=${config.redis?.builtIn ? 'true' : 'false'}`);
-      envLines.push(`QUEUE_ENABLED=${config.queue?.enabled ? 'true' : 'false'}`);
-      if (config.redis?.enabled) {
-        if (config.redis.builtIn) {
-          // Built-in Redis - use container name as host
-          envLines.push('REDIS_HOST=redis');
-          envLines.push('REDIS_PORT=6379');
-          profiles.push('redis');
-        } else {
-          // External Redis
-          envLines.push(`REDIS_HOST=${config.redis.host || 'localhost'}`);
-          envLines.push(`REDIS_PORT=${config.redis.port || '6379'}`);
-          if (config.redis.password) {
-            envLines.push(`REDIS_PASSWORD=${config.redis.password}`);
+      if (config.redis || config.queue) {
+        updates.REDIS_ENABLED = config.redis?.enabled ? 'true' : 'false';
+        updates.REDIS_BUILTIN = config.redis?.builtIn ? 'true' : 'false';
+        updates.QUEUE_ENABLED = config.queue?.enabled ? 'true' : 'false';
+        if (config.redis?.enabled) {
+          if (config.redis.builtIn) {
+            // Built-in Redis - use container name as host
+            updates.REDIS_HOST = 'redis';
+            updates.REDIS_PORT = '6379';
+            profiles.push('redis');
+          } else {
+            // External Redis
+            updates.REDIS_HOST = config.redis.host || 'localhost';
+            updates.REDIS_PORT = config.redis.port || '6379';
+            setSecret('REDIS_PASSWORD', config.redis.password);
           }
         }
       }
-      envLines.push('');
 
-      // Storage
+      // Storage. NOTE: STORAGE_LOCAL_PATH / S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY are
+      // the names configuration.ts reads (previously saved as STORAGE_PATH / S3_*_KEY and
+      // silently ignored — #226).
       if (config.storage) {
-        envLines.push('# Storage');
-        envLines.push(`STORAGE_TYPE=${config.storage.type || 'local'}`);
-        envLines.push(`MINIO_BUILTIN=${config.storage.builtIn ? 'true' : 'false'}`);
+        updates.STORAGE_TYPE = config.storage.type || 'local';
+        updates.MINIO_BUILTIN = config.storage.builtIn ? 'true' : 'false';
         if (config.storage.type === 'local') {
-          envLines.push(`STORAGE_PATH=${config.storage.localPath || './uploads'}`);
+          updates.STORAGE_LOCAL_PATH = config.storage.localPath || './data/media';
+          // Switching to local: drop stale S3 keys.
+          for (const k of ['S3_ENDPOINT', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'S3_BUCKET', 'S3_REGION']) {
+            staleKeys.add(k);
+          }
         } else if (config.storage.type === 's3') {
+          staleKeys.add('STORAGE_LOCAL_PATH');
           if (config.storage.builtIn) {
             // Built-in MinIO - use container name as endpoint
-            envLines.push('S3_ENDPOINT=http://minio:9000');
-            envLines.push('S3_ACCESS_KEY=minioadmin');
-            envLines.push('S3_SECRET_KEY=minioadmin');
-            envLines.push('S3_BUCKET=openwa');
-            envLines.push('S3_REGION=us-east-1');
+            updates.S3_ENDPOINT = 'http://minio:9000';
+            updates.S3_ACCESS_KEY_ID = 'minioadmin';
+            updates.S3_SECRET_ACCESS_KEY = 'minioadmin';
+            updates.S3_BUCKET = 'openwa';
+            updates.S3_REGION = 'us-east-1';
             profiles.push('minio');
           } else {
             // External S3/MinIO
-            envLines.push(`S3_BUCKET=${config.storage.s3Bucket || ''}`);
-            envLines.push(`S3_REGION=${config.storage.s3Region || 'ap-southeast-1'}`);
-            envLines.push(`S3_ACCESS_KEY=${config.storage.s3AccessKey || ''}`);
-            envLines.push(`S3_SECRET_KEY=${config.storage.s3SecretKey || ''}`);
+            updates.S3_BUCKET = config.storage.s3Bucket || '';
+            updates.S3_REGION = config.storage.s3Region || 'ap-southeast-1';
+            setSecret('S3_ACCESS_KEY_ID', config.storage.s3AccessKey);
+            setSecret('S3_SECRET_ACCESS_KEY', config.storage.s3SecretKey);
             if (config.storage.s3Endpoint) {
-              envLines.push(`S3_ENDPOINT=${config.storage.s3Endpoint}`);
+              updates.S3_ENDPOINT = config.storage.s3Endpoint;
             }
           }
         }
-        envLines.push('');
       }
 
-      // Engine
+      // Engine. NOTE: PUPPETEER_HEADLESS / SESSION_DATA_PATH / PUPPETEER_ARGS are the names
+      // configuration.ts reads (previously saved as ENGINE_* and silently ignored — #226).
       if (config.engine) {
-        envLines.push('# WhatsApp Engine');
-        envLines.push(`ENGINE_HEADLESS=${config.engine.headless !== false ? 'true' : 'false'}`);
-        envLines.push(`ENGINE_SESSION_PATH=${config.engine.sessionDataPath || './data/sessions'}`);
-        envLines.push(`ENGINE_BROWSER_ARGS=${config.engine.browserArgs || '--no-sandbox --disable-gpu'}`);
-        envLines.push('');
+        // Persist the selected engine so the Infrastructure tile can actually switch engines (the
+        // active engine was previously only settable via the ENGINE_TYPE env, never from the UI).
+        if (config.engine.type) {
+          const validEngineIds = this.engineFactory.getAvailableEngines().map(e => e.id);
+          if (!validEngineIds.includes(config.engine.type)) {
+            throw new BadRequestException(`Unknown engine type: ${config.engine.type}`);
+          }
+          updates.ENGINE_TYPE = config.engine.type;
+        }
+        updates.PUPPETEER_HEADLESS = config.engine.headless !== false ? 'true' : 'false';
+        updates.SESSION_DATA_PATH = config.engine.sessionDataPath || './data/sessions';
+        updates.PUPPETEER_ARGS = config.engine.browserArgs || '--no-sandbox --disable-gpu';
       }
 
-      // Docker Profiles (for reference)
-      envLines.push('# Docker Profiles (auto-generated)');
-      envLines.push(`# Required profiles: ${profiles.length > 0 ? profiles.join(', ') : 'none'}`);
-      envLines.push('');
+      // .env.generated is one KEY=value per line, loaded on the next boot. A value carrying a
+      // line break would write a second line and inject an arbitrary env var the operator never
+      // set, so refuse any such value before writing anything.
+      for (const [key, value] of Object.entries(updates)) {
+        if (/[\r\n]/.test(value)) {
+          throw new BadRequestException(`Invalid configuration value for ${key}: line breaks are not allowed`);
+        }
+      }
 
-      // Write to .env file in data/ directory so it persists across container restarts
-      const envPath = path.resolve(process.cwd(), 'data', '.env.generated');
-      fs.writeFileSync(envPath, envLines.join('\n'), 'utf8');
+      // Existing values are the base; this payload's values win (secrets handled above).
+      const merged: Record<string, string> = { ...existing, ...updates };
+      // Drop keys made obsolete by a mode switch (postgres->sqlite, s3->local).
+      for (const k of staleKeys) {
+        delete merged[k];
+      }
+      const body = Object.keys(merged)
+        .sort()
+        .map(key => `${key}=${merged[key]}`);
+      const contents = [
+        '# OpenWA Configuration',
+        `# Generated at ${new Date().toISOString()}`,
+        '# Managed via Dashboard > Infrastructure. Values in process env or project .env take precedence.',
+        '',
+        ...body,
+        '',
+      ].join('\n');
+
+      // Write to data/ so it persists across container restarts. Owner-only (0600): this file holds
+      // the DB/S3/Redis credentials, so it must not be world-readable between save and next restart.
+      writeSecretFile(envPath, contents);
       this.logger.log('Configuration saved', { envPath });
 
       const profileMsg = profiles.length > 0 ? ` Docker profiles required: ${profiles.join(', ')}.` : '';
@@ -335,6 +522,7 @@ export class InfraController {
     }
   }
   @Post('restart')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Request server restart with Docker orchestration' })
   @ApiResponse({ status: 200, description: 'Server will restart with new profiles' })
   async requestRestart(@Body() body?: { profiles?: string[]; profilesToRemove?: string[] }): Promise<{
@@ -400,8 +588,9 @@ export class InfraController {
       }
     }
 
-    // Schedule graceful shutdown after delay to allow response and container orchestration
-    void this.shutdownService.shutdown(3000);
+    // Schedule graceful shutdown after the configurable bounded grace (SHUTDOWN_DELAY_MS,
+    // default 3s) — readiness reports 503 during the window so traffic drains first.
+    void this.shutdownService.shutdown();
 
     // Calculate estimated time - base 15s + additional for each service (increased for reliability)
     let estimatedTime = 15;
@@ -436,21 +625,31 @@ export class InfraController {
   }
 
   @Get('export-data')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Export all data from Data DB for migration' })
   @ApiResponse({ status: 200, description: 'Exported data as JSON' })
   async exportData(): Promise<{
     exportedAt: string;
     dataDbType: string;
     tables: MigrationTables;
-    counts: { sessions: number; webhooks: number; messages: number; messageBatches: number };
+    counts: {
+      sessions: number;
+      webhooks: number;
+      messages: number;
+      messageBatches: number;
+      templates: number;
+      baileysStoredMessages: number;
+    };
   }> {
     // Get all entities from Data DB
     const sessions = await this.dataDataSource.query<SessionRow[]>('SELECT * FROM sessions');
     const webhooks = await this.dataDataSource.query<WebhookRow[]>('SELECT * FROM webhooks');
 
-    // Messages table may not exist yet or be empty
+    // These tables may not exist yet (older DB) or be empty.
     let messages: MessageRow[] = [];
     let messageBatches: MessageBatchRow[] = [];
+    let templates: TemplateRow[] = [];
+    let baileysStoredMessages: BaileysStoredMessageRow[] = [];
 
     try {
       messages = await this.dataDataSource.query<MessageRow[]>('SELECT * FROM messages');
@@ -464,6 +663,20 @@ export class InfraController {
       this.logger.debug('Message batches table not available for export', { error: String(error) });
     }
 
+    try {
+      templates = await this.dataDataSource.query<TemplateRow[]>('SELECT * FROM templates');
+    } catch (error) {
+      this.logger.debug('Templates table not available for export', { error: String(error) });
+    }
+
+    try {
+      baileysStoredMessages = await this.dataDataSource.query<BaileysStoredMessageRow[]>(
+        'SELECT * FROM baileys_stored_messages',
+      );
+    } catch (error) {
+      this.logger.debug('Baileys stored messages table not available for export', { error: String(error) });
+    }
+
     return {
       exportedAt: new Date().toISOString(),
       dataDbType: this.configService.get<string>('dataDatabase.type', 'sqlite'),
@@ -472,17 +685,22 @@ export class InfraController {
         webhooks,
         messages,
         messageBatches,
+        templates,
+        baileysStoredMessages,
       },
       counts: {
         sessions: sessions.length,
         webhooks: webhooks.length,
         messages: messages.length,
         messageBatches: messageBatches.length,
+        templates: templates.length,
+        baileysStoredMessages: baileysStoredMessages.length,
       },
     };
   }
 
   @Post('import-data')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Import data to Data DB (replaces existing data)' })
   @ApiBody({
     description: 'Exported data from export-data endpoint',
@@ -509,7 +727,14 @@ export class InfraController {
     },
   ): Promise<{
     imported: boolean;
-    counts: { sessions: number; webhooks: number; messages: number; messageBatches: number };
+    counts: {
+      sessions: number;
+      webhooks: number;
+      messages: number;
+      messageBatches: number;
+      templates: number;
+      baileysStoredMessages: number;
+    };
     warnings: string[];
   }> {
     const warnings: string[] = [];
@@ -518,10 +743,15 @@ export class InfraController {
     await queryRunner.startTransaction();
 
     try {
-      // Clear existing data (in correct order due to foreign keys)
+      // Clear existing data (in correct order due to foreign keys). templates and
+      // baileys_stored_messages FK sessions ON DELETE CASCADE, so the sessions DELETE would clear
+      // them too; clearing them explicitly first keeps the order correct on engines where the
+      // cascade is not enforced, and is a no-op when the table doesn't exist.
       await queryRunner.query('DELETE FROM webhooks');
       await queryRunner.query('DELETE FROM messages').catch(() => {});
       await queryRunner.query('DELETE FROM message_batches').catch(() => {});
+      await queryRunner.query('DELETE FROM templates').catch(() => {});
+      await queryRunner.query('DELETE FROM baileys_stored_messages').catch(() => {});
       await queryRunner.query('DELETE FROM sessions');
 
       // Import sessions first
@@ -560,8 +790,8 @@ export class InfraController {
         for (const webhook of data.tables.webhooks) {
           try {
             await queryRunner.query(
-              `INSERT INTO webhooks (id, "sessionId", url, events, secret, headers, active, "retryCount", "lastTriggeredAt", "createdAt", "updatedAt") 
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+              `INSERT INTO webhooks (id, "sessionId", url, events, secret, headers, filters, active, "retryCount", "lastTriggeredAt", "createdAt", "updatedAt")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
               [
                 webhook.id,
                 webhook.sessionId,
@@ -569,6 +799,11 @@ export class InfraController {
                 typeof webhook.events === 'string' ? webhook.events : JSON.stringify(webhook.events || []),
                 webhook.secret,
                 typeof webhook.headers === 'string' ? webhook.headers : JSON.stringify(webhook.headers || {}),
+                webhook.filters == null
+                  ? null
+                  : typeof webhook.filters === 'string'
+                    ? webhook.filters
+                    : JSON.stringify(webhook.filters),
                 webhook.active,
                 webhook.retryCount,
                 webhook.lastTriggeredAt,
@@ -589,20 +824,26 @@ export class InfraController {
         for (const msg of data.tables.messages) {
           try {
             await queryRunner.query(
-              `INSERT INTO messages (id, "sessionId", "messageId", "chatId", direction, type, content, status, metadata, "createdAt", "updatedAt") 
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+              `INSERT INTO messages (id, "sessionId", "waMessageId", "chatId", "from", "to", body, type, direction, "timestamp", metadata, status, "createdAt")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
               [
                 msg.id,
                 msg.sessionId,
-                msg.messageId,
+                msg.waMessageId ?? null,
                 msg.chatId,
-                msg.direction,
+                msg.from,
+                msg.to,
+                msg.body ?? null,
                 msg.type,
-                typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content || {}),
+                msg.direction,
+                msg.timestamp ?? null,
+                msg.metadata == null
+                  ? null
+                  : typeof msg.metadata === 'string'
+                    ? msg.metadata
+                    : JSON.stringify(msg.metadata),
                 msg.status,
-                typeof msg.metadata === 'string' ? msg.metadata : JSON.stringify(msg.metadata || {}),
                 msg.createdAt,
-                msg.updatedAt,
               ],
             );
             messagesCount++;
@@ -618,22 +859,34 @@ export class InfraController {
         for (const batch of data.tables.messageBatches) {
           try {
             await queryRunner.query(
-              `INSERT INTO message_batches (id, "batchId", "sessionId", status, messages, options, progress, results, "currentIndex", "createdAt", "updatedAt", "startedAt", "completedAt") 
+              `INSERT INTO message_batches (id, batch_id, session_id, status, messages, options, progress, results, current_index, created_at, updated_at, started_at, completed_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
               [
                 batch.id,
-                batch.batchId,
-                batch.sessionId,
+                batch.batch_id,
+                batch.session_id,
                 batch.status,
-                typeof batch.messages === 'string' ? batch.messages : JSON.stringify(batch.messages || []),
-                typeof batch.options === 'string' ? batch.options : JSON.stringify(batch.options || {}),
-                typeof batch.progress === 'string' ? batch.progress : JSON.stringify(batch.progress || {}),
-                typeof batch.results === 'string' ? batch.results : JSON.stringify(batch.results || []),
-                batch.currentIndex,
-                batch.createdAt,
-                batch.updatedAt,
-                batch.startedAt,
-                batch.completedAt,
+                typeof batch.messages === 'string' ? batch.messages : JSON.stringify(batch.messages ?? []),
+                batch.options == null
+                  ? null
+                  : typeof batch.options === 'string'
+                    ? batch.options
+                    : JSON.stringify(batch.options),
+                batch.progress == null
+                  ? null
+                  : typeof batch.progress === 'string'
+                    ? batch.progress
+                    : JSON.stringify(batch.progress),
+                batch.results == null
+                  ? null
+                  : typeof batch.results === 'string'
+                    ? batch.results
+                    : JSON.stringify(batch.results),
+                batch.current_index,
+                batch.created_at,
+                batch.updated_at,
+                batch.started_at,
+                batch.completed_at,
               ],
             );
             messageBatchesCount++;
@@ -643,18 +896,69 @@ export class InfraController {
         }
       }
 
-      await queryRunner.commitTransaction();
+      // Import templates (optional; FK -> sessions, restored above)
+      let templatesCount = 0;
+      if (data.tables.templates?.length) {
+        for (const tpl of data.tables.templates) {
+          try {
+            await queryRunner.query(
+              `INSERT INTO templates (id, "sessionId", name, body, header, footer, "createdAt", "updatedAt")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+              [
+                tpl.id,
+                tpl.sessionId,
+                tpl.name,
+                tpl.body,
+                tpl.header ?? null,
+                tpl.footer ?? null,
+                tpl.createdAt,
+                tpl.updatedAt,
+              ],
+            );
+            templatesCount++;
+          } catch (err) {
+            warnings.push(`Failed to import template ${tpl.id}: ${err}`);
+          }
+        }
+      }
 
-      return {
-        imported: true,
-        counts: {
-          sessions: sessionsCount,
-          webhooks: webhooksCount,
-          messages: messagesCount,
-          messageBatches: messageBatchesCount,
-        },
-        warnings,
+      // Import baileys stored messages (optional; FK -> sessions, restored above)
+      let baileysStoredMessagesCount = 0;
+      if (data.tables.baileysStoredMessages?.length) {
+        for (const bsm of data.tables.baileysStoredMessages) {
+          try {
+            await queryRunner.query(
+              `INSERT INTO baileys_stored_messages (id, "sessionId", "waMessageId", "serializedMessage", "createdAt")
+               VALUES ($1, $2, $3, $4, $5)`,
+              [bsm.id, bsm.sessionId, bsm.waMessageId, bsm.serializedMessage, bsm.createdAt],
+            );
+            baileysStoredMessagesCount++;
+          } catch (err) {
+            warnings.push(`Failed to import baileys stored message ${bsm.id}: ${err}`);
+          }
+        }
+      }
+
+      const counts = {
+        sessions: sessionsCount,
+        webhooks: webhooksCount,
+        messages: messagesCount,
+        messageBatches: messageBatchesCount,
+        templates: templatesCount,
+        baileysStoredMessages: baileysStoredMessagesCount,
       };
+
+      // "Replace all data" must be all-or-nothing: the import already DELETEd every row, so if any
+      // INSERT failed we must roll back (restoring the pre-import data) rather than commit a
+      // half-wiped DB and report success. A partial restore reported as imported:true was how
+      // message history could silently vanish on a SQLite->Postgres migration.
+      if (warnings.length > 0) {
+        await queryRunner.rollbackTransaction();
+        return { imported: false, counts, warnings };
+      }
+
+      await queryRunner.commitTransaction();
+      return { imported: true, counts, warnings };
     } catch (error) {
       await queryRunner.rollbackTransaction();
       throw error;
@@ -668,6 +972,7 @@ export class InfraController {
   // ============================================================================
 
   @Get('storage/files/count')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get file count in current storage' })
   @ApiResponse({ status: 200, description: 'File count and size' })
   async getStorageFileCount(): Promise<{
@@ -686,13 +991,23 @@ export class InfraController {
   }
 
   @Get('storage/export')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Export all storage files as tar.gz' })
   @ApiResponse({ status: 200, description: 'Tar.gz archive stream' })
   async exportStorage(): Promise<{ message: string; download: string }> {
     // Note: In production, this would return a StreamableFile
     // For simplicity, we'll save to a temp file and return the path
     const stream = await this.storageService.createExportStream();
-    const exportPath = path.join(process.cwd(), 'data', `storage-export-${Date.now()}.tar.gz`);
+    // Keep the export INSIDE data/ (under data/exports/): the import handler only accepts paths under
+    // data/, and the documented backend-migration flow re-imports this file AFTER a container restart,
+    // so it must live on the persistent volume — the OS temp dir is wiped on restart. The original
+    // unbounded-accumulation leak is addressed by the TTL sweep below + a collision-proof filename
+    // (a per-call UUID), not by relocating off the volume.
+    const exportDir = path.join(process.cwd(), 'data', 'exports');
+    if (!fs.existsSync(exportDir)) {
+      fs.mkdirSync(exportDir, { recursive: true });
+    }
+    const exportPath = path.join(exportDir, `storage-export-${Date.now()}-${randomUUID()}.tar.gz`);
 
     const writeStream = fs.createWriteStream(exportPath);
     stream.pipe(writeStream);
@@ -702,6 +1017,13 @@ export class InfraController {
       writeStream.on('error', reject);
     });
 
+    // Sweep the throwaway archive so repeated exports don't accumulate on the data volume.
+    const ttlRaw = Number.parseInt(process.env.STORAGE_EXPORT_TTL_MS ?? '', 10);
+    const ttlMs = Number.isInteger(ttlRaw) && ttlRaw > 0 ? ttlRaw : 60 * 60 * 1000; // default 1h
+    setTimeout(() => {
+      fs.promises.unlink(exportPath).catch(() => undefined);
+    }, ttlMs).unref();
+
     return {
       message: 'Storage export completed',
       download: exportPath,
@@ -709,6 +1031,7 @@ export class InfraController {
   }
 
   @Post('storage/import')
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Import storage files from tar.gz' })
   @ApiBody({ description: 'Path to tar.gz file to import' })
   @ApiResponse({ status: 200, description: 'Import result' })
@@ -717,8 +1040,15 @@ export class InfraController {
   ): Promise<{ imported: boolean; count: number; storageType: string }> {
     const { filePath } = body;
 
+    // `filePath` is fully caller-controlled. Restrict it to the app's data
+    // directory so it cannot point at arbitrary files on the host.
+    const dataDir = path.join(process.cwd(), 'data');
+    if (!filePath || !isPathWithin(dataDir, filePath)) {
+      throw new BadRequestException('filePath must reference a file inside the data directory');
+    }
+
     if (!fs.existsSync(filePath)) {
-      throw new Error(`File not found: ${filePath}`);
+      throw new BadRequestException(`File not found: ${filePath}`);
     }
 
     const readStream = fs.createReadStream(filePath);

@@ -21,34 +21,22 @@ X-API-Key: your-api-key-here
 
 ### Response Format
 
+Responses are the **raw handler payload** — there is no `{success, data, meta}` envelope.
+A successful response is the resource itself (object) or a bare array for lists.
+
 ```json
-{
-  "success": true,
-  "data": { ... },
-  "meta": {
-    "timestamp": "2026-02-02T10:30:00Z",
-    "requestId": "req_abc123"
-  }
-}
+{ "id": "abc", "status": "READY" }
 ```
 
 ### Error Format
 
+Errors use the NestJS default shape:
+
 ```json
 {
-  "success": false,
-  "error": {
-    "code": "VALIDATION_ERROR",
-    "message": "Invalid phone number format",
-    "details": {
-      "field": "phone",
-      "expected": "format: 628xxx@c.us"
-    }
-  },
-  "meta": {
-    "timestamp": "2026-02-02T10:30:00Z",
-    "requestId": "req_abc123"
-  }
+  "statusCode": 400,
+  "message": "Invalid phone number format",
+  "error": "Bad Request"
 }
 ```
 
@@ -83,7 +71,7 @@ curl -H "X-API-Key: $API_KEY" \
 ```json
 {
   "status": "ok",
-  "version": "0.1.0",
+  "version": "0.4.6",
   "uptime": 86400,
   "timestamp": "2026-02-02T10:30:00Z",
   "checks": {
@@ -145,26 +133,18 @@ curl -H "X-API-Key: $API_KEY" \
 
 **Response:**
 ```json
-{
-  "success": true,
-  "data": [
-    {
-      "id": "default",
-      "name": "Default Session",
-      "status": "CONNECTED",
-      "phoneNumber": "628123456789",
-      "profileName": "John Doe",
-      "profilePicture": "https://...",
-      "createdAt": "2026-02-01T00:00:00Z",
-      "lastSeen": "2026-02-02T10:30:00Z"
-    }
-  ],
-  "meta": {
-    "total": 1,
-    "limit": 20,
-    "offset": 0
+[
+  {
+    "id": "default",
+    "name": "Default Session",
+    "status": "CONNECTED",
+    "phoneNumber": "628123456789",
+    "profileName": "John Doe",
+    "profilePicture": "https://...",
+    "createdAt": "2026-02-01T00:00:00Z",
+    "lastSeen": "2026-02-02T10:30:00Z"
   }
-}
+]
 ```
 
 ### POST /api/sessions
@@ -197,14 +177,11 @@ curl -X POST http://localhost:2785/api/sessions \
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "id": "session-1",
-    "name": "Customer Support",
-    "status": "INITIALIZING",
-    "qr": null,
-    "createdAt": "2026-02-02T10:30:00Z"
-  }
+  "id": "session-1",
+  "name": "Customer Support",
+  "status": "INITIALIZING",
+  "qr": null,
+  "createdAt": "2026-02-02T10:30:00Z"
 }
 ```
 
@@ -220,28 +197,25 @@ curl -H "X-API-Key: $API_KEY" \
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "id": "session-1",
-    "name": "Customer Support",
-    "status": "CONNECTED",
-    "phoneNumber": "628123456789",
-    "profileName": "John Doe",
-    "profilePicture": "https://...",
-    "pushName": "John",
-    "platform": "android",
-    "config": {
-      "autoReconnect": true,
-      "webhookUrl": "https://your-server.com/webhook"
-    },
-    "stats": {
-      "messagesReceived": 1234,
-      "messagesSent": 567,
-      "lastMessageAt": "2026-02-02T10:25:00Z"
-    },
-    "createdAt": "2026-02-01T00:00:00Z",
-    "lastSeen": "2026-02-02T10:30:00Z"
-  }
+  "id": "session-1",
+  "name": "Customer Support",
+  "status": "CONNECTED",
+  "phoneNumber": "628123456789",
+  "profileName": "John Doe",
+  "profilePicture": "https://...",
+  "pushName": "John",
+  "platform": "android",
+  "config": {
+    "autoReconnect": true,
+    "webhookUrl": "https://your-server.com/webhook"
+  },
+  "stats": {
+    "messagesReceived": 1234,
+    "messagesSent": 567,
+    "lastMessageAt": "2026-02-02T10:25:00Z"
+  },
+  "createdAt": "2026-02-01T00:00:00Z",
+  "lastSeen": "2026-02-02T10:30:00Z"
 }
 ```
 
@@ -263,10 +237,7 @@ curl -X DELETE \
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "message": "Session deleted successfully"
-  }
+  "message": "Session deleted successfully"
 }
 ```
 
@@ -287,11 +258,8 @@ curl -H "X-API-Key: $API_KEY" \
 **Response (format=base64):**
 ```json
 {
-  "success": true,
-  "data": {
-    "qr": "data:image/png;base64,iVBORw0KGgo...",
-    "expiresAt": "2026-02-02T10:31:00Z"
-  }
+  "qr": "data:image/png;base64,iVBORw0KGgo...",
+  "expiresAt": "2026-02-02T10:31:00Z"
 }
 ```
 
@@ -311,11 +279,8 @@ curl -X POST \
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "message": "Session restarting",
-    "status": "INITIALIZING"
-  }
+  "message": "Session restarting",
+  "status": "INITIALIZING"
 }
 ```
 
@@ -332,10 +297,7 @@ curl -X POST \
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "message": "Session logged out successfully"
-  }
+  "message": "Session logged out successfully"
 }
 ```
 
@@ -435,53 +397,25 @@ curl -X POST http://localhost:2785/api/sessions/default/messages \
 }
 ```
 
-**Request Body - Buttons (Interactive):**
-```json
-{
-  "phone": "628123456789@c.us",
-  "type": "buttons",
-  "body": "Please choose an option:",
-  "buttons": [
-    { "id": "btn1", "text": "Option 1" },
-    { "id": "btn2", "text": "Option 2" },
-    { "id": "btn3", "text": "Option 3" }
-  ],
-  "footer": "Powered by OpenWA"
-}
-```
+**Interactive messages (Buttons / List): not supported**
 
-**Request Body - List (Interactive):**
-```json
-{
-  "phone": "628123456789@c.us",
-  "type": "list",
-  "body": "Please select from the menu:",
-  "buttonText": "View Menu",
-  "sections": [
-    {
-      "title": "Category 1",
-      "rows": [
-        { "id": "item1", "title": "Item 1", "description": "Description 1" },
-        { "id": "item2", "title": "Item 2", "description": "Description 2" }
-      ]
-    }
-  ],
-  "footer": "Powered by OpenWA"
-}
-```
+> ⚠️ **Buttons and List (interactive) messages are not available** through OpenWA's
+> unofficial-client engines (`whatsapp-web.js` default or `baileys`). WhatsApp stopped
+> honoring the interactive-message payload for unofficial clients around 2021–2022 —
+> messages of this type are **silently dropped and never delivered** to recipients.
+> OpenWA therefore does not expose `type: "buttons"` or `type: "list"` endpoints;
+> sending interactive messages requires the official WhatsApp Business Cloud API.
+> (The earlier examples here were speculative and never implemented — see #158.)
 
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "id": "MSG_ABC123DEF456",
-    "phone": "628123456789@c.us",
-    "type": "text",
-    "body": "Hello, World!",
-    "status": "PENDING",
-    "timestamp": "2026-02-02T10:30:00Z"
-  }
+  "id": "MSG_ABC123DEF456",
+  "phone": "628123456789@c.us",
+  "type": "text",
+  "body": "Hello, World!",
+  "status": "PENDING",
+  "timestamp": "2026-02-02T10:30:00Z"
 }
 ```
 
@@ -514,29 +448,22 @@ curl -H "X-API-Key: $API_KEY" \
 | limit | number | Max results (default: 50, max: 200) |
 | before | string | Messages before this ID |
 | after | string | Messages after this ID |
-| type | string | Filter by type: `chat`, `image`, `video`, etc. |
+| type | string | Filter by type: `text`, `image`, `video`, etc. |
 
 **Response:**
 ```json
-{
-  "success": true,
-  "data": [
-    {
-      "id": "MSG_ABC123",
-      "from": "628123456789@c.us",
-      "to": "628987654321@c.us",
-      "body": "Hello!",
-      "type": "chat",
-      "timestamp": "2026-02-02T10:25:00Z",
-      "status": "READ",
-      "isFromMe": false
-    }
-  ],
-  "meta": {
-    "hasMore": true,
-    "nextCursor": "MSG_DEF456"
+[
+  {
+    "id": "MSG_ABC123",
+    "from": "628123456789@c.us",
+    "to": "628987654321@c.us",
+    "body": "Hello!",
+    "type": "text",
+    "timestamp": "2026-02-02T10:25:00Z",
+    "status": "READ",
+    "isFromMe": false
   }
-}
+]
 ```
 
 ### GET /api/sessions/:id/messages/:messageId
@@ -587,20 +514,17 @@ curl -H "X-API-Key: $API_KEY" \
 
 **Response:**
 ```json
-{
-  "success": true,
-  "data": [
-    {
-      "id": "628123456789@c.us",
-      "name": "John Doe",
-      "pushName": "John",
-      "shortName": "John",
-      "isMyContact": true,
-      "isBlocked": false,
-      "profilePicture": "https://..."
-    }
-  ]
-}
+[
+  {
+    "id": "628123456789@c.us",
+    "name": "John Doe",
+    "pushName": "John",
+    "shortName": "John",
+    "isMyContact": true,
+    "isBlocked": false,
+    "profilePicture": "https://..."
+  }
+]
 ```
 
 ### GET /api/sessions/:id/contacts/:phone
@@ -612,25 +536,26 @@ curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions/default/contacts/628123456789
 ```
 
-### GET /api/sessions/:id/contacts/:phone/exists
+### GET /api/sessions/:id/contacts/check/:number
 
 Check if number exists on WhatsApp.
 
 ```bash
 curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/sessions/default/contacts/628123456789/exists
+  http://localhost:2785/api/sessions/default/contacts/check/628123456789
 ```
 
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "exists": true,
-    "jid": "628123456789@c.us"
-  }
+  "number": "628123456789",
+  "exists": true,
+  "whatsappId": "628123456789@c.us"
 }
 ```
+
+`whatsappId` is the engine's canonical WhatsApp ID (`null` when `exists` is
+`false`); it may be normalized and differ from the submitted number.
 
 ### POST /api/sessions/:id/contacts/:phone/block
 
@@ -665,20 +590,17 @@ curl -H "X-API-Key: $API_KEY" \
 
 **Response:**
 ```json
-{
-  "success": true,
-  "data": [
-    {
-      "id": "120363123456789@g.us",
-      "name": "Family Group",
-      "description": "Family chat",
-      "participantsCount": 15,
-      "isAdmin": true,
-      "profilePicture": "https://...",
-      "createdAt": "2025-01-15T00:00:00Z"
-    }
-  ]
-}
+[
+  {
+    "id": "120363123456789@g.us",
+    "name": "Family Group",
+    "description": "Family chat",
+    "participantsCount": 15,
+    "isAdmin": true,
+    "profilePicture": "https://...",
+    "createdAt": "2025-01-15T00:00:00Z"
+  }
+]
 ```
 
 ### POST /api/sessions/:id/groups
@@ -701,12 +623,9 @@ curl -X POST http://localhost:2785/api/sessions/default/groups \
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "id": "120363987654321@g.us",
-    "name": "New Group",
-    "inviteCode": "ABC123XYZ"
-  }
+  "id": "120363987654321@g.us",
+  "name": "New Group",
+  "inviteCode": "ABC123XYZ"
 }
 ```
 
@@ -722,31 +641,28 @@ curl -H "X-API-Key: $API_KEY" \
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "id": "120363123456789@g.us",
-    "name": "Family Group",
-    "description": "Family chat",
-    "owner": "628111222333@c.us",
-    "participants": [
-      {
-        "id": "628123456789@c.us",
-        "isAdmin": true,
-        "isSuperAdmin": false
-      },
-      {
-        "id": "628987654321@c.us",
-        "isAdmin": false,
-        "isSuperAdmin": false
-      }
-    ],
-    "settings": {
-      "announce": false,
-      "restrict": false
+  "id": "120363123456789@g.us",
+  "name": "Family Group",
+  "description": "Family chat",
+  "owner": "628111222333@c.us",
+  "participants": [
+    {
+      "id": "628123456789@c.us",
+      "isAdmin": true,
+      "isSuperAdmin": false
     },
-    "inviteCode": "ABC123XYZ",
-    "createdAt": "2025-01-15T00:00:00Z"
-  }
+    {
+      "id": "628987654321@c.us",
+      "isAdmin": false,
+      "isSuperAdmin": false
+    }
+  ],
+  "settings": {
+    "announce": false,
+    "restrict": false
+  },
+  "inviteCode": "ABC123XYZ",
+  "createdAt": "2025-01-15T00:00:00Z"
 }
 ```
 
@@ -838,11 +754,8 @@ curl -H "X-API-Key: $API_KEY" \
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "inviteCode": "ABC123XYZ",
-    "inviteUrl": "https://chat.whatsapp.com/ABC123XYZ"
-  }
+  "inviteCode": "ABC123XYZ",
+  "inviteUrl": "https://chat.whatsapp.com/ABC123XYZ"
 }
 ```
 
@@ -869,20 +782,17 @@ curl -H "X-API-Key: $API_KEY" \
 
 **Response:**
 ```json
-{
-  "success": true,
-  "data": [
-    {
-      "id": "wh_123",
-      "url": "https://your-server.com/webhook",
-      "events": ["message.received", "message.ack"],
-      "sessionId": "sess_abc123",
-      "enabled": true,
-      "secret": "whsec_***",
-      "createdAt": "2026-02-01T00:00:00Z"
-    }
-  ]
-}
+[
+  {
+    "id": "wh_123",
+    "url": "https://your-server.com/webhook",
+    "events": ["message.received", "message.ack"],
+    "sessionId": "sess_abc123",
+    "enabled": true,
+    "secret": "whsec_***",
+    "createdAt": "2026-02-01T00:00:00Z"
+  }
+]
 ```
 
 ### POST /api/sessions/:sessionId/webhooks
@@ -916,6 +826,7 @@ message.received       - New incoming message
 message.sent           - Message sent
 message.ack            - Message status (sent, delivered, read)
 message.revoked        - Message deleted
+message.reaction       - Reaction added, changed, or removed
 session.status         - Session status change
 session.qr             - QR code generated
 session.authenticated  - Session authenticated
@@ -928,16 +839,13 @@ group.update           - Group settings changed
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "id": "wh_456",
-    "url": "https://your-server.com/webhook",
-    "events": ["message.received", "message.ack", "session.status"],
-    "sessionId": "sess_abc123",
-    "enabled": true,
-    "secret": "whsec_abc123xyz",
-    "createdAt": "2026-02-02T10:30:00Z"
-  }
+  "id": "wh_456",
+  "url": "https://your-server.com/webhook",
+  "events": ["message.received", "message.ack", "session.status"],
+  "sessionId": "sess_abc123",
+  "enabled": true,
+  "secret": "whsec_abc123xyz",
+  "createdAt": "2026-02-02T10:30:00Z"
 }
 ```
 
@@ -985,23 +893,20 @@ curl -H "X-API-Key: $API_KEY" \
 
 **Response:**
 ```json
-{
-  "success": true,
-  "data": [
-    {
-      "id": "log_789",
-      "webhookId": "wh_456",
-      "event": "message.received",
-      "status": "success",
-      "statusCode": 200,
-      "duration": 150,
-      "attempt": 1,
-      "payload": { ... },
-      "response": { ... },
-      "createdAt": "2026-02-02T10:30:00Z"
-    }
-  ]
-}
+[
+  {
+    "id": "log_789",
+    "webhookId": "wh_456",
+    "event": "message.received",
+    "status": "success",
+    "statusCode": 200,
+    "duration": 150,
+    "attempt": 1,
+    "payload": { },
+    "response": { },
+    "createdAt": "2026-02-02T10:30:00Z"
+  }
+]
 ```
 
 ### POST /api/sessions/:sessionId/webhooks/:id/test
@@ -1017,110 +922,137 @@ curl -X POST \
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "status": "success",
-    "statusCode": 200,
-    "duration": 125,
-    "response": {
-      "received": true
-    }
+  "status": "success",
+  "statusCode": 200,
+  "duration": 125,
+  "response": {
+    "received": true
   }
 }
 ```
 
 ## 07.8 API Keys API
 
-### GET /api/api-keys
+All API key management endpoints require an admin API key in `X-API-Key`.
+OpenWA creates the initial admin key on first run, prints it in the startup
+logs, and writes it to `data/.api-key` (or `/app/data/.api-key` inside the API
+container). By default a random `owa_k1_...` admin key is generated on first run
+in all environments; set `ALLOW_DEV_API_KEY=true` to seed the well-known
+`dev-admin-key` for local development only.
+
+### GET /api/auth/api-keys
 
 List API keys.
 
 ```bash
 curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/api-keys
+  http://localhost:2785/api/auth/api-keys
 ```
 
 **Response:**
 ```json
-{
-  "success": true,
-  "data": [
-    {
-      "id": "key_123",
-      "name": "Production Key",
-      "prefix": "owa_prod_***",
-      "permissions": ["*"],
-      "sessionAccess": ["*"],
-      "rateLimit": 1000,
-      "lastUsed": "2026-02-02T10:30:00Z",
-      "expiresAt": null,
-      "createdAt": "2026-01-01T00:00:00Z"
-    }
-  ]
-}
+[
+  {
+    "id": "2a8f41e3-3b9a-4a1d-b6d0-b9910df8f0be",
+    "name": "Production Key",
+    "keyPrefix": "owa_k1_abcd",
+    "role": "operator",
+    "allowedIps": ["192.168.1.10"],
+    "allowedSessions": ["session-uuid-1"],
+    "isActive": true,
+    "lastUsedAt": "2026-02-02T10:30:00Z",
+    "usageCount": 12,
+    "expiresAt": null,
+    "createdAt": "2026-01-01T00:00:00Z"
+  }
+]
 ```
 
-### POST /api/api-keys
+### POST /api/auth/api-keys
 
 Create API key.
 
 ```bash
-curl -X POST http://localhost:2785/api/api-keys \
+curl -X POST http://localhost:2785/api/auth/api-keys \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Integration Key",
-    "permissions": ["sessions:read", "messages:write"],
-    "sessionAccess": ["default"],
-    "rateLimit": 100,
+    "role": "operator",
+    "allowedIps": ["192.168.1.10"],
+    "allowedSessions": ["default"],
     "expiresAt": "2027-01-01T00:00:00Z"
   }'
 ```
 
-**Permissions:**
+**Roles:**
 ```
-*                    - All permissions
-sessions:read        - Read session info
-sessions:write       - Create/delete sessions
-messages:read        - Read messages
-messages:write       - Send messages
-contacts:read        - Read contacts
-contacts:write       - Block/unblock contacts
-groups:read          - Read group info
-groups:write         - Manage groups
-webhooks:read        - Read webhooks
-webhooks:write       - Manage webhooks
-api-keys:read        - Read API keys
-api-keys:write       - Manage API keys
+admin     - Full access, including API key management
+operator  - Operational API access for integrations
+viewer    - Read-only API access where supported
 ```
 
 **Response:**
 ```json
 {
-  "success": true,
-  "data": {
-    "id": "key_456",
-    "name": "Integration Key",
-    "key": "owa_abc123xyz789...",
-    "permissions": ["sessions:read", "messages:write"],
-    "sessionAccess": ["default"],
-    "rateLimit": 100,
-    "expiresAt": "2027-01-01T00:00:00Z",
-    "createdAt": "2026-02-02T10:30:00Z"
-  }
+  "id": "4d0564f1-5fb7-4e4a-baae-4cb0d154e861",
+  "name": "Integration Key",
+  "keyPrefix": "owa_k1_efgh",
+  "role": "operator",
+  "allowedIps": ["192.168.1.10"],
+  "allowedSessions": ["default"],
+  "isActive": true,
+  "usageCount": 0,
+  "expiresAt": "2027-01-01T00:00:00Z",
+  "createdAt": "2026-02-02T10:30:00Z",
+  "apiKey": "owa_k1_efgh5678..."
 }
 ```
 
-**Note:** The full `key` is only shown once at creation.
+**Note:** The full `apiKey` is only shown once at creation.
 
-### DELETE /api/api-keys/:id
+### PUT /api/auth/api-keys/:id
 
-Revoke API key.
+Update API key metadata, role, IP allowlist, session allowlist, or expiry.
+
+```bash
+curl -X PUT http://localhost:2785/api/auth/api-keys/4d0564f1-5fb7-4e4a-baae-4cb0d154e861 \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Integration Key - Production",
+    "role": "operator"
+  }'
+```
+
+### POST /api/auth/api-keys/:id/revoke
+
+Revoke API key without deleting its record.
+
+```bash
+curl -X POST \
+  -H "X-API-Key: $API_KEY" \
+  http://localhost:2785/api/auth/api-keys/4d0564f1-5fb7-4e4a-baae-4cb0d154e861/revoke
+```
+
+### DELETE /api/auth/api-keys/:id
+
+Delete API key.
 
 ```bash
 curl -X DELETE \
   -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/api-keys/key_456
+  http://localhost:2785/api/auth/api-keys/4d0564f1-5fb7-4e4a-baae-4cb0d154e861
+```
+
+### POST /api/auth/validate
+
+Validate the API key provided in the `X-API-Key` header.
+
+```bash
+curl -X POST \
+  -H "X-API-Key: $API_KEY" \
+  http://localhost:2785/api/auth/validate
 ```
 
 ## 07.9 Postman Collection
@@ -1320,7 +1252,7 @@ curl -s -X POST "$BASE_URL/api/sessions" \
 # Get QR Code
 echo "=== Get QR Code ==="
 curl -s "$BASE_URL/api/sessions/$SESSION_ID/qr" \
-  -H "X-API-Key: $API_KEY" | jq -r '.data.qr'
+  -H "X-API-Key: $API_KEY" | jq -r '.qr'
 
 # Send Text Message
 echo "=== Send Text Message ==="

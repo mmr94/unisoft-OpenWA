@@ -648,12 +648,12 @@ class OpenWA:
 
                 if not response.ok:
                     raise OpenWAError(
-                        message=data.get("error", {}).get("message", "Unknown error"),
-                        code=data.get("error", {}).get("code", "UNKNOWN"),
+                        message=data.get("message", "Unknown error"),
+                        code=str(response.status),
                         status=response.status
                     )
 
-                return data.get("data", data)
+                return data
 
     async def health(self) -> Dict[str, Any]:
         return await self._request("GET", "/health")
@@ -932,22 +932,14 @@ class Client
             $response = $this->http->request($method, $path, $options);
             $data = json_decode($response->getBody()->getContents(), true);
 
-            if (!isset($data['success']) || !$data['success']) {
-                throw new OpenWAException(
-                    $data['error']['message'] ?? 'Unknown error',
-                    $data['error']['code'] ?? 'UNKNOWN',
-                    $response->getStatusCode()
-                );
-            }
-
-            return $data['data'] ?? [];
+            return $data ?? [];
         } catch (\GuzzleHttp\Exception\RequestException $e) {
             $response = $e->getResponse();
-            $data = json_decode($response->getBody()->getContents(), true);
+            $data = $response ? json_decode($response->getBody()->getContents(), true) : null;
 
             throw new OpenWAException(
-                $data['error']['message'] ?? $e->getMessage(),
-                $data['error']['code'] ?? 'REQUEST_ERROR',
+                $data['message'] ?? $e->getMessage(),
+                'HTTP_ERROR',
                 $response ? $response->getStatusCode() : 0
             );
         }
@@ -1314,7 +1306,7 @@ export class OpenWA implements INodeType {
         }
       }
 
-      returnData.push({ json: response.data });
+      returnData.push({ json: response });
     }
 
     return [returnData];
@@ -1403,7 +1395,7 @@ export class OpenWATrigger implements INodeType {
           json: true,
         });
 
-        return response.data.some((w: any) => w.url === webhookUrl);
+        return response.some((w: any) => w.url === webhookUrl);
       },
 
       async create(this: IHookFunctions): Promise<boolean> {
@@ -1439,7 +1431,7 @@ export class OpenWATrigger implements INodeType {
           json: true,
         });
 
-        const webhook = response.data.find((w: any) => w.url === webhookUrl);
+        const webhook = response.find((w: any) => w.url === webhookUrl);
         if (webhook) {
           await this.helpers.request({
             method: 'DELETE',

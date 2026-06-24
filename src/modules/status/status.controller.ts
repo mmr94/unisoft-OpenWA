@@ -1,11 +1,12 @@
 import { Controller, Get, Post, Delete, Param, Body } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
+import { ApiTags, ApiOperation } from '@nestjs/swagger';
 import { StatusService } from './status.service';
 import { SendTextStatusDto } from './dto/send-text-status.dto';
 import { SendImageStatusDto, SendVideoStatusDto } from './dto/send-media-status.dto';
+import { RequireRole } from '../auth/decorators/auth.decorators';
+import { ApiKeyRole } from '../auth/entities/api-key.entity';
 
 @ApiTags('Status')
-@ApiBearerAuth()
 @Controller('sessions/:sessionId/status')
 export class StatusController {
   constructor(private readonly statusService: StatusService) {}
@@ -23,6 +24,7 @@ export class StatusController {
   }
 
   @Post('send-text')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Post a text status' })
   async sendTextStatus(@Param('sessionId') sessionId: string, @Body() dto: SendTextStatusDto) {
     return this.statusService.postTextStatus(sessionId, dto.text, {
@@ -32,18 +34,21 @@ export class StatusController {
   }
 
   @Post('send-image')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Post an image status' })
   async sendImageStatus(@Param('sessionId') sessionId: string, @Body() dto: SendImageStatusDto) {
     return this.statusService.postImageStatus(sessionId, dto.image, dto.caption);
   }
 
   @Post('send-video')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Post a video status' })
   async sendVideoStatus(@Param('sessionId') sessionId: string, @Body() dto: SendVideoStatusDto) {
     return this.statusService.postVideoStatus(sessionId, dto.video, dto.caption);
   }
 
   @Delete(':statusId')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Delete own status' })
   async deleteStatus(@Param('sessionId') sessionId: string, @Param('statusId') statusId: string) {
     await this.statusService.deleteStatus(sessionId, statusId);

@@ -21,7 +21,7 @@
 | **@openwa/plugin-sdk** | 🔜 Planned | NPM package not yet published |
 | **Sandboxed execution** | 🔜 Planned | vm2 isolation not implemented |
 | **Permission enforcement** | ⚠️ Partial | Defined in manifest, not enforced |
-| **Built-in plugins** | 🔜 Planned | Auto-reply, Translation examples |
+| **Built-in plugins** | ✅ Implemented | `auto-reply` + group auto-translation ship with v0.3.0, disabled by default |
 | **Plugin marketplace** | 🔜 Planned | Install from npm/github |
 
 ---
@@ -49,9 +49,9 @@ flowchart TB
     end
 ```
 
-1. **Isolation** - Plugins cannot compromise the core system
+1. **Isolation** - _Planned, NOT enforced._ Plugins currently run in-process with full Node privileges (`require()`), guarded only by a path-containment check. **Load only trusted plugins** until sandboxed (vm2/worker) execution ships.
 2. **Extensibility** - Easy to add new features
-3. **Safety** - Permission-based access control
+3. **Safety** - Permission-based access control (planned; not yet enforced)
 4. **Performance** - Lazy loading, minimal overhead
 
 ## 19.2 Plugin Types
@@ -117,7 +117,7 @@ plugins/
   "types": "dist/index.d.ts",
 
   "openwa": {
-    "minVersion": "0.2.0",
+    "minVersion": "0.3.0",
     "maxVersion": "2.0.0"
   },
 

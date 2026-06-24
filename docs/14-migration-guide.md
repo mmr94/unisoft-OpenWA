@@ -103,7 +103,7 @@ curl -s 'http://localhost:2785/api/infra/export-data' \
 #       POSTGRES_BUILTIN=true
 
 # Step 3: Restart with new configuration
-docker compose --profile with-dashboard --profile with-proxy up -d
+docker compose --profile postgres up -d
 
 # Step 4: Import data to new database
 curl -X POST 'http://localhost:2785/api/infra/import-data' \
@@ -156,7 +156,9 @@ curl -s 'http://localhost:2785/api/infra/storage/files/count' \
 # Step 2: Export all files as tar.gz
 curl -s 'http://localhost:2785/api/infra/storage/export' \
   -H 'X-API-Key: YOUR_KEY'
-# Response: { "message": "Storage export completed", "download": "/app/data/storage-export-xxx.tar.gz" }
+# Response: { "message": "Storage export completed", "download": "/app/data/exports/storage-export-xxx.tar.gz" }
+# The archive is auto-removed after STORAGE_EXPORT_TTL_MS (default 1h), so re-import it before then.
+# It is written under data/ so it survives the restart in Step 4 and stays import-able.
 
 # Step 3: Change storage configuration
 # From: STORAGE_TYPE=local
@@ -170,7 +172,7 @@ docker compose up -d
 curl -X POST 'http://localhost:2785/api/infra/storage/import' \
   -H 'X-API-Key: YOUR_KEY' \
   -H 'Content-Type: application/json' \
-  -d '{"filePath": "/app/data/storage-export-xxx.tar.gz"}'
+  -d '{"filePath": "/app/data/exports/storage-export-xxx.tar.gz"}'
 ```
 
 | Scenario                     | Support | Method                   |
@@ -750,7 +752,7 @@ docker run --rm \
   -v $(pwd)/data:/app/data \
   -e DATABASE_URL=sqlite:///app/data/openwa.db \
   ghcr.io/rmyndharis/openwa:0.2.0 \
-  npm run migration:run
+  npm run migration:run:prod   # the prod image strips ts-node/TS source — use :prod (M13)
 
 # 4. Migrate configuration
 echo "⚙️ Migrating configuration..."
@@ -815,7 +817,7 @@ breaking_changes:
     - Rate limiting enforced
 
   config:
-    - ENGINE_TYPE required (default: whatsapp-web.js)
+    - ENGINE_TYPE required (default: whatsapp-web.js; also accepts: baileys)
     - STORAGE_ADAPTER required (default: local)
 
   database:
@@ -874,7 +876,7 @@ echo "⚙️ Updating configuration..."
 cat >> .env << 'EOF'
 
 # New in v1.0
-ENGINE_TYPE=whatsapp-web.js
+ENGINE_TYPE=whatsapp-web.js  # default (Chromium-based); set to "baileys" for browser-free engine
 STORAGE_ADAPTER=local
 CACHE_ADAPTER=memory
 

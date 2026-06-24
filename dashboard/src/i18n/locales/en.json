@@ -1,4 +1,10 @@
 {
+  "toast": {
+    "connectionLost": {
+      "title": "Server Connection Lost",
+      "message": "The backend server is unreachable. Please check if the server is running."
+    }
+  },
   "common": {
     "appName": "OpenWA",
     "appSubtitle": "WhatsApp API",
@@ -9,6 +15,8 @@
     "edit": "Edit",
     "create": "Create",
     "close": "Close",
+    "showApiKey": "Show API key",
+    "hideApiKey": "Hide API key",
     "submit": "Submit",
     "confirm": "Confirm",
     "search": "Search",
@@ -51,17 +59,64 @@
     "light": "Light",
     "dark": "Dark",
     "system": "System",
-    "label": "Theme: {{value}}"
+    "label": "Theme: {{value}}",
+    "appearance": "Appearance",
+    "mode": "Mode",
+    "palette": "Palette"
   },
   "nav": {
     "dashboard": "Dashboard",
     "sessions": "Sessions",
+    "chats": "Chats",
     "webhooks": "Webhooks",
+    "templates": "Templates",
     "apiKeys": "API Keys",
     "messageTester": "Message Tester",
     "infrastructure": "Infrastructure",
     "plugins": "Plugins",
     "logs": "Logs"
+  },
+  "chats": {
+    "subtitle": "Send and reply to WhatsApp messages in real time",
+    "noSessionsTitle": "No connected sessions",
+    "noSessionsDesc": "Please connect a WhatsApp session from the <1>Sessions</1> menu first to use the chat feature.",
+    "sessionLabel": "WhatsApp session",
+    "noPhone": "No phone",
+    "searchPlaceholder": "Search chats...",
+    "loadingChats": "Loading chats...",
+    "empty": "No chats",
+    "noMessageYet": "No messages yet",
+    "loadingMessages": "Loading messages...",
+    "noMessagesInChat": "No messages yet. Send the first message to get started!",
+    "downloadDocument": "Download document",
+    "actions": {
+      "reply": "Reply",
+      "react": "React",
+      "delete": "Delete message"
+    },
+    "replyingTo": "Replying to {{name}}",
+    "you": "You",
+    "youPrefix": "You: ",
+    "yesterday": "Yesterday",
+    "attachTitle": "Send file / image",
+    "emojiTitle": "Pick emoji",
+    "captionPlaceholder": "Add a caption...",
+    "messagePlaceholder": "Type a message...",
+    "noPermission": "You do not have permission to send messages",
+    "send": "Send",
+    "placeholderTitle": "Start messaging",
+    "placeholderDesc": "Choose a conversation to read and reply.",
+    "deleteConfirm": "Delete this message for everyone?",
+    "messageDeleted": "🚫 This message was deleted",
+    "errors": {
+      "loadSessions": "Failed to load sessions",
+      "loadChats": "Failed to load chats",
+      "loadMessages": "Failed to load messages",
+      "markRead": "Failed to mark chat as read",
+      "send": "Failed to send message",
+      "react": "Failed to react to message",
+      "delete": "Failed to delete message"
+    }
   },
   "errorBoundary": {
     "title": "Something went wrong",
@@ -88,7 +143,8 @@
       "activeSessions": "Active Sessions",
       "messagesToday": "Messages Today",
       "webhooksConfigured": "Webhooks Configured",
-      "apiCalls": "API Calls (24h)"
+      "apiCalls": "API Calls (24h)",
+      "totalMessages": "Total Messages"
     },
     "sessionsOverview": "Sessions Overview",
     "showingSessions": "Showing {{shown}} of {{total}} sessions",
@@ -103,7 +159,22 @@
     "view": "View",
     "disconnect": "Disconnect",
     "errorPrefix": "Error: {{message}}",
-    "loadError": "Failed to load data"
+    "loadError": "Failed to load data",
+    "charts": {
+      "title": "Message Analytics",
+      "period": {
+        "24h": "24h",
+        "7d": "7d",
+        "30d": "30d"
+      },
+      "overTime": "Messages over time",
+      "byType": "Messages by type",
+      "topChats": "Top chats",
+      "sent": "Sent",
+      "received": "Received",
+      "messages": "Messages",
+      "empty": "No message activity in this period."
+    }
   },
   "sessionStatus": {
     "created": "New",
@@ -180,18 +251,32 @@
       "start": "Start",
       "stop": "Stop",
       "reconnect": "Reconnect",
-      "delete": "Delete"
+      "delete": "Delete",
+      "killStuck": "Kill Stuck"
     },
     "toasts": {
       "readyTitle": "Session Ready",
       "readyDesc": "WhatsApp session is now connected",
       "disconnectedTitle": "Session Disconnected",
-      "disconnectedDesc": "WhatsApp session was disconnected"
+      "disconnectedDesc": "WhatsApp session was disconnected",
+      "failedTitle": "Session Failed",
+      "failedDesc": "The WhatsApp session failed to start. Open the session to see the reason."
     },
     "card": {
       "phone": "Phone",
       "sessionId": "Session ID",
-      "lastActive": "Last Active"
+      "lastActive": "Last Active",
+      "error": "Error"
+    },
+    "forceKill": {
+      "title": "Kill Stuck Session",
+      "message": "Are you sure you want to force-kill session \"{{name}}\"?",
+      "warning": "This will forcefully terminate the WhatsApp browser process. The session may need to be re-scanned on restart.",
+      "confirm": "Kill Session",
+      "successTitle": "Session Killed",
+      "success": "Session has been force-killed. You can restart it now.",
+      "failedTitle": "Force-Kill Failed",
+      "failed": "Failed to force-kill the session."
     }
   },
   "webhooks": {
@@ -207,6 +292,36 @@
     "events": "Events",
     "available": "Available Events",
     "saveChanges": "Save Changes",
+    "filters": {
+      "title": "Filters (optional)",
+      "hint": "Only fire when all conditions match. Applies to message events.",
+      "badge": "{{count}} filter",
+      "badge_other": "{{count}} filters",
+      "addCondition": "Add condition",
+      "removeCondition": "Remove condition",
+      "caseSensitive": "Case sensitive",
+      "contactPlaceholder": "Number or WhatsApp ID...",
+      "textPlaceholder": "Text to match...",
+      "addValue": "Add \"{{value}}\"",
+      "yes": "Yes",
+      "no": "No",
+      "fields": {
+        "sender": "Sender",
+        "recipient": "Recipient",
+        "body": "Message body",
+        "type": "Message type",
+        "isGroup": "Is group chat",
+        "fromMe": "Sent by me",
+        "hasMedia": "Has media",
+        "mentions": "Mentions"
+      },
+      "operators": {
+        "is": "is",
+        "isNot": "is not",
+        "contains": "contains",
+        "equals": "equals"
+      }
+    },
     "columns": {
       "url": "URL",
       "events": "Events",
@@ -241,6 +356,51 @@
       "session.disconnected": "When a session disconnects",
       "session.qr": "When QR code is generated",
       "all": "All events"
+    }
+  },
+  "templates": {
+    "title": "Templates",
+    "subtitle": "Create reusable message templates for each WhatsApp session",
+    "createTitle": "Create Template",
+    "editTitle": "Edit Template",
+    "newTemplate": "New Template",
+    "createTemplate": "Create Template",
+    "saveChanges": "Save Changes",
+    "viewOnly": "View Only",
+    "noSessions": "No sessions",
+    "sessionHint": "Saved under {{name}}",
+    "namePlaceholder": "e.g., order-confirmation",
+    "header": "Header",
+    "headerPlaceholder": "Optional intro line",
+    "body": "Body",
+    "bodyPlaceholder": "Hi {{customer}}, your order {{orderId}} is ready.",
+    "footer": "Footer",
+    "footerPlaceholder": "Optional closing line",
+    "previewTitle": "Preview",
+    "previewValuePlaceholder": "Sample value",
+    "previewEmpty": "Start writing a template to preview it here.",
+    "noPlaceholders": "Use {{name}} placeholders to test substitutions.",
+    "savedTitle": "Saved Templates",
+    "count": "{{count}} total",
+    "deleteTitle": "Delete Template",
+    "deleteConfirm": "Delete template \"{{name}}\"? This action cannot be undone.",
+    "actions": {
+      "copyName": "Copy template name"
+    },
+    "empty": {
+      "title": "No templates saved",
+      "description": "Create a reusable template to speed up common replies and notifications.",
+      "noSessionsTitle": "No sessions available",
+      "noSessionsDesc": "Create a WhatsApp session before adding templates."
+    },
+    "toasts": {
+      "created": "Template created successfully",
+      "createFailed": "Failed to create template: {{message}}",
+      "updated": "Template updated successfully",
+      "updateFailed": "Failed to update template: {{message}}",
+      "deleted": "Template deleted successfully",
+      "deleteFailed": "Failed to delete template: {{message}}",
+      "copied": "Template name copied"
     }
   },
   "apiKeys": {
@@ -359,7 +519,8 @@
       "messageId": "Message ID",
       "error": "Error"
     },
-    "sendFailed": "Failed to send message"
+    "sendFailed": "Failed to send message",
+    "notOnWhatsApp": "This number is not registered on WhatsApp"
   },
   "infrastructure": {
     "title": "Infrastructure",
@@ -401,9 +562,22 @@
       "poolSize": "Pool Size",
       "ssl": "SSL Connection",
       "sslDesc": "Enable TLS/SSL for secure database connections",
+      "sslRejectUnauthorized": "Verify SSL Certificate",
+      "sslRejectUnauthorizedDesc": "Reject self-signed or invalid certificates. Turn off for managed Postgres with self-signed certs (Supabase, Heroku, Render, Railway).",
       "migrationsTitle": "Database Migrations",
       "migrationsStatus": "Schema is auto-synchronized with TypeORM",
       "migrationsHint": "Migrations are managed automatically. Use CLI for manual migrations."
+    },
+    "engine": {
+      "title": "WhatsApp Engine",
+      "subtitle": "Choose and configure the WhatsApp connection engine.",
+      "builtIn": "Built-in",
+      "headless": "Headless Mode",
+      "headlessDesc": "Run the browser without a visible UI (recommended for production).",
+      "sessionDataPath": "Session Data Path",
+      "browserArgs": "Browser Arguments",
+      "noBrowser": "This engine connects over WebSocket — it has no browser, so there are no headless or browser-argument settings. The active engine is applied after a restart.",
+      "restartNote": "Switching the engine takes effect after a server restart."
     },
     "redis": {
       "title": "Redis",
@@ -447,11 +621,11 @@
       "disabled": "Disabled"
     },
     "restart": {
-      "idleTitle": "⚙️ Configuration Saved",
-      "restartingTitle": "🔄 Restarting Server...",
-      "waitingTitle": "⏳ Please Wait...",
-      "successTitle": "✅ Server Ready",
-      "errorTitle": "❌ Restart Failed",
+      "idleTitle": "Configuration saved",
+      "restartingTitle": "Restarting server…",
+      "waitingTitle": "Please wait…",
+      "successTitle": "Server ready",
+      "errorTitle": "Restart failed",
       "idleDesc": "Configuration has been saved to <code>.env.generated</code>.<br/>A server restart is required to apply the changes.",
       "later": "Restart Later",
       "now": "Restart Now",
@@ -468,12 +642,11 @@
   },
   "plugins": {
     "title": "Plugins",
-    "subtitle": "Manage engines, storage backends, and extensions",
+    "subtitle": "Install, configure, and manage extensions",
     "refresh": "Refresh",
     "engineCard": "Active WhatsApp Engine",
     "running": "Running",
     "supportedFeatures": "Supported Features:",
-    "more": "+{{count}} more",
     "builtIn": "Built-in",
     "noDescription": "No description available",
     "required": "Required",
@@ -483,9 +656,14 @@
     "disable": "Disable",
     "healthCheck": "Health Check",
     "configure": "Configure",
+    "available": "Available",
+    "install": "Install plugin",
+    "uninstall": "Uninstall",
+    "uninstallConfirm": "Uninstall \"{{name}}\"? This deletes its files.",
+    "engineSwitchHint": "To switch the active engine, set ENGINE_TYPE in the environment and restart the server",
     "empty": {
-      "title": "No Plugins Found",
-      "description": "Install plugins to extend OpenWA functionality"
+      "title": "No plugins installed",
+      "description": "Install a plugin to extend what OpenWA can do."
     },
     "config": {
       "title": "Configure {{name}}",
@@ -496,7 +674,23 @@
       "sessionDataPath": "Session Data Path",
       "browserArgs": "Browser Arguments",
       "noOptions": "No configuration options available for this plugin",
-      "save": "Save Configuration"
+      "save": "Save Configuration",
+      "addItem": "Add",
+      "tabConfig": "Configuration",
+      "tabSessions": "Sessions"
+    },
+    "rail": {
+      "engine": "Active engine",
+      "enabled": "enabled",
+      "installed": "installed",
+      "active": "Active plugins",
+      "none": "None enabled yet"
+    },
+    "installModal": {
+      "title": "Install a plugin",
+      "hint": "Upload a plugin packaged as a .zip (with a manifest.json). It runs sandboxed once enabled.",
+      "choose": "Choose a .zip file…",
+      "tooLarge": "The file exceeds the 5 MB limit."
     },
     "toasts": {
       "errorTitle": "Plugin Error",
@@ -506,7 +700,24 @@
       "healthError": "Health Check Error",
       "savedTitle": "Configuration Saved",
       "savedDesc": "Server restart required to apply changes.",
-      "saveFailed": "Save Failed"
+      "saveFailed": "Save Failed",
+      "installed": "Plugin installed",
+      "installFailed": "Install failed",
+      "uninstalled": "Plugin uninstalled",
+      "uninstallFailed": "Uninstall failed"
+    },
+    "sessions": {
+      "activationTitle": "Run for",
+      "activationDesc": "Choose which sessions this plugin runs for.",
+      "allSessions": "All sessions",
+      "specificSessions": "Specific sessions",
+      "noSessions": "No sessions yet.",
+      "saveActivation": "Save activation",
+      "perSessionTitle": "Per-session config",
+      "perSessionDesc": "Override the global config for a session; untouched fields inherit the global value.",
+      "selectSession": "Select a session…",
+      "saveOverride": "Save override",
+      "clearOverride": "Clear override"
     }
   }
 }

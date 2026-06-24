@@ -9,13 +9,16 @@ import {
   Loader2,
   CheckCircle,
   Trash2,
-  Globe,
-  Webhook,
-  Gauge,
+  Cpu,
 } from 'lucide-react';
-import { infraApi } from '../services/api';
+import { infraApi, API_BASE_URL } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
-import { useInfraStatusQuery } from '../hooks/queries';
+import {
+  useInfraStatusQuery,
+  useInfraConfigQuery,
+  useEnginesQuery,
+  useCurrentEngineQuery,
+} from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
 import { useToast } from '../components/Toast';
 import './Infrastructure.css';
@@ -35,6 +38,7 @@ interface DatabaseConfig {
   database: string;
   poolSize: number;
   sslEnabled: boolean;
+  sslRejectUnauthorized: boolean;
 }
 
 interface RedisConfig {
@@ -56,31 +60,17 @@ interface StorageConfig {
   s3Endpoint: string;
 }
 
+interface EngineConfig {
+  type: string;
+  headless: boolean;
+  sessionDataPath: string;
+  browserArgs: string;
+}
+
 interface QueueStats {
   pending: number;
   completed: number;
   failed: number;
-}
-
-interface ServerConfig {
-  port: string;
-  nodeEnv: 'production' | 'development';
-  domain: string;
-  dashboardPort: string;
-  baseUrl: string;
-  dashboardUrl: string;
-  corsOrigins: string;
-}
-
-interface WebhookConfig {
-  timeout: number;
-  maxRetries: number;
-  retryDelay: number;
-}
-
-interface RateLimitConfig {
-  ttl: number;
-  max: number;
 }
 
 export function Infrastructure() {
@@ -88,6 +78,10 @@ export function Infrastructure() {
   useDocumentTitle(t('infrastructure.title'));
   const toast = useToast();
   const { data: infraStatus, isLoading: loading } = useInfraStatusQuery();
+  const { data: savedConfig } = useInfraConfigQuery();
+  const { data: engines = [] } = useEnginesQuery();
+  const { data: currentEngineData } = useCurrentEngineQuery();
+  const currentEngine = currentEngineData?.engineType ?? '';
   const [saving, setSaving] = useState(false);
   const [showRestartModal, setShowRestartModal] = useState(false);
   const [restartCountdown, setRestartCountdown] = useState(0);
@@ -103,6 +97,7 @@ export function Infrastructure() {
     database: 'openwa',
     poolSize: 10,
     sslEnabled: false,
+    sslRejectUnauthorized: true,
   });
 
   const [redisConfig, setRedisConfig] = useState<RedisConfig>({
@@ -129,31 +124,17 @@ export function Infrastructure() {
     webhooks: { pending: 0, completed: 0, failed: 0 } as QueueStats,
   });
 
+  const [engineConfig, setEngineConfig] = useState<EngineConfig>({
+    type: 'whatsapp-web.js',
+    headless: true,
+    sessionDataPath: './data/sessions',
+    browserArgs: '--no-sandbox --disable-gpu',
+  });
+
   const [redisEnabled, setRedisEnabled] = useState(false);
   const [queueEnabled, setQueueEnabled] = useState(false);
   const [pendingProfiles, setPendingProfiles] = useState<string[]>([]);
   const [previousProfiles, setPreviousProfiles] = useState<string[]>([]);
-
-  const [serverConfig, setServerConfig] = useState<ServerConfig>({
-    port: '2785',
-    nodeEnv: 'development',
-    domain: 'localhost',
-    dashboardPort: '2886',
-    baseUrl: '',
-    dashboardUrl: '',
-    corsOrigins: '*',
-  });
-
-  const [webhookConfig, setWebhookConfig] = useState<WebhookConfig>({
-    timeout: 10000,
-    maxRetries: 3,
-    retryDelay: 5000,
-  });
-
-  const [rateLimitConfig, setRateLimitConfig] = useState<RateLimitConfig>({
-    ttl: 60,
-    max: 100,
-  });
 
   useEffect(() => {
     if (!infraStatus) return;
@@ -184,6 +165,55 @@ export function Infrastructure() {
     });
   }, [infraStatus]);
 
+  // Hydrate the editable form from the saved config (data/.env.generated) so the form
+  // reflects what was actually persisted — including fields /status does not expose
+  // (username, pool size, SSL flags, S3 details). Secrets are never returned, so their
+  // inputs stay empty; an empty submit preserves the stored secret on the backend (#226).
+  useEffect(() => {
+    if (!savedConfig) return;
+    setDbConfig(prev => ({
+      ...prev,
+      type: savedConfig.database.type,
+      builtIn: savedConfig.database.builtIn,
+      host: savedConfig.database.host || prev.host,
+      port: savedConfig.database.port || prev.port,
+      username: savedConfig.database.username || prev.username,
+      database: savedConfig.database.database || prev.database,
+      poolSize: savedConfig.database.poolSize,
+      sslEnabled: savedConfig.database.sslEnabled,
+      sslRejectUnauthorized: savedConfig.database.sslRejectUnauthorized,
+    }));
+    setRedisEnabled(savedConfig.redis.enabled);
+    setRedisConfig(prev => ({
+      ...prev,
+      builtIn: savedConfig.redis.builtIn,
+      host: savedConfig.redis.host || prev.host,
+      port: savedConfig.redis.port || prev.port,
+    }));
+    setQueueEnabled(savedConfig.queue.enabled);
+    setStorageConfig(prev => ({
+      ...prev,
+      type: savedConfig.storage.type,
+      builtIn: savedConfig.storage.builtIn,
+      localPath: savedConfig.storage.localPath || prev.localPath,
+      s3Bucket: savedConfig.storage.s3Bucket || prev.s3Bucket,
+      s3Region: savedConfig.storage.s3Region || prev.s3Region,
+      s3Endpoint: savedConfig.storage.s3Endpoint || prev.s3Endpoint,
+    }));
+    setEngineConfig(prev => ({
+      ...prev,
+      headless: savedConfig.engine.headless,
+      sessionDataPath: savedConfig.engine.sessionDataPath || prev.sessionDataPath,
+      browserArgs: savedConfig.engine.browserArgs || prev.browserArgs,
+    }));
+  }, [savedConfig]);
+
+  // The active engine reflects what's actually running (honours a real-env ENGINE_TYPE override),
+  // so seed the selected radio from it rather than the saved .env.generated value.
+  useEffect(() => {
+    if (currentEngine) setEngineConfig(prev => ({ ...prev, type: currentEngine }));
+  }, [currentEngine]);
+
   if (loading) {
     return (
       <div
@@ -201,12 +231,8 @@ export function Infrastructure() {
     setRedisConfig(prev => ({ ...prev, [key]: value }));
   const updateStorageConfig = (key: keyof StorageConfig, value: string | boolean) =>
     setStorageConfig(prev => ({ ...prev, [key]: value }));
-  const updateServerConfig = (key: keyof ServerConfig, value: string) =>
-    setServerConfig(prev => ({ ...prev, [key]: value }));
-  const updateWebhookConfig = (key: keyof WebhookConfig, value: number) =>
-    setWebhookConfig(prev => ({ ...prev, [key]: value }));
-  const updateRateLimitConfig = (key: keyof RateLimitConfig, value: number) =>
-    setRateLimitConfig(prev => ({ ...prev, [key]: value }));
+  const updateEngineConfig = (key: keyof EngineConfig, value: string | boolean) =>
+    setEngineConfig(prev => ({ ...prev, [key]: value }));
 
   const handleSaveConfig = async () => {
     setSaving(true);
@@ -216,9 +242,7 @@ export function Infrastructure() {
         redis: { enabled: redisEnabled, ...redisConfig },
         queue: { enabled: queueEnabled },
         storage: { ...storageConfig },
-        server: { ...serverConfig },
-        webhook: { ...webhookConfig },
-        rateLimit: { ...rateLimitConfig },
+        engine: { ...engineConfig },
       };
 
       const result = await infraApi.saveConfig(payload);
@@ -297,156 +321,6 @@ export function Infrastructure() {
       <PageHeader title={t('infrastructure.title')} subtitle={t('infrastructure.subtitle')} />
 
       <div className="infra-sections">
-        {/* Server Configuration */}
-        <section className="infra-card">
-          <div className="card-header">
-            <div className="header-left">
-              <Globe size={20} />
-              <h2>{t('infrastructure.server.title')}</h2>
-            </div>
-            <span className={`status-indicator ${serverConfig.nodeEnv === 'production' ? 'connected' : 'sqlite'}`}>
-              ● {serverConfig.nodeEnv === 'production' ? t('infrastructure.server.production') : t('infrastructure.server.development')}
-            </span>
-          </div>
-
-          <div className="config-form">
-            <div className="form-row">
-              <div className="form-group">
-                <label>{t('infrastructure.server.environment')}</label>
-                <select
-                  value={serverConfig.nodeEnv}
-                  onChange={e => updateServerConfig('nodeEnv', e.target.value as 'production' | 'development')}
-                >
-                  <option value="production">{t('infrastructure.server.production')}</option>
-                  <option value="development">{t('infrastructure.server.development')}</option>
-                </select>
-              </div>
-              <div className="form-group">
-                <label>{t('infrastructure.server.domain')}</label>
-                <input
-                  type="text"
-                  value={serverConfig.domain}
-                  onChange={e => updateServerConfig('domain', e.target.value)}
-                  placeholder="localhost"
-                />
-              </div>
-            </div>
-            <div className="form-row">
-              <div className="form-group small">
-                <label>{t('infrastructure.server.apiPort')}</label>
-                <input type="text" value={serverConfig.port} onChange={e => updateServerConfig('port', e.target.value)} />
-              </div>
-              <div className="form-group small">
-                <label>{t('infrastructure.server.dashboardPort')}</label>
-                <input
-                  type="text"
-                  value={serverConfig.dashboardPort}
-                  onChange={e => updateServerConfig('dashboardPort', e.target.value)}
-                />
-              </div>
-              <div className="form-group">
-                <label>{t('infrastructure.server.corsOrigins')}</label>
-                <input
-                  type="text"
-                  value={serverConfig.corsOrigins}
-                  onChange={e => updateServerConfig('corsOrigins', e.target.value)}
-                  placeholder={t('infrastructure.server.corsPlaceholder')}
-                />
-              </div>
-            </div>
-            <div className="form-row">
-              <div className="form-group">
-                <label>{t('infrastructure.server.publicApiUrl')}</label>
-                <input
-                  type="text"
-                  value={serverConfig.baseUrl}
-                  onChange={e => updateServerConfig('baseUrl', e.target.value)}
-                  placeholder="https://api.yourdomain.com"
-                />
-              </div>
-              <div className="form-group">
-                <label>{t('infrastructure.server.publicDashboardUrl')}</label>
-                <input
-                  type="text"
-                  value={serverConfig.dashboardUrl}
-                  onChange={e => updateServerConfig('dashboardUrl', e.target.value)}
-                  placeholder="https://dashboard.yourdomain.com"
-                />
-              </div>
-            </div>
-          </div>
-        </section>
-
-        {/* Webhook & Rate Limiting */}
-        <section className="infra-card">
-          <div className="card-header">
-            <div className="header-left">
-              <Webhook size={20} />
-              <h2>{t('infrastructure.webhook.title')}</h2>
-            </div>
-          </div>
-
-          <div className="config-form">
-            <h3 style={{ margin: '0 0 1rem', fontSize: '0.9375rem', color: '#475569', fontWeight: 600 }}>
-              <Webhook size={16} style={{ marginInlineEnd: '0.5rem', verticalAlign: 'middle' }} />
-              {t('infrastructure.webhook.settings')}
-            </h3>
-            <div className="form-row">
-              <div className="form-group">
-                <label>{t('infrastructure.webhook.timeout')}</label>
-                <input
-                  type="number"
-                  value={webhookConfig.timeout}
-                  onChange={e => updateWebhookConfig('timeout', parseInt(e.target.value) || 10000)}
-                />
-              </div>
-              <div className="form-group small">
-                <label>{t('infrastructure.webhook.maxRetries')}</label>
-                <input
-                  type="number"
-                  min="0"
-                  max="10"
-                  value={webhookConfig.maxRetries}
-                  onChange={e => updateWebhookConfig('maxRetries', parseInt(e.target.value) || 3)}
-                />
-              </div>
-              <div className="form-group">
-                <label>{t('infrastructure.webhook.retryDelay')}</label>
-                <input
-                  type="number"
-                  value={webhookConfig.retryDelay}
-                  onChange={e => updateWebhookConfig('retryDelay', parseInt(e.target.value) || 5000)}
-                />
-              </div>
-            </div>
-
-            <div style={{ borderTop: '1px solid var(--border)', margin: '1.5rem 0', paddingTop: '1.5rem' }}>
-              <h3 style={{ margin: '0 0 1rem', fontSize: '0.9375rem', color: '#475569', fontWeight: 600 }}>
-                <Gauge size={16} style={{ marginInlineEnd: '0.5rem', verticalAlign: 'middle' }} />
-                {t('infrastructure.webhook.rateLimit')}
-              </h3>
-              <div className="form-row">
-                <div className="form-group">
-                  <label>{t('infrastructure.webhook.window')}</label>
-                  <input
-                    type="number"
-                    value={rateLimitConfig.ttl}
-                    onChange={e => updateRateLimitConfig('ttl', parseInt(e.target.value) || 60)}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>{t('infrastructure.webhook.maxReq')}</label>
-                  <input
-                    type="number"
-                    value={rateLimitConfig.max}
-                    onChange={e => updateRateLimitConfig('max', parseInt(e.target.value) || 100)}
-                  />
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-
         {/* Database */}
         <section className="infra-card">
           <div className="card-header">
@@ -565,6 +439,22 @@ export function Infrastructure() {
                       <span className="toggle-slider"></span>
                     </label>
                   </div>
+                  {dbConfig.sslEnabled && (
+                    <div className="toggle-row">
+                      <div className="toggle-info">
+                        <span>{t('infrastructure.database.sslRejectUnauthorized')}</span>
+                        <small>{t('infrastructure.database.sslRejectUnauthorizedDesc')}</small>
+                      </div>
+                      <label className="toggle-switch">
+                        <input
+                          type="checkbox"
+                          checked={dbConfig.sslRejectUnauthorized}
+                          onChange={e => updateDbConfig('sslRejectUnauthorized', e.target.checked)}
+                        />
+                        <span className="toggle-slider"></span>
+                      </label>
+                    </div>
+                  )}
                 </div>
               )}
             </>
@@ -604,6 +494,81 @@ export function Infrastructure() {
               {t('infrastructure.database.migrationsHint')}
             </p>
           </div>
+        </section>
+
+        {/* Engine */}
+        <section className="infra-card">
+          <div className="card-header">
+            <div className="header-left">
+              <Cpu size={20} />
+              <h2>{t('infrastructure.engine.title')}</h2>
+            </div>
+            <span className="status-indicator connected">● {currentEngine || engineConfig.type}</span>
+          </div>
+
+          <div className="radio-group">
+            {engines.map(engine => (
+              <label key={engine.id} className={`radio-option ${engineConfig.type === engine.id ? 'selected' : ''}`}>
+                <input
+                  type="radio"
+                  name="engineType"
+                  checked={engineConfig.type === engine.id}
+                  onChange={() => updateEngineConfig('type', engine.id)}
+                />
+                <Cpu className="watermark-icon" />
+                <span>{engine.name}</span>
+                <small>
+                  {engine.library
+                    ? `${engine.library.name} ${engine.library.version}`
+                    : t('infrastructure.engine.builtIn')}
+                </small>
+              </label>
+            ))}
+          </div>
+
+          {engineConfig.type === 'whatsapp-web.js' ? (
+            <div className="config-form">
+              <div className="toggle-row">
+                <div className="toggle-info">
+                  <span>{t('infrastructure.engine.headless')}</span>
+                  <small>{t('infrastructure.engine.headlessDesc')}</small>
+                </div>
+                <label className="toggle-switch">
+                  <input
+                    type="checkbox"
+                    checked={engineConfig.headless}
+                    onChange={e => updateEngineConfig('headless', e.target.checked)}
+                  />
+                  <span className="toggle-slider"></span>
+                </label>
+              </div>
+              <div className="form-group">
+                <label>{t('infrastructure.engine.sessionDataPath')}</label>
+                <input
+                  type="text"
+                  value={engineConfig.sessionDataPath}
+                  onChange={e => updateEngineConfig('sessionDataPath', e.target.value)}
+                />
+              </div>
+              <div className="form-group">
+                <label>{t('infrastructure.engine.browserArgs')}</label>
+                <input
+                  type="text"
+                  value={engineConfig.browserArgs}
+                  onChange={e => updateEngineConfig('browserArgs', e.target.value)}
+                  placeholder="--no-sandbox --disable-gpu"
+                />
+              </div>
+            </div>
+          ) : (
+            <p style={{ margin: '0.5rem 0 0', color: '#64748B', fontSize: '0.8125rem', lineHeight: 1.5 }}>
+              {t('infrastructure.engine.noBrowser')}
+            </p>
+          )}
+
+          <p style={{ margin: '1rem 0 0', color: '#64748B', fontSize: '0.8125rem', lineHeight: 1.5 }}>
+            {t('infrastructure.engine.restartNote')}
+          </p>
         </section>
 
         {/* Redis */}
@@ -758,7 +723,7 @@ export function Infrastructure() {
                     </button>
                     <button
                       className="btn-outline"
-                      onClick={() => window.open('http://localhost:2785/api/admin/queues', '_blank')}
+                      onClick={() => window.open(`${API_BASE_URL}/admin/queues`, '_blank')}
                     >
                       <ExternalLink size={16} />
                       {t('infrastructure.redis.viewBullMq')}

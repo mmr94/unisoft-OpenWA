@@ -1,4 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import type { Session } from '../entities/session.entity';
 import { SessionStatus } from '../entities/session.entity';
 
 export class SessionResponseDto {
@@ -34,6 +35,33 @@ export class SessionResponseDto {
 
   @ApiProperty({ example: '2025-02-02T10:00:00Z' })
   updatedAt: Date;
+
+  @ApiPropertyOptional({
+    description: 'Human-readable reason for the most recent terminal engine failure (only set when status is FAILED).',
+    example: 'Failed to launch the browser process: spawn /usr/bin/chromium ENOENT',
+  })
+  lastError?: string | null;
+
+  /**
+   * Map a Session entity to the public response shape, stripping sensitive
+   * engine config fields (`config`, `proxyUrl`, `proxyType`) that must not
+   * appear in any API response.
+   */
+  static fromEntity(session: Session): SessionResponseDto {
+    return {
+      id: session.id,
+      name: session.name,
+      status: session.status,
+      phone: session.phone,
+      pushName: session.pushName,
+      connectedAt: session.connectedAt,
+      lastActive: session.lastActiveAt,
+      lastSent: session.lastSentAt,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      lastError: session.lastError ?? null,
+    };
+  }
 }
 
 export class QRCodeResponseDto {

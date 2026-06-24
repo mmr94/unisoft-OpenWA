@@ -62,4 +62,12 @@ export class Session {
 
   @UpdateDateColumn()
   updatedAt: Date;
+
+  /**
+   * Transient (non-persisted) human-readable reason for the most recent terminal
+   * engine failure. Populated at read time from the in-memory error map so the
+   * dashboard can explain a FAILED status; intentionally not a column because it
+   * is runtime state that resets when the engine re-initializes.
+   */
+  lastError?: string;
 }

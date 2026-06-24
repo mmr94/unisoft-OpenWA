@@ -365,7 +365,7 @@ flowchart TB
 
 | ID | Requirement | Description | Priority |
 |----|-------------|-------------|----------|
-| NFR-CP-001 | Node.js version | 18.x, 20.x LTS | High |
+| NFR-CP-001 | Node.js version | 22 LTS | High |
 | NFR-CP-002 | Database support | SQLite, PostgreSQL | High |
 | NFR-CP-003 | OS support | Linux, macOS, Windows | High |
 | NFR-CP-004 | Docker support | Official image | High |

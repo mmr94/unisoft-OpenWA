@@ -25,43 +25,123 @@ X-API-Key: your-api-key
 X-Request-ID: optional-tracking-id (recommended)
 ```
 
+### API Key Management
+
+OpenWA creates an initial admin API key on first run. The key is printed in the
+startup logs and written to:
+
+- `data/.api-key` for local development
+- `/app/data/.api-key` inside the API container for Docker deployments
+
+By default a random `owa_k1_...` admin key is generated on first run in all
+environments; set `ALLOW_DEV_API_KEY=true` to seed the well-known `dev-admin-key`
+for local development only. Use that admin key to create scoped keys for
+integrations. The full generated key is returned only once in the `apiKey`
+field of the create response.
+
+#### Create API Key
+
+```http
+POST /api/auth/api-keys
+```
+
+**Required role:** `admin`
+
+**Request Body:**
+```json
+{
+  "name": "Production Bot",
+  "role": "operator",
+  "allowedIps": ["192.168.1.10", "10.0.0.0/8"],
+  "allowedSessions": ["session-uuid-1"],
+  "expiresAt": "2027-12-31T23:59:59Z"
+}
+```
+
+Only `name` is required. `role` defaults to `operator`; valid roles are
+`admin`, `operator`, and `viewer`.
+
+**Example:**
+```bash
+curl -X POST http://localhost:2785/api/auth/api-keys \
+  -H "X-API-Key: $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "n8n Integration",
+    "role": "operator"
+  }'
+```
+
+**Response:**
+```json
+{
+  "id": "2a8f41e3-3b9a-4a1d-b6d0-b9910df8f0be",
+  "name": "n8n Integration",
+  "keyPrefix": "owa_k1_abcd",
+  "role": "operator",
+  "isActive": true,
+  "usageCount": 0,
+  "createdAt": "2026-02-02T10:30:00.000Z",
+  "apiKey": "owa_k1_abcd1234..."
+}
+```
+
+#### API Key Endpoints
+
+| Method | Endpoint | Description | Required role |
+|--------|----------|-------------|---------------|
+| `GET` | `/api/auth/api-keys` | List API keys | `admin` |
+| `POST` | `/api/auth/api-keys` | Create an API key | `admin` |
+| `GET` | `/api/auth/api-keys/:id` | Get API key details | `admin` |
+| `PUT` | `/api/auth/api-keys/:id` | Update API key metadata, role, IPs, sessions, or expiry | `admin` |
+| `DELETE` | `/api/auth/api-keys/:id` | Delete an API key | `admin` |
+| `POST` | `/api/auth/api-keys/:id/revoke` | Revoke an API key by setting it inactive | `admin` |
+| `POST` | `/api/auth/validate` | Validate the key in `X-API-Key` | Any key |
+
 ## 6.2 Response Format
+
+> **OpenWA returns the raw handler payload directly — there is NO `{success, data, meta}`
+> envelope.** A resource endpoint returns that resource object; a list endpoint returns a
+> bare array. Read fields directly (`response.id`, not `response.data.id`). Errors use the
+> NestJS default shape with the HTTP status in the status line.
+>
+> *(The response examples elsewhere in this document predate this and may still show the
+> old wrapper; the shape described here is authoritative — see [the H8 finding](../_docs/2026-06-15-security-architecture-audit.md).)*
 
 ### Success Response
 
+A successful request returns the resource (or array) as-is:
+
 ```json
 {
-  "success": true,
-  "data": {},
-  "meta": {
-    "timestamp": "2025-02-02T10:00:00.000Z",
-    "requestId": "550e8400-e29b-41d4-a716-446655440000",
-    "version": "0.1.0"
-  }
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "name": "my-session",
+  "status": "READY"
 }
+```
+
+List endpoints return a bare array:
+
+```json
+[
+  { "id": "…", "name": "session-a" },
+  { "id": "…", "name": "session-b" }
+]
 ```
 
 ### Error Response
 
+Errors use the NestJS default shape (the HTTP status is on the status line, not in a `code` field):
+
 ```json
 {
-  "success": false,
-  "error": {
-    "code": "ERROR_CODE",
-    "message": "Human readable message",
-    "details": {}
-  },
-  "meta": {
-    "timestamp": "2025-02-02T10:00:00.000Z",
-    "requestId": "550e8400-e29b-41d4-a716-446655440000"
-  }
+  "statusCode": 404,
+  "message": "Webhook with id 'x' not found",
+  "error": "Not Found"
 }
 ```
 
-### Request ID Convention
-
-- Recommended format: `req_<epoch_ms>` (example: `req_1706868000000`).
-- `X-Request-ID` is returned in `meta.requestId` when provided by the client.
+Validation errors (`statusCode: 400`) return `message` as an array of field-level strings.
 
 ### Timestamp Conventions
 
@@ -335,14 +415,11 @@ POST /api/sessions
 **Response (201 Created):**
 ```json
 {
-  "success": true,
-  "data": {
-    "id": "sess_abc123",
-    "name": "my-bot",
-    "status": "INITIALIZING",
-    "qr": null,
-    "createdAt": "2025-02-02T10:00:00.000Z"
-  }
+  "id": "sess_abc123",
+  "name": "my-bot",
+  "status": "INITIALIZING",
+  "qr": null,
+  "createdAt": "2025-02-02T10:00:00.000Z"
 }
 ```
 
@@ -363,24 +440,15 @@ GET /api/sessions
 
 **Response (200 OK):**
 ```json
-{
-  "success": true,
-  "data": [
-    {
-      "id": "sess_abc123",
-      "name": "my-bot",
-      "status": "CONNECTED",
-      "phoneNumber": "628123456789",
-      "createdAt": "2025-02-02T10:00:00.000Z"
-    }
-  ],
-  "pagination": {
-    "page": 1,
-    "limit": 20,
-    "total": 1,
-    "totalPages": 1
+[
+  {
+    "id": "sess_abc123",
+    "name": "my-bot",
+    "status": "CONNECTED",
+    "phoneNumber": "628123456789",
+    "createdAt": "2025-02-02T10:00:00.000Z"
   }
-}
+]
 ```
 
 ---
@@ -394,17 +462,14 @@ GET /api/sessions/:sessionId
 **Response (200 OK):**
 ```json
 {
-  "success": true,
-  "data": {
-    "id": "sess_abc123",
-    "name": "my-bot",
-    "status": "CONNECTED",
-    "phoneNumber": "628123456789",
-    "pushName": "My Bot",
-    "platform": "android",
-    "connectedAt": "2025-02-02T10:05:00.000Z",
-    "createdAt": "2025-02-02T10:00:00.000Z"
-  }
+  "id": "sess_abc123",
+  "name": "my-bot",
+  "status": "CONNECTED",
+  "phoneNumber": "628123456789",
+  "pushName": "My Bot",
+  "platform": "android",
+  "connectedAt": "2025-02-02T10:05:00.000Z",
+  "createdAt": "2025-02-02T10:00:00.000Z"
 }
 ```
 
@@ -445,11 +510,8 @@ GET /api/sessions/:sessionId/qr
 **Response (200 OK):**
 ```json
 {
-  "success": true,
-  "data": {
-    "code": "2@ABC123...",
-    "image": "data:image/png;base64,..."
-  }
+  "code": "2@ABC123...",
+  "image": "data:image/png;base64,..."
 }
 ```
 
@@ -464,10 +526,7 @@ DELETE /api/sessions/:sessionId
 **Response (200 OK):**
 ```json
 {
-  "success": true,
-  "data": {
-    "message": "Session deleted successfully"
-  }
+  "message": "Session deleted successfully"
 }
 ```
 
@@ -482,10 +541,7 @@ POST /api/sessions/:sessionId/logout
 **Response (200 OK):**
 ```json
 {
-  "success": true,
-  "data": {
-    "message": "Session logged out successfully"
-  }
+  "message": "Session logged out successfully"
 }
 ```
 
@@ -497,7 +553,7 @@ POST /api/sessions/:sessionId/logout
 
 ```mermaid
 flowchart LR
-    A[Client] -->|POST| B[/messages/send-text]
+    A[Client] -->|POST| B["/messages/send-text"]
     B --> C{Validate}
     C -->|OK| D[Queue]
     D --> E[Send]
@@ -523,12 +579,9 @@ POST /api/sessions/:sessionId/messages/send-text
 **Response (200 OK):**
 ```json
 {
-  "success": true,
-  "data": {
-    "messageId": "true_628123456789@c.us_3EB0ABC123",
-    "status": "sent",
-    "timestamp": "2025-02-02T10:00:00.000Z"
-  }
+  "messageId": "true_628123456789@c.us_3EB0ABC123",
+  "status": "sent",
+  "timestamp": "2025-02-02T10:00:00.000Z"
 }
 ```
 
@@ -565,12 +618,9 @@ POST /api/sessions/:sessionId/messages/send-image
 **Response (200 OK):**
 ```json
 {
-  "success": true,
-  "data": {
-    "messageId": "true_628123456789@c.us_3EB0ABC124",
-    "status": "sent",
-    "timestamp": "2025-02-02T10:00:00.000Z"
-  }
+  "messageId": "true_628123456789@c.us_3EB0ABC124",
+  "status": "sent",
+  "timestamp": "2025-02-02T10:00:00.000Z"
 }
 ```
 
@@ -702,7 +752,7 @@ POST /api/sessions/:sessionId/messages/send-bulk
       "chatId": "628123456789@c.us",
       "type": "text",
       "content": {
-        "text": "Hello {name}!"
+        "text": "Hello {{name}}!"
       },
       "variables": {
         "name": "John"
@@ -713,7 +763,7 @@ POST /api/sessions/:sessionId/messages/send-bulk
       "type": "image",
       "content": {
         "image": { "url": "https://example.com/promo.jpg" },
-        "caption": "Special offer for {name}!"
+        "caption": "Special offer for {{name}}!"
       },
       "variables": {
         "name": "Jane"
@@ -737,7 +787,7 @@ POST /api/sessions/:sessionId/messages/send-bulk
 | `messages[].chatId` | string | Yes | Recipient chat ID |
 | `messages[].type` | string | Yes | Message type: `text`, `image`, `video`, `audio`, `document` |
 | `messages[].content` | object | Yes | Message content based on type |
-| `messages[].variables` | object | No | Variables for template substitution |
+| `messages[].variables` | object | No | Variables substituted into `content` strings. Use canonical `{{name}}` placeholders (consistent with message templates); the legacy single-brace `{name}` is deprecated but still honored. Unknown placeholders are left literal. |
 | `options.delayBetweenMessages` | number | No | Delay in ms (default: 3000, min: 1000) |
 | `options.randomizeDelay` | boolean | No | Add random 0-2s to delay (default: true) |
 | `options.stopOnError` | boolean | No | Stop batch on first error (default: false) |
@@ -745,14 +795,11 @@ POST /api/sessions/:sessionId/messages/send-bulk
 **Response (202 Accepted):**
 ```json
 {
-  "success": true,
-  "data": {
-    "batchId": "batch_abc123xyz",
-    "status": "processing",
-    "totalMessages": 2,
-    "estimatedCompletionTime": "2025-02-02T10:05:00.000Z",
-    "statusUrl": "/api/sessions/sess_abc123/messages/batch/batch_abc123xyz"
-  }
+  "batchId": "batch_abc123xyz",
+  "status": "processing",
+  "totalMessages": 2,
+  "estimatedCompletionTime": "2025-02-02T10:05:00.000Z",
+  "statusUrl": "/api/sessions/sess_abc123/messages/batch/batch_abc123xyz"
 }
 ```
 
@@ -767,34 +814,31 @@ GET /api/sessions/:sessionId/messages/batch/:batchId
 **Response (200 OK):**
 ```json
 {
-  "success": true,
-  "data": {
-    "batchId": "batch_abc123xyz",
-    "status": "completed",
-    "progress": {
-      "total": 100,
-      "sent": 95,
-      "failed": 5,
-      "pending": 0
+  "batchId": "batch_abc123xyz",
+  "status": "completed",
+  "progress": {
+    "total": 100,
+    "sent": 95,
+    "failed": 5,
+    "pending": 0
+  },
+  "results": [
+    {
+      "chatId": "628123456789@c.us",
+      "status": "sent",
+      "messageId": "true_628123456789@c.us_3EB0ABC123"
     },
-    "results": [
-      {
-        "chatId": "628123456789@c.us",
-        "status": "sent",
-        "messageId": "true_628123456789@c.us_3EB0ABC123"
-      },
-      {
-        "chatId": "628111111111@c.us",
-        "status": "failed",
-        "error": {
-          "code": "MESSAGE_NUMBER_NOT_ON_WHATSAPP",
-          "message": "Number not registered on WhatsApp"
-        }
+    {
+      "chatId": "628111111111@c.us",
+      "status": "failed",
+      "error": {
+        "code": "MESSAGE_NUMBER_NOT_ON_WHATSAPP",
+        "message": "Number not registered on WhatsApp"
       }
-    ],
-    "startedAt": "2025-02-02T10:00:00.000Z",
-    "completedAt": "2025-02-02T10:08:30.000Z"
-  }
+    }
+  ],
+  "startedAt": "2025-02-02T10:00:00.000Z",
+  "completedAt": "2025-02-02T10:08:30.000Z"
 }
 ```
 
@@ -809,16 +853,13 @@ POST /api/sessions/:sessionId/messages/batch/:batchId/cancel
 **Response (200 OK):**
 ```json
 {
-  "success": true,
-  "data": {
-    "batchId": "batch_abc123xyz",
-    "status": "cancelled",
-    "progress": {
-      "total": 100,
-      "sent": 45,
-      "failed": 2,
-      "cancelled": 53
-    }
+  "batchId": "batch_abc123xyz",
+  "status": "cancelled",
+  "progress": {
+    "total": 100,
+    "sent": 45,
+    "failed": 2,
+    "cancelled": 53
   }
 }
 ```
@@ -839,27 +880,168 @@ GET /api/sessions/:sessionId/chats/:chatId/messages
 
 **Response (200 OK):**
 ```json
+[
+  {
+    "id": "true_628123456789@c.us_3EB0ABC123",
+    "from": "628123456789@c.us",
+    "to": "628987654321@c.us",
+    "body": "Hello!",
+    "type": "text",
+    "waTimestamp": 1706868000,
+    "timestamp": "2025-02-02T10:00:00.000Z",
+    "fromMe": false,
+    "hasMedia": false
+  }
+]
+```
+
+---
+
+#### Send Template Message
+
+Render a stored text template and send it as a regular text message. The
+template body (and optional header/footer) is rendered server-side by
+substituting `{{placeholder}}` tokens with the supplied `vars`. Rendering
+reuses the standard `send-text` path, so plugin hooks, message persistence, and
+delivery-status tracking behave identically to a direct text send.
+
+> **Scope (issue #69):** Only **Option B** — server-side text templates with
+> variable substitution — is supported. Interactive templates (buttons, list
+> messages, WhatsApp Business HSM / approved message templates) are **Option A**
+> and are **not supported** on any of the current engines (`whatsapp-web.js` or `baileys`).
+
+```http
+POST /api/sessions/:sessionId/messages/send-template
+```
+
+**Request Body:**
+```json
 {
-  "success": true,
-  "data": [
-    {
-      "id": "true_628123456789@c.us_3EB0ABC123",
-      "from": "628123456789@c.us",
-      "to": "628987654321@c.us",
-      "body": "Hello!",
-      "type": "chat",
-      "waTimestamp": 1706868000,
-      "timestamp": "2025-02-02T10:00:00.000Z",
-      "fromMe": false,
-      "hasMedia": false
-    }
-  ]
+  "chatId": "628123456789@c.us",
+  "templateName": "order-confirmation",
+  "vars": {
+    "customer": "Alice",
+    "orderId": "1234"
+  }
+}
+```
+
+**Request Fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `chatId` | string | Yes | Recipient chat ID |
+| `templateId` | string | Conditional | Template UUID. Provide either `templateId` or `templateName`. |
+| `templateName` | string | Conditional | Template name within the session. Provide either `templateId` or `templateName`. |
+| `vars` | object | No | Map of `{{placeholder}}` keys to substitution values. Unknown placeholders are left literal. |
+
+**Response (201 Created):**
+```json
+{
+  "messageId": "true_628123456789@c.us_3EB0ABC123",
+  "timestamp": "2025-02-02T10:00:00.000Z"
+}
+```
+
+Returns `404 Not Found` when the session or the referenced template does not
+exist, and `400 Bad Request` when the session is not active.
+
+---
+
+### 6.4.3 Templates
+
+Server-side text message templates (issue #69, Option B). Templates are scoped
+to a session and rendered with `{{placeholder}}` substitution by the
+[Send Template Message](#send-template-message) endpoint. All endpoints require
+an API key with at least the `operator` role.
+
+> Interactive button / list / HSM templates (**Option A**) are out of scope on
+> all current engines and are not provided.
+
+#### Create Template
+
+```http
+POST /api/sessions/:sessionId/templates
+```
+
+**Request Body:**
+```json
+{
+  "name": "order-confirmation",
+  "body": "Hi {{customer}}, your order {{orderId}} has shipped.",
+  "header": "OpenWA Store",
+  "footer": "Reply STOP to unsubscribe."
+}
+```
+
+**Request Fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Template name (max 100 chars), unique per session by convention |
+| `body` | string | Yes | Template body with `{{placeholder}}` tokens (max 4096 chars) |
+| `header` | string | No | Optional header, prepended to the rendered body |
+| `footer` | string | No | Optional footer, appended to the rendered body |
+
+When rendered, the header, body, and footer are joined with blank lines.
+
+**Response (201 Created):**
+```json
+{
+  "id": "b1c2d3e4-f5a6-7890-bcde-f01234567890",
+  "sessionId": "sess_abc123",
+  "name": "order-confirmation",
+  "body": "Hi {{customer}}, your order {{orderId}} has shipped.",
+  "header": "OpenWA Store",
+  "footer": "Reply STOP to unsubscribe.",
+  "createdAt": "2025-02-02T10:00:00.000Z",
+  "updatedAt": "2025-02-02T10:00:00.000Z"
 }
 ```
 
 ---
 
-### 6.4.3 Contacts
+#### List Templates
+
+```http
+GET /api/sessions/:sessionId/templates
+```
+
+Returns all templates for the session, newest first.
+
+---
+
+#### Get Template
+
+```http
+GET /api/sessions/:sessionId/templates/:id
+```
+
+Returns `404 Not Found` when the template does not exist in the session.
+
+---
+
+#### Update Template
+
+```http
+PUT /api/sessions/:sessionId/templates/:id
+```
+
+**Request Body:** any subset of `name`, `body`, `header`, `footer`.
+
+---
+
+#### Delete Template
+
+```http
+DELETE /api/sessions/:sessionId/templates/:id
+```
+
+**Response:** `204 No Content`.
+
+---
+
+### 6.4.4 Contacts
 
 #### Get All Contacts
 
@@ -867,20 +1049,19 @@ GET /api/sessions/:sessionId/chats/:chatId/messages
 GET /api/sessions/:sessionId/contacts
 ```
 
+**Query parameters (optional):** `limit` — max items to return, clamped to `[1, 1000]` (default `1000`); `offset` — items to skip, for paging.
+
 **Response (200 OK):**
 ```json
-{
-  "success": true,
-  "data": [
-    {
-      "id": "628123456789@c.us",
-      "name": "John Doe",
-      "pushName": "John",
-      "isMyContact": true,
-      "isBlocked": false
-    }
-  ]
-}
+[
+  {
+    "id": "628123456789@c.us",
+    "name": "John Doe",
+    "pushName": "John",
+    "isMyContact": true,
+    "isBlocked": false
+  }
+]
 ```
 
 ---
@@ -894,13 +1075,16 @@ GET /api/sessions/:sessionId/contacts/check/:phone
 **Response (200 OK):**
 ```json
 {
-  "success": true,
-  "data": {
-    "exists": true,
-    "chatId": "628123456789@c.us"
-  }
+  "number": "628123456789",
+  "exists": true,
+  "whatsappId": "628123456789@c.us"
 }
 ```
+
+> `whatsappId` is the engine's canonical WhatsApp ID for the number (and `null`
+> when `exists` is `false`). It is resolved by the engine, so it may be
+> normalized and differ from the submitted number's `@c.us` form (e.g. a `@lid`
+> identifier) — use it verbatim as the chat target rather than rebuilding it.
 
 ---
 
@@ -913,16 +1097,37 @@ GET /api/sessions/:sessionId/contacts/:contactId/profile-picture
 **Response (200 OK):**
 ```json
 {
-  "success": true,
-  "data": {
-    "url": "https://pps.whatsapp.net/..."
-  }
+  "url": "https://pps.whatsapp.net/..."
 }
 ```
 
+#### Resolve a contact id to a phone number
+
+Resolve a contact identified by a WhatsApp privacy id (`@lid`) to its phone number. Pass the `@lid`
+JID as `:contactId`.
+
+```http
+GET /api/sessions/:sessionId/contacts/:contactId/phone
+```
+
+**Response (200 OK):**
+```json
+{
+  "contactId": "123456789@lid",
+  "phone": "628123456789"
+}
+```
+
+> **Best-effort.** `phone` is MSISDN digits when the account knows the mapping, or `null` otherwise —
+> `@lid` exists specifically to hide phone numbers, so a stranger you've never interacted with (or a
+> privacy-protected sender) won't resolve. This is a WhatsApp-engine limitation, not an OpenWA one.
+
+To get this resolved automatically on each incoming message instead of calling the endpoint, see
+`RESOLVE_LID_TO_PHONE` under [message.received](#messagereceived).
+
 ---
 
-### 6.4.4 Groups
+### 6.4.5 Groups
 
 #### Get All Groups
 
@@ -930,20 +1135,19 @@ GET /api/sessions/:sessionId/contacts/:contactId/profile-picture
 GET /api/sessions/:sessionId/groups
 ```
 
+**Query parameters (optional):** `limit` — max items to return, clamped to `[1, 1000]` (default `1000`); `offset` — items to skip, for paging.
+
 **Response (200 OK):**
 ```json
-{
-  "success": true,
-  "data": [
-    {
-      "id": "628123456789-1234567890@g.us",
-      "name": "Family Group",
-      "description": "Family chat",
-      "participantsCount": 10,
-      "createdAt": "2024-01-01T00:00:00.000Z"
-    }
-  ]
-}
+[
+  {
+    "id": "628123456789-1234567890@g.us",
+    "name": "Family Group",
+    "description": "Family chat",
+    "participantsCount": 10,
+    "createdAt": "2024-01-01T00:00:00.000Z"
+  }
+]
 ```
 
 ---
@@ -957,21 +1161,18 @@ GET /api/sessions/:sessionId/groups/:groupId
 **Response (200 OK):**
 ```json
 {
-  "success": true,
-  "data": {
-    "id": "628123456789-1234567890@g.us",
-    "name": "Family Group",
-    "description": "Family chat",
-    "owner": "628123456789@c.us",
-    "participants": [
-      {
-        "id": "628123456789@c.us",
-        "isAdmin": true,
-        "isSuperAdmin": true
-      }
-    ],
-    "createdAt": "2024-01-01T00:00:00.000Z"
-  }
+  "id": "628123456789-1234567890@g.us",
+  "name": "Family Group",
+  "description": "Family chat",
+  "owner": "628123456789@c.us",
+  "participants": [
+    {
+      "id": "628123456789@c.us",
+      "isAdmin": true,
+      "isSuperAdmin": true
+    }
+  ],
+  "createdAt": "2024-01-01T00:00:00.000Z"
 }
 ```
 
@@ -996,7 +1197,7 @@ POST /api/sessions/:sessionId/groups
 
 ---
 
-### 6.4.5 Webhooks
+### 6.4.6 Webhooks
 
 #### Register Webhook
 
@@ -1017,21 +1218,35 @@ POST /api/sessions/:sessionId/webhooks
   "secret": "your-webhook-secret",
   "headers": {
     "X-Custom-Header": "value"
+  },
+  "filters": {
+    "conditions": [
+      { "field": "sender", "operator": "is", "value": ["1234567890@c.us"] },
+      { "field": "body", "operator": "contains", "value": "invoice" }
+    ]
   }
 }
 ```
 
+**Smart filters (optional).** When `filters` is present, the webhook fires only if **all** conditions
+match (logical AND); a webhook with no filters behaves exactly as before. Conditions are evaluated per
+event before delivery and message-only fields are skipped for non-message events.
+
+| Field | Kind | Operators | Notes |
+|-------|------|-----------|-------|
+| `sender`, `recipient`, `mentions` | id | `is`, `isNot` | Matched by engine-neutral `WaId`; a plain number or any dialect (`@c.us` / `@s.whatsapp.net` / `@lid`) matches the same contact. `value` is an array. |
+| `body` | text | `contains`, `equals` | Optional `caseSensitive` (default `false`). |
+| `type` | enum | `is`, `isNot` | `text` / `image` / `video` / `audio` / `voice` / `document` / `sticker` / `location` / `contact` / `revoked` / `unknown`. |
+| `fromMe`, `hasMedia`, `isGroup` | boolean | `is` | `value` is a boolean. |
+
 **Response (201 Created):**
 ```json
 {
-  "success": true,
-  "data": {
-    "id": "wh_xyz789",
-    "url": "https://your-server.com/webhook",
-    "events": ["message.received", "message.sent"],
-    "active": true,
-    "createdAt": "2025-02-02T10:00:00.000Z"
-  }
+  "id": "wh_xyz789",
+  "url": "https://your-server.com/webhook",
+  "events": ["message.received", "message.sent"],
+  "active": true,
+  "createdAt": "2025-02-02T10:00:00.000Z"
 }
 ```
 
@@ -1053,7 +1268,7 @@ DELETE /api/sessions/:sessionId/webhooks/:webhookId
 
 ---
 
-### 6.4.6 Health
+### 6.4.7 Health
 
 #### Basic Health Check
 
@@ -1069,30 +1284,23 @@ GET /health
 }
 ```
 
-The basic endpoint is public. The detailed endpoint requires an API key.
+The basic endpoint is public.
 
-#### Detailed Health Check
+#### Readiness / Liveness
 
 ```http
-GET /health/detailed
+GET /api/health/ready
+GET /api/health/live
 ```
+
+`/api/health/ready` reports whether the service is ready to receive traffic;
+`/api/health/live` reports process liveness. (There is no `/health/detailed` route.)
 
 **Response (200 OK):**
 ```json
 {
   "status": "ok",
-  "version": "0.1.0",
-  "uptime": 3600,
-  "timestamp": "2026-02-02T10:30:00Z",
-  "checks": {
-    "database": "ok",
-    "redis": "ok",
-    "sessions": {
-      "total": 5,
-      "connected": 4,
-      "disconnected": 1
-    }
-  }
+  "details": { "database": { "status": "up" } }
 }
 ```
 
@@ -1129,14 +1337,17 @@ OpenWA provides an idempotency mechanism to prevent duplicate processing on the 
 #### Idempotency Key Format
 
 ```
-Format: {event_type}_{unique_identifier}_{timestamp}
+Keys are content-based and do NOT include a timestamp, so a replayed/retried event with an
+identical payload produces the same key for correct de-duplication.
 
 Examples:
-- message.received: msg_{messageId}_{timestamp}
-- message.sent: msg_{messageId}_{timestamp}
-- message.ack: ack_{messageId}_{ackLevel}_{timestamp}
-- session.status: sess_{sessionId}_{status}_{timestamp}
-- group.join: grp_{groupId}_{participantId}_{timestamp}
+- message.received: msg_{sessionId}_{messageId}
+- message.sent: msg_{sessionId}_{messageId}
+- message.ack: ack_{sessionId}_{messageId}_{status}
+- message.failed: failed_{sessionId}_{messageId}_{status}
+- message.reaction: react_{sessionId}_{messageId}_{senderId}
+- session.status: sess_{sessionId}_{status}
+- group.join: grp_{groupId}_{participantId}_join
 ```
 
 #### Client-Side Idempotency Implementation
@@ -1277,18 +1488,45 @@ flowchart TB
     "from": "628123456789@c.us",
     "to": "628987654321@c.us",
     "body": "Hello!",
-    "type": "chat",
+    "type": "text",
     "waTimestamp": 1706868000,
     "timestamp": "2025-02-02T10:00:00.000Z",
     "isGroup": false,
     "hasMedia": false,
     "contact": {
+      "id": "628123456789@c.us",
+      "number": "628123456789",
       "name": "John Doe",
-      "pushName": "John"
+      "pushName": "John",
+      "shortName": "John",
+      "type": "in",
+      "isMyContact": true,
+      "isWAContact": true,
+      "isBusiness": false,
+      "isEnterprise": false,
+      "verifiedName": null,
+      "verifiedLevel": 0,
+      "isBlocked": false,
+      "labels": []
     }
   }
 }
 ```
+
+> **`contact` fields (opt-in via `WEBHOOK_CONTACT_DETAILS`).** By default the `contact` object carries
+> only `name` and `pushName`. Set `WEBHOOK_CONTACT_DETAILS=true` to expose the full set shown above
+> (`id`, `number`, `shortName`, `type`, the business flags, `isBlocked`, `labels`, …). All fields are
+> optional and best-effort, read synchronously from the WhatsApp Web contact cache already fetched for
+> the message — **no extra WhatsApp API calls** are made. Profile picture and about/status are
+> intentionally not included (they require per-message network calls and risk rate-limiting/ban). For
+> an `@lid` privacy-id sender, `number` may be empty; use the top-level `senderPhone` field for the
+> resolved phone number.
+
+> **Optional `senderPhone` (`@lid` resolution).** When a sender is identified by a WhatsApp privacy id
+> (`from`/`author` ends in `@lid`) and `RESOLVE_LID_TO_PHONE=true` is set, the payload also carries a
+> best-effort `senderPhone` (MSISDN digits, or `null` when the engine can't map it). Off by default
+> because it adds a per-sender lookup (results are cached). See also the on-demand
+> [resolve endpoint](#resolve-a-contact-id-to-a-phone-number). (#263)
 
 ### message.ack
 
@@ -1298,21 +1536,25 @@ flowchart TB
   "timestamp": "2025-02-02T10:00:00.000Z",
   "sessionId": "sess_abc123",
   "data": {
+    "id": "true_628123456789@c.us_3EB0ABC123",
     "messageId": "true_628123456789@c.us_3EB0ABC123",
-    "ack": 3,
-    "ackName": "read"
+    "status": "read",
+    "ack": 3
   }
 }
 ```
 
-| Ack | Name | Description |
-|-----|------|-------------|
-| 0 | error | Error |
-| 1 | pending | Pending |
-| 2 | sent | Sent to server |
-| 3 | delivered | Delivered |
-| 4 | read | Read |
-| 5 | played | Played (audio) |
+Read the engine-neutral **`status`** field — it is the canonical delivery state and is identical
+across engines. The legacy **`ack`** integer is **deprecated**, derived from `status` for backward
+compatibility only (a non-whatsapp-web.js engine still reports the same `status`).
+
+| `status` | `ack` (deprecated) | Description |
+|----------|--------------------|-------------|
+| `pending` | 0 | Queued, not yet sent to the server |
+| `sent` | 1 | Sent to the server |
+| `delivered` | 2 | Delivered to the recipient's device |
+| `read` | 3 | Read by the recipient (a played voice/video note also reports `read`) |
+| `failed` | -1 | Delivery failed (also dispatched as a separate `message.failed` event) |
 
 ### session.status
 
@@ -1464,6 +1706,7 @@ ws.send(JSON.stringify({
 | `message.sent` | Message sent successfully |
 | `message.ack` | Message acknowledgment (delivered, read) |
 | `message.revoked` | Message was deleted |
+| `message.reaction` | A reaction was added, changed, or removed on a message |
 | `group.join` | Group join event |
 | `group.leave` | Group leave event |
 | `group.update` | Group info updated |
@@ -1644,7 +1887,7 @@ async function sendMessage(sessionId, chatId, text) {
 
 // Usage
 sendMessage('sess_abc123', '628123456789@c.us', 'Hello!')
-  .then(result => console.log('Sent:', result.data.messageId))
+  .then(result => console.log('Sent:', result.messageId))
   .catch(err => console.error('Error:', err.response?.data));
 ```
 
@@ -1686,7 +1929,7 @@ class OpenWA:
 # Usage
 client = OpenWA('http://localhost:2785/api', 'your-api-key')
 result = client.send_text('sess_abc123', '628123456789@c.us', 'Hello from Python!')
-print(f"Message ID: {result['data']['messageId']}")
+print(f"Message ID: {result['messageId']}")
 ```
 
 ### WebSocket Client Example (JavaScript)

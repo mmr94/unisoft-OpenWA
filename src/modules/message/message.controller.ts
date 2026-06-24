@@ -3,7 +3,16 @@ import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery } from '@nestjs/
 import { MessageService } from './message.service';
 import { BulkMessageService } from './bulk-message.service';
 import { SendTextMessageDto, SendMediaMessageDto, MessageResponseDto } from './dto';
+import { SendTemplateMessageDto } from './dto/send-template.dto';
 import { SendBulkMessageDto, BulkMessageResponseDto } from './dto/bulk-message.dto';
+import {
+  SendLocationDto,
+  SendContactDto,
+  ReplyMessageDto,
+  ForwardMessageDto,
+  ReactMessageDto,
+  DeleteMessageDto,
+} from './dto/message-actions.dto';
 import { RequireRole } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
 
@@ -19,6 +28,11 @@ export class MessageController {
   @ApiOperation({ summary: 'Get message history for a session' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiQuery({ name: 'chatId', required: false, description: 'Filter by chat ID' })
+  @ApiQuery({
+    name: 'from',
+    required: false,
+    description: 'Filter by sender. A phone also matches messages from a lid that resolves to it.',
+  })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Max messages to return (default 50)' })
   @ApiQuery({ name: 'offset', required: false, type: Number, description: 'Offset for pagination' })
   @ApiResponse({
@@ -28,11 +42,13 @@ export class MessageController {
   async getMessages(
     @Param('sessionId') sessionId: string,
     @Query('chatId') chatId?: string,
+    @Query('from') from?: string,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
   ) {
     return this.messageService.getMessages(sessionId, {
       chatId,
+      from,
       limit: limit ? parseInt(limit, 10) : undefined,
       offset: offset ? parseInt(offset, 10) : undefined,
     });
@@ -54,6 +70,27 @@ export class MessageController {
   @ApiResponse({ status: 404, description: 'Session not found' })
   async sendText(@Param('sessionId') sessionId: string, @Body() dto: SendTextMessageDto): Promise<MessageResponseDto> {
     return this.messageService.sendText(sessionId, dto);
+  }
+
+  @Post('send-template')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({ summary: 'Render a stored text template and send it as a text message' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiResponse({
+    status: 201,
+    description: 'Template rendered and sent',
+    type: MessageResponseDto,
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Session not active or invalid request',
+  })
+  @ApiResponse({ status: 404, description: 'Session or template not found' })
+  async sendTemplate(
+    @Param('sessionId') sessionId: string,
+    @Body() dto: SendTemplateMessageDto,
+  ): Promise<MessageResponseDto> {
+    return this.messageService.sendTemplate(sessionId, dto);
   }
 
   @Post('send-image')
@@ -147,10 +184,7 @@ export class MessageController {
     description: 'Location sent',
     type: MessageResponseDto,
   })
-  async sendLocation(
-    @Param('sessionId') sessionId: string,
-    @Body() dto: { chatId: string; latitude: number; longitude: number; description?: string; address?: string },
-  ): Promise<MessageResponseDto> {
+  async sendLocation(@Param('sessionId') sessionId: string, @Body() dto: SendLocationDto): Promise<MessageResponseDto> {
     return this.messageService.sendLocation(sessionId, dto);
   }
 
@@ -163,10 +197,7 @@ export class MessageController {
     description: 'Contact sent',
     type: MessageResponseDto,
   })
-  async sendContact(
-    @Param('sessionId') sessionId: string,
-    @Body() dto: { chatId: string; contactName: string; contactNumber: string },
-  ): Promise<MessageResponseDto> {
+  async sendContact(@Param('sessionId') sessionId: string, @Body() dto: SendContactDto): Promise<MessageResponseDto> {
     return this.messageService.sendContact(sessionId, dto);
   }
 
@@ -195,10 +226,7 @@ export class MessageController {
     description: 'Reply sent',
     type: MessageResponseDto,
   })
-  async reply(
-    @Param('sessionId') sessionId: string,
-    @Body() dto: { chatId: string; quotedMessageId: string; text: string },
-  ): Promise<MessageResponseDto> {
+  async reply(@Param('sessionId') sessionId: string, @Body() dto: ReplyMessageDto): Promise<MessageResponseDto> {
     return this.messageService.reply(sessionId, dto);
   }
 
@@ -211,16 +239,14 @@ export class MessageController {
     description: 'Message forwarded',
     type: MessageResponseDto,
   })
-  async forward(
-    @Param('sessionId') sessionId: string,
-    @Body() dto: { fromChatId: string; toChatId: string; messageId: string },
-  ): Promise<MessageResponseDto> {
+  async forward(@Param('sessionId') sessionId: string, @Body() dto: ForwardMessageDto): Promise<MessageResponseDto> {
     return this.messageService.forward(sessionId, dto);
   }
 
   // ========== Phase 3: Reactions ==========
 
   @Post('react')
+  @HttpCode(HttpStatus.OK)
   @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Add or remove a reaction to a message' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
@@ -232,12 +258,54 @@ export class MessageController {
     status: 400,
     description: 'Session not active or message not found',
   })
-  async react(
-    @Param('sessionId') sessionId: string,
-    @Body() dto: { chatId: string; messageId: string; emoji: string },
-  ): Promise<{ success: boolean }> {
+  async react(@Param('sessionId') sessionId: string, @Body() dto: ReactMessageDto): Promise<{ success: boolean }> {
     await this.messageService.reactToMessage(sessionId, dto);
     return { success: true };
+  }
+
+  @Get(':chatId/history')
+  @ApiOperation({
+    summary: 'Fetch chat history live from WhatsApp',
+    description:
+      'Reads messages directly from the WhatsApp client for the given chat, bypassing the local DB. ' +
+      'Useful for retrieving messages that arrived before the gateway was started.',
+  })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'chatId', description: 'Chat ID (e.g. 1234567890@c.us or groupId@g.us)' })
+  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Max messages to return (default 50)' })
+  @ApiQuery({
+    name: 'includeMedia',
+    required: false,
+    type: Boolean,
+    description: 'When true, downloads media (base64) for messages that have it. Slower; default false.',
+  })
+  @ApiQuery({
+    name: 'deep',
+    required: false,
+    type: Boolean,
+    description:
+      'When true, raises the limit ceiling from 100 to 2000 for reaching further back in history ' +
+      '(whatsapp-web.js only; loads earlier messages on demand). Forces metadata-only (includeMedia ' +
+      'is ignored). Large/slow requests may increase WhatsApp rate-limiting risk; default false.',
+  })
+  @ApiResponse({ status: 200, description: 'Chat history (most recent messages)' })
+  async getChatHistory(
+    @Param('sessionId') sessionId: string,
+    @Param('chatId') chatId: string,
+    @Query('limit') limit?: string,
+    @Query('includeMedia') includeMedia?: string,
+    @Query('deep') deep?: string,
+  ) {
+    // Parse the limit defensively: a non-numeric query value (?limit=abc) yields NaN,
+    // so fall back to undefined and let the service apply its default + clamp.
+    const parsedLimit = limit ? parseInt(limit, 10) : undefined;
+    return this.messageService.getChatHistory(
+      sessionId,
+      chatId,
+      parsedLimit !== undefined && !Number.isNaN(parsedLimit) ? parsedLimit : undefined,
+      includeMedia === 'true' || includeMedia === '1',
+      deep === 'true' || deep === '1',
+    );
   }
 
   @Get(':chatId/:messageId/reactions')
@@ -260,6 +328,7 @@ export class MessageController {
   // ========== Delete Message ==========
 
   @Post('delete')
+  @HttpCode(HttpStatus.OK)
   @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Delete a message' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
@@ -273,7 +342,7 @@ export class MessageController {
   })
   async deleteMessage(
     @Param('sessionId') sessionId: string,
-    @Body() dto: { chatId: string; messageId: string; forEveryone?: boolean },
+    @Body() dto: DeleteMessageDto,
   ): Promise<{ success: boolean }> {
     await this.messageService.deleteMessage(sessionId, dto);
     return { success: true };

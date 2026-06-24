@@ -49,7 +49,84 @@ flowchart TD
     A3 -->|No| A3a[Check message format]
 ```
 
-## 12.2 Connection Issues
+## 12.2 Podman Compatibility
+
+### Issue: `FileNotFoundError` / Docker socket missing
+
+**Symptoms:**
+
+```text
+docker.errors.DockerException: Error while fetching server API version:
+  ('Connection aborted.', FileNotFoundError(2, 'No such file or directory'))
+```
+
+**Cause:** The system uses Podman (not Docker Engine). Podman's rootless socket is inactive by default.
+
+**Fix:**
+
+```bash
+systemctl --user start podman.socket
+systemctl --user enable podman.socket
+export DOCKER_HOST=unix:///run/user/$(id -u)/podman/podman.sock
+```
+
+Add the `export` to `~/.bashrc` to make it permanent.
+
+---
+
+### Issue: `short-name did not resolve to an alias`
+
+**Symptoms:**
+
+```text
+Error: creating build container: short-name "nginx:alpine" did not resolve to an alias
+and no unqualified-search registries are defined
+```
+
+**Cause:** Podman rootless mode does not fall back to Docker Hub for unqualified image names.
+
+**Fix:** All `FROM` directives in the `Dockerfile` must use fully-qualified names:
+
+```dockerfile
+FROM docker.io/node:22-slim
+```
+
+---
+
+### Issue: Healthcheck always `unhealthy` on Node 22 + Podman
+
+**Symptoms:** Container starts successfully but stays `unhealthy`; logs show:
+
+```text
+SyntaxError: Unexpected end of input
+at evalTypeScript (node:internal/process/execution:256:22)
+```
+
+**Cause:** Node 22 routes `node -e` through its TypeScript evaluator which rejects arrow-function
+syntax. Podman also splits quoted shell commands on whitespace, truncating the `-e` argument.
+
+**Fix:** Use `curl` for the healthcheck instead of `node -e`:
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:2785/api/health || exit 1
+```
+
+```yaml
+# docker-compose.dev.yml
+healthcheck:
+  test: ['CMD', 'curl', '-f', 'http://localhost:2785/api/health']
+```
+
+Ensure `curl` is installed in the production stage:
+
+```dockerfile
+RUN apt-get install -y ... curl ...
+```
+
+---
+
+## 12.3 Connection Issues
 
 ### Issue: Container Won't Start
 
@@ -119,6 +196,83 @@ docker compose restart openwa
 export PROXY_URL=http://proxy:8080
 docker compose up -d
 ```
+
+### Issue: Session stuck at `authenticating`, never reaches `ready`
+
+> **Engine:** This issue applies to the `whatsapp-web.js` engine only. If you are using `ENGINE_TYPE=baileys`, skip this section.
+
+**Symptoms:** After scanning the QR the phone links the device, but the session stays at
+`authenticating` indefinitely and never becomes `ready`. `GET /sessions/:id/qr` returns 400 while
+stuck. Often seen on ARM64 (e.g. Raspberry Pi) after upgrading to v0.2.x.
+
+**Cause:** whatsapp-web.js auto-selects a WhatsApp Web client version, and an incompatible version
+stalls the post-link sync. (If you also see `chrome_crashpad_handler: --database is required` *and the
+session never starts at all*, that is a different problem — see "Session fails to launch …" below.)
+
+**Fix:** OpenWA reconciles a missed `ready` event when WhatsApp Web is connected, the injected
+runtime is available, and whatsapp-web.js has populated the linked account identity. If your
+environment still hits a WA-Web compatibility hang, pin a known-good WA-Web version with
+`WWEBJS_WEB_VERSION`:
+
+```bash
+# Optional workaround:
+WWEBJS_WEB_VERSION=2.3000.1040641150-alpha
+```
+
+Restart the container after changing it. Browse newer versions at
+[wppconnect-team/wa-version](https://github.com/wppconnect-team/wa-version) (the `html/` folder). Set
+`WWEBJS_WEB_VERSION=latest`, `auto`, or `off` (or leave it unset) to use whatsapp-web.js
+auto-version behavior.
+
+### Issue: QR generation times out on slow first boot (WSL2 / low-resource)
+
+> **Engine:** This issue applies to the `whatsapp-web.js` engine only. If you are using `ENGINE_TYPE=baileys`, skip this section.
+
+**Symptoms:** On the first launch the session never produces a QR code and fails after ~30 seconds,
+often inside WSL2 or a resource-constrained container while WhatsApp Web is still loading.
+
+**Cause:** whatsapp-web.js waits a fixed 30000ms for WhatsApp Web to finish its initial load before
+generating the QR. On a slow first boot that window can expire before the page is ready.
+
+**Fix:** raise the boot/inject wait (milliseconds) with `WWEBJS_AUTH_TIMEOUT_MS`:
+
+```bash
+# Allow up to 2 minutes for the first-boot init wait:
+WWEBJS_AUTH_TIMEOUT_MS=120000
+```
+
+Restart the container after setting it. Leave it unset to keep the default (30000ms).
+
+### Issue: Session fails to launch with `chrome_crashpad_handler: --database is required`
+
+> **Engine:** This issue applies to the `whatsapp-web.js` engine only (Chromium/Puppeteer-based). It does not affect `ENGINE_TYPE=baileys`.
+
+**Symptoms:** The session never starts; the engine log shows `Failed to launch the browser process` with
+`chrome_crashpad_handler: --database is required`, and the host kernel log shows a Chromium
+`trap int3` / `Trace/breakpoint trap (core dumped)`. Seen on hardened, `read_only` containers.
+
+**Cause:** Chromium resolves its home directory from the passwd entry (glibc `getpwuid()`) and **ignores
+`$HOME`**. The non-root `openwa` user has no home dir, so Chromium tries to use `/home/openwa`, which does
+not exist on the read-only rootfs — and aborts at launch. (Setting `HOME=` does **not** help, and
+`--crash-dumps-dir` is a no-op for the crashpad database on Debian/Ubuntu system Chromium.)
+
+**Fix:** Give Chromium writable, pre-created config/cache dirs via `XDG_CONFIG_HOME` / `XDG_CACHE_HOME`.
+The bundled image and `docker-compose.yml` already do this (the entrypoint creates them on the tmpfs `/tmp`,
+owned by `openwa`). If you run a custom container, ensure both are set to a writable, existing path:
+
+```bash
+XDG_CONFIG_HOME=/tmp/.config
+XDG_CACHE_HOME=/tmp/.cache
+# and create them owned by the runtime user before launch:
+#   mkdir -p /tmp/.config /tmp/.cache && chown <user> /tmp/.config /tmp/.cache
+```
+
+On a `read_only` rootfs you **must** also mount a writable tmpfs/emptyDir at `/tmp` (compose:
+`tmpfs: [/tmp]`; k8s: an `emptyDir` at `/tmp`) — otherwise the entrypoint cannot create these dirs and
+will exit at startup with a clear `FATAL:` message rather than crash-looping later.
+
+Do **not** work around this by dropping `--no-sandbox` security hardening or using `seccomp:unconfined`
+(confirmed not to help, and it widens the attack surface).
 
 ### Issue: Frequent Disconnections
 
@@ -307,7 +461,8 @@ docker stats openwa --no-stream
 curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/metrics/memory
 
-# Expected: ~300-500MB per session
+# Expected: ~300-500MB per session (whatsapp-web.js / Chromium engine)
+# With ENGINE_TYPE=baileys the footprint is significantly lower (no Chromium)
 ```
 
 **Solutions:**
@@ -323,7 +478,7 @@ services:
         reservations:
           memory: 512M
     environment:
-      # Optimize Puppeteer
+      # Optimize Puppeteer (whatsapp-web.js engine only)
       - PUPPETEER_ARGS=--disable-dev-shm-usage,--disable-gpu,--no-sandbox
       # Limit cache
       - WA_CACHE_SIZE=1000
@@ -337,7 +492,7 @@ services:
 |--------------|--------|-----------|
 | Disable media cache | -30% RAM | Slower media re-send |
 | Reduce message history | -20% RAM | Less searchable history |
-| Headless Chrome flags | -15% RAM | None |
+| Headless Chrome flags | -15% RAM (wwebjs only) | None |
 | Limit concurrent sessions | Linear | Fewer sessions |
 
 ### Issue: Slow API Response
@@ -528,11 +683,12 @@ docker exec openwa curl http://host.docker.internal:8080
 > - Implement rate limiting
 
 **Q: How many sessions can I run?**
-> A: Depends on your server resources:
+> A: Depends on your server resources and the engine in use. With the default `whatsapp-web.js` engine (Chromium-based), each session uses ~300-500MB RAM:
 > - 2GB RAM: 3-5 sessions
 > - 4GB RAM: 8-10 sessions
 > - 8GB RAM: 15-20 sessions
-> Each session uses ~300-500MB RAM.
+>
+> With `ENGINE_TYPE=baileys` (browser-free), RAM per session is significantly lower — you can run more sessions on the same hardware. Exact figures depend on message volume and group membership.
 
 **Q: Can I use WhatsApp Business account?**
 > A: Yes, OpenWA works with both personal and WhatsApp Business accounts. Note that WhatsApp Business API (official Meta API) is different and not supported.
@@ -630,7 +786,10 @@ else
 fi
 
 # Backup auth sessions
+# whatsapp-web.js engine:
 cp -r ./data/.wwebjs_auth "$BACKUP_DIR/$DATE/"
+# Baileys engine (ENGINE_TYPE=baileys): back up BAILEYS_AUTH_DIR (default: ./data/baileys)
+# cp -r ./data/baileys "$BACKUP_DIR/$DATE/"
 
 # Keep only last 7 days
 find "$BACKUP_DIR" -type d -mtime +7 -exec rm -rf {} \;
@@ -648,6 +807,7 @@ available_events:
   - message.sent         # Message sent
   - message.ack          # Message status update (sent, delivered, read)
   - message.revoked      # Message deleted
+  - message.reaction     # Reaction added, changed, or removed
 
   # Session
   - session.status       # Session status change
@@ -676,7 +836,7 @@ available_events:
     "from": "628123456789@c.us",
     "to": "628987654321@c.us",
     "body": "Hello!",
-    "type": "chat",
+    "type": "text",
     "timestamp": 1706868600,
     "isGroup": false,
     "author": null,

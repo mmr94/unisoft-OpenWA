@@ -980,76 +980,41 @@ export default defineConfig({
 });
 ```
 
-### Docker Build
+### Production Build & Serving
 
-```dockerfile
-# dashboard/Dockerfile
+The dashboard has **no container of its own**. In production the NestJS API serves the bundled
+SPA from the same process and port (default `2785`) via `@nestjs/serve-static`, so there is no
+nginx image and no separate dashboard service to deploy.
 
-# Build stage
-FROM node:20-alpine AS builder
+How it fits together:
 
-WORKDIR /app
+- `npm run build:all` builds the API (`dist/`) **and** the dashboard (`dashboard/dist/`). The root
+  `Dockerfile` does this in its builder stage and copies `dashboard/dist` into the runtime image.
+- `ServeStaticModule` is registered conditionally in `src/app.module.ts`: it only activates when
+  `dashboard/dist/index.html` exists, serves it with SPA fallback, and `exclude`s `/api` and
+  `/socket.io` so those keep returning real API/WebSocket responses. Opt out with
+  `SERVE_DASHBOARD=false`.
+- Run it directly with `npm run prod` (build + serve) or `node dist/main` against a prebuilt image.
 
-COPY package*.json ./
-RUN npm ci
+In development the build is absent, so serve-static stays inert and the Vite dev server (port
+`2886`, see above) handles the UI with HMR while proxying `/api` + `/socket.io` to the API.
 
-COPY . .
-RUN npm run build
+**Split-origin hosting is still supported.** Same-origin serving is the default, not a lock-in: to
+host the dashboard separately (a CDN, an object store, or its own container), build it with the API
+origin baked in and deploy `dashboard/dist` wherever you like:
 
-# Production stage
-FROM nginx:alpine
-
-COPY --from=builder /app/dist /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
-
-EXPOSE 80
-
-CMD ["nginx", "-g", "daemon off;"]
+```bash
+VITE_API_URL=https://api.example.com npm run build   # in dashboard/
 ```
 
-```nginx
-# dashboard/nginx.conf
+`dashboard/src/services/api.ts` reads `VITE_API_URL` and calls that origin instead of same-origin
+`/api`. Set `SERVE_DASHBOARD=false` on the API so it stops serving its own copy. Remember to add the
+dashboard's origin to `CORS_ORIGINS` on the API.
 
-server {
-    listen 80;
-    server_name _;
-    root /usr/share/nginx/html;
-    index index.html;
+For TLS or public exposure of the default single-port setup, terminate at your own reverse proxy
+(nginx, Caddy, a cloud load balancer, or a k8s Ingress) in front of the API; see
+`docs/12-troubleshooting-faq.md` for an nginx example.
 
-    # Gzip compression
-    gzip on;
-    gzip_types text/plain text/css application/json application/javascript;
-
-    # SPA routing
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
-
-    # API proxy (if needed)
-    location /api {
-        proxy_pass http://openwa:2785;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_cache_bypass $http_upgrade;
-    }
-
-    # WebSocket proxy
-    location /ws {
-        proxy_pass http://openwa:2785;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-
-    # Cache static assets
-    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)$ {
-        expires 1y;
-        add_header Cache-Control "public, immutable";
-    }
-}
-```
 ---
 
 <div align="center">

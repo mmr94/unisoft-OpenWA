@@ -27,6 +27,9 @@ const TTL = {
   SESSIONS_STATS: 15, // 15 sec
 };
 
+/** Max time to await a graceful `redis.quit()` on shutdown before force-disconnecting (see onModuleDestroy). */
+export const CACHE_QUIT_TIMEOUT_MS = 2000;
+
 @Injectable()
 export class CacheService implements OnModuleDestroy {
   private readonly logger = createLogger('CacheService');
@@ -111,8 +114,25 @@ export class CacheService implements OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
-    if (this.redis) {
-      await this.redis.quit();
+    if (!this.redis) return;
+    const redis = this.redis;
+
+    // Bound the teardown: redis.quit() waits for the QUIT reply, which never arrives on a half-open /
+    // partitioned socket — leaving app.close() blocked until the orchestrator SIGKILLs the process.
+    // Force-disconnect after a short deadline so shutdown always completes.
+    let timer: NodeJS.Timeout | undefined;
+    const forceDisconnect = new Promise<void>(resolve => {
+      timer = setTimeout(() => {
+        redis.disconnect();
+        resolve();
+      }, CACHE_QUIT_TIMEOUT_MS);
+      timer.unref();
+    });
+
+    try {
+      await Promise.race([redis.quit().catch(() => undefined), forceDisconnect]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -232,41 +252,6 @@ export class CacheService implements OnModuleDestroy {
       await this.redis!.setex('sessions:stats', TTL.SESSIONS_STATS, JSON.stringify(stats));
     } catch (error) {
       this.logger.warn(`Cache write failed (sessions:stats): ${String(error)}`);
-    }
-  }
-
-  // ========== Invalidation ==========
-
-  async invalidateSession(id: string): Promise<void> {
-    if (!(await this.isAvailable())) return;
-    try {
-      await this.redis!.del(`session:${id}:status`, `session:${id}:info`, `session:${id}:qr`);
-      // Also invalidate list since a session changed
-      await this.redis!.del('sessions:list', 'sessions:stats');
-    } catch (error) {
-      this.logger.warn(`Cache invalidation failed: ${String(error)}`);
-    }
-  }
-
-  async invalidateSessionsList(): Promise<void> {
-    if (!(await this.isAvailable())) return;
-    try {
-      await this.redis!.del('sessions:list', 'sessions:stats');
-    } catch (error) {
-      this.logger.warn(`Cache invalidation failed: ${String(error)}`);
-    }
-  }
-
-  async invalidateAll(): Promise<void> {
-    if (!(await this.isAvailable())) return;
-    try {
-      const keys = await this.redis!.keys('session:*');
-      keys.push('sessions:list', 'sessions:stats');
-      if (keys.length > 0) {
-        await this.redis!.del(...keys);
-      }
-    } catch (error) {
-      this.logger.warn(`Cache invalidation failed: ${String(error)}`);
     }
   }
 }

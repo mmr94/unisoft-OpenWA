@@ -10,6 +10,7 @@ export type HookEvent =
   | 'session:ready'
   | 'session:qr'
   | 'session:disconnected'
+  | 'session:error'
   | 'session:deleted'
   | 'session:hibernated' // Engine unloaded after inactivity (RAM freed)
   | 'session:resuming' // Engine being reloaded after hibernation
@@ -26,6 +27,40 @@ export type HookEvent =
   | 'webhook:delivered' // After webhook successfully delivered (direct or queue)
   | 'webhook:after' // After webhook attempt (direct mode only, deprecated for queue)
   | 'webhook:error'; // After webhook delivery failed (all retries exhausted)
+
+// Runtime allowlist of every HookEvent. The Record is exhaustively typed, so adding a HookEvent above
+// without listing it here is a COMPILE error — keeping the runtime set in lockstep with the type.
+// Used to reject fabricated event names at the sandbox IPC boundary (HookEvent is type-only; the wire
+// payload is an arbitrary string), bounding host-registry growth to this finite set.
+const HOOK_EVENT_REGISTRY: Record<HookEvent, true> = {
+  'session:created': true,
+  'session:starting': true,
+  'session:ready': true,
+  'session:qr': true,
+  'session:disconnected': true,
+  'session:error': true,
+  'session:deleted': true,
+  'session:hibernated': true,
+  'session:resuming': true,
+  'session:resumed': true,
+  'message:received': true,
+  'message:sending': true,
+  'message:sent': true,
+  'message:failed': true,
+  'message:ack': true,
+  'webhook:before': true,
+  'webhook:queued': true,
+  'webhook:delivered': true,
+  'webhook:after': true,
+  'webhook:error': true,
+};
+
+export const KNOWN_HOOK_EVENTS: ReadonlySet<HookEvent> = new Set(Object.keys(HOOK_EVENT_REGISTRY) as HookEvent[]);
+
+/** Type guard: is `event` one of the known HookEvent values? Narrows an untrusted string to HookEvent. */
+export function isKnownHookEvent(event: string): event is HookEvent {
+  return (KNOWN_HOOK_EVENTS as ReadonlySet<string>).has(event);
+}
 
 export interface HookContext<T = unknown> {
   event: HookEvent;

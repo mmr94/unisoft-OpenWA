@@ -24,6 +24,7 @@ export class DockerService implements OnModuleInit {
   private readonly logger = new Logger(DockerService.name);
   private docker: Docker | null = null;
   private isAvailable = false;
+  private reinitInFlight = false;
 
   async onModuleInit() {
     await this.initializeDocker();
@@ -71,23 +72,48 @@ export class DockerService implements OnModuleInit {
 
   private async initializeDocker(): Promise<void> {
     try {
-      this.docker = new Docker({ socketPath: '/var/run/docker.sock' });
+      this.docker = new Docker(this.buildDockerOptions());
       await this.docker.ping();
       this.isAvailable = true;
       this.logger.log('Docker API connected successfully');
     } catch (error) {
       this.logger.warn(
-        'Docker socket not available. Container orchestration disabled.',
+        'Docker not available. Container orchestration disabled.',
         error instanceof Error ? error.message : error,
       );
       this.isAvailable = false;
     }
   }
 
+  // Visible for testing
+  buildDockerOptions(): Docker.DockerOptions {
+    const dockerHost = process.env.DOCKER_HOST;
+    if (dockerHost) {
+      const match = /^tcp:\/\/([^:]+):(\d+)$/.exec(dockerHost);
+      if (match) {
+        return { host: match[1], port: parseInt(match[2], 10), protocol: 'http' };
+      }
+    }
+    return { socketPath: '/var/run/docker.sock' };
+  }
+
   /**
-   * Check if Docker is available
+   * Check if Docker is available.
+   *
+   * Startup-race recovery: when the API talks to the Docker socket-proxy over TCP
+   * (DOCKER_HOST=tcp://...), the proxy container may not be accepting connections at
+   * the moment onModuleInit runs (compose `service_started` doesn't wait for readiness).
+   * If the first connect failed, retry it once in the background here so orchestration
+   * recovers without a process restart. Only for the DOCKER_HOST (proxy/tcp) case — a
+   * socket-based or docker-less deployment has no such race.
    */
   isDockerAvailable(): boolean {
+    if (!this.isAvailable && !this.reinitInFlight && process.env.DOCKER_HOST) {
+      this.reinitInFlight = true;
+      void this.initializeDocker().finally(() => {
+        this.reinitInFlight = false;
+      });
+    }
     return this.isAvailable;
   }
 
@@ -302,13 +328,10 @@ export class DockerService implements OnModuleInit {
           NetworkMode: 'openwa-network',
           RestartPolicy: { Name: 'unless-stopped' },
           Binds: spec.volumes?.map(v => `${v.name}:${v.path}`),
-          PortBindings: spec.ports?.reduce(
-            (acc, p) => {
-              acc[`${p.container}/tcp`] = [{ HostIp: '127.0.0.1', HostPort: p.host.toString() }];
-              return acc;
-            },
-            {} as Record<string, { HostIp: string; HostPort: string }[]>,
-          ),
+          PortBindings: spec.ports?.reduce<Record<string, { HostIp: string; HostPort: string }[]>>((acc, p) => {
+            acc[`${p.container}/tcp`] = [{ HostIp: '127.0.0.1', HostPort: p.host.toString() }];
+            return acc;
+          }, {}),
         },
         Healthcheck: spec.healthcheck
           ? {
@@ -400,7 +423,9 @@ export class DockerService implements OnModuleInit {
           await container.stop();
           this.logger.log(`Stopped container: ${profile}`);
         }
-        await container.remove({ v: true }); // v: true removes volumes too
+        // v: true removes only the container's ANONYMOUS volumes; named datastore volumes
+        // (redis/postgres/minio data) are preserved, so disable + re-enable keeps the data.
+        await container.remove({ v: true });
         this.logger.log(`Removed container: ${profile}`);
         return true;
       } catch (error) {

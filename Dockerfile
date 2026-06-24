@@ -2,7 +2,14 @@
 # Multi-stage build for production-ready image
 
 # ===== Stage 1: Builder =====
-FROM node:22-slim AS builder
+# Pin the builder to the BUILD host's platform (not the target's). It only produces arch-INDEPENDENT
+# artifacts (the NestJS dist/ JS and the static dashboard SPA), so it never needs to run emulated for
+# the non-native target. On a multi-arch buildx build this avoids QEMU emulating the whole npm ci +
+# Vite build for arm64 — which is slow AND is where the arm64 lightningcss (Vite 8's native CSS
+# minifier) optional dependency fails to install ("Cannot find module lightningcss.linux-arm64-gnu.node").
+# The per-arch runtime deps are installed natively in the target-platform production stage below.
+# NOTE: $BUILDPLATFORM requires BuildKit (CI uses buildx; modern `docker build`/compose default to it).
+FROM --platform=$BUILDPLATFORM docker.io/node:22-slim AS builder
 
 WORKDIR /app
 
@@ -16,17 +23,27 @@ RUN apt-get update && apt-get install -y \
 # Copy package files
 COPY package*.json ./
 
-# Install all dependencies (including devDependencies for build)
-RUN npm ci
+# Install all dependencies INCLUDING devDependencies — the build needs them (`nest` from
+# @nestjs/cli, plus `vite`/`typescript` for the dashboard). `--include=dev` is REQUIRED, not
+# cosmetic: npm omits devDependencies whenever NODE_ENV=production is present in the build env.
+# Coolify (and similar PaaS) promote every ${VAR} referenced in the compose file to a build-time
+# variable, so docker-compose.yml's `NODE_ENV=${NODE_ENV:-production}` leaks NODE_ENV=production
+# into this stage and a bare `npm ci` would skip @nestjs/cli → `sh: 1: nest: not found` (exit 127).
+# (docker-compose.dev.yml hardcodes NODE_ENV=development, which is why the dev build never hit this.)
+RUN npm ci --include=dev
 
 # Copy source code
 COPY . .
 
-# Build the application
-RUN npm run build
+# Build the API (dist/) and the dashboard SPA (dashboard/dist/). The root `npm ci` above
+# ran before the dashboard source was copied, so its postinstall hook skipped the dashboard
+# deps - install them explicitly here (npm ci, reproducible from dashboard/package-lock.json).
+# `--include=dev` for the same reason as above: the dashboard build needs vite/typescript
+# (devDependencies), which a NODE_ENV=production build env would otherwise omit.
+RUN npm run build && npm run dashboard:ci -- --include=dev && npm run dashboard:build
 
 # ===== Stage 2: Production =====
-FROM node:22-slim AS production
+FROM docker.io/node:22-slim AS production
 
 # Install Chrome/Chromium and required dependencies
 RUN apt-get update && apt-get install -y \
@@ -49,6 +66,9 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     xdg-utils \
     dumb-init \
+    gosu \
+    curl \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Chrome executable path for Puppeteer
@@ -69,21 +89,38 @@ RUN npm ci --omit=dev && npm cache clean --force
 # Copy built application from builder stage
 COPY --from=builder /app/dist ./dist
 
-# Create data directories with proper permissions
+# Copy the bundled dashboard SPA; ServeStaticModule serves it from this same process/port
+# (app.module.ts resolves dashboard/dist relative to dist/). Single container, single port.
+COPY --from=builder /app/dashboard/dist ./dashboard/dist
+
+# Create data directories with correct ownership
 RUN mkdir -p ./data/sessions ./data/media && \
     chown -R openwa:openwa /app
 
-# Note: Running as root to allow Docker socket access for orchestration
-# For production with stricter security, consider using a Docker socket proxy
-# USER openwa
+# The non-root openwa user has no home of its own (`useradd -r`, no -m). Chromium resolves the home
+# dir from the passwd entry via glib's getpwuid() — it IGNORES $HOME — so it tries to read/write
+# /home/openwa, which does not exist. On hardened/read-only hosts that makes the browser HARD-CRASH
+# at launch (SIGTRAP/int3, logged as "chrome_crashpad_handler: --database is required"). The robust
+# fix is to point Chromium's config + cache at writable, pre-created dirs via XDG_* (honored directly,
+# bypassing the passwd lookup); docker-entrypoint.sh creates them owned by openwa. On a read_only
+# rootfs these live on the tmpfs /tmp. HOME is kept for any other HOME-relative tooling. See #254/#242.
+ENV HOME=/app/data
+ENV XDG_CONFIG_HOME=/tmp/.config
+ENV XDG_CACHE_HOME=/tmp/.cache
+
+# Copy entrypoint: runs as root to fix named-volume ownership, then drops to openwa via gosu
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Expose port
 EXPOSE 2785
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD node -e "require('http').get('http://localhost:2785/api/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"
+    CMD curl -f http://localhost:2785/api/health/ready || exit 1
 
-# Start with dumb-init to handle signals properly
-ENTRYPOINT ["dumb-init", "--"]
+# dumb-init is PID 1 and handles signal forwarding.
+# It execs docker-entrypoint.sh (as root), which fixes volume ownership and
+# then drops to the openwa user via gosu before starting the node process.
+ENTRYPOINT ["dumb-init", "--", "/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "dist/main"]

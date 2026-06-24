@@ -1,11 +1,15 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, NotFoundException, PayloadTooLargeException } from '@nestjs/common';
 import { MessageService } from './message.service';
 import { Message, MessageDirection, MessageStatus } from './entities/message.entity';
 import { SessionService } from '../session/session.service';
 import { HookManager } from '../../core/hooks';
+import { TemplateService } from '../template/template.service';
+import { Template } from '../template/entities/template.entity';
+import { SsrfBlockedError } from '../../common/security/ssrf-guard';
+import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 
 const mockEngineResult = { id: 'wa-msg-1', timestamp: 1706868000 };
 
@@ -24,6 +28,8 @@ function createMockEngine() {
     reactToMessage: jest.fn().mockResolvedValue(undefined),
     getMessageReactions: jest.fn().mockResolvedValue([]),
     deleteMessage: jest.fn().mockResolvedValue(undefined),
+    getChatHistory: jest.fn().mockResolvedValue([]),
+    sendChatState: jest.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -32,12 +38,26 @@ describe('MessageService', () => {
   let repository: jest.Mocked<Partial<Repository<Message>>>;
   let sessionService: jest.Mocked<Partial<SessionService>>;
   let hookManager: jest.Mocked<Partial<HookManager>>;
+  let templateService: jest.Mocked<Partial<TemplateService>>;
+  let lidMappingStore: { lidsForPhone: jest.Mock };
   let mockEngine: ReturnType<typeof createMockEngine>;
+
+  // Auto-typing is on by default; disable it for the unrelated send tests so they don't incur the
+  // real setTimeout delay and don't add an extra sendChatState call. The auto-typing suite opts in.
+  beforeEach(() => {
+    process.env.SIMULATE_TYPING = 'false';
+  });
+  afterEach(() => {
+    delete process.env.SIMULATE_TYPING;
+    delete process.env.SIMULATE_TYPING_MAX_MS;
+  });
 
   beforeEach(async () => {
     repository = {
       create: jest.fn().mockImplementation((data: Partial<Message>) => ({ id: 'msg-uuid-1', ...data }) as Message),
       save: jest.fn().mockImplementation(msg => Promise.resolve(msg)),
+      findOne: jest.fn().mockResolvedValue(null),
+      update: jest.fn().mockResolvedValue({ affected: 1 }),
       createQueryBuilder: jest.fn(),
     };
 
@@ -57,12 +77,20 @@ describe('MessageService', () => {
       }),
     };
 
+    templateService = {
+      resolve: jest.fn(),
+    };
+
+    lidMappingStore = { lidsForPhone: jest.fn().mockReturnValue([]) };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         MessageService,
         { provide: getRepositoryToken(Message, 'data'), useValue: repository },
         { provide: SessionService, useValue: sessionService },
         { provide: HookManager, useValue: hookManager },
+        { provide: TemplateService, useValue: templateService },
+        { provide: LidMappingStoreService, useValue: lidMappingStore },
       ],
     }).compile();
 
@@ -70,6 +98,24 @@ describe('MessageService', () => {
   });
 
   // ── sendText ──────────────────────────────────────────────────────
+
+  describe('auto-typing before send (SIMULATE_TYPING, on by default)', () => {
+    it('sends a typing presence before the message by default', async () => {
+      delete process.env.SIMULATE_TYPING; // default = on
+      process.env.SIMULATE_TYPING_MAX_MS = '1'; // keep the humanising delay ~instant in tests
+
+      await service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'Hello' });
+
+      expect(mockEngine.sendChatState).toHaveBeenCalledWith('628123456789@c.us', 'typing');
+      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('628123456789@c.us', 'Hello');
+    });
+
+    it('does not send typing presence when SIMULATE_TYPING=false', async () => {
+      process.env.SIMULATE_TYPING = 'false';
+      await service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'Hello' });
+      expect(mockEngine.sendChatState).not.toHaveBeenCalled();
+    });
+  });
 
   describe('sendText', () => {
     it('should send text message and return messageId + timestamp', async () => {
@@ -103,7 +149,7 @@ describe('MessageService', () => {
       expect(repository.save).toHaveBeenCalledTimes(2);
     });
 
-    it('should execute message:sending and message:sent hooks', async () => {
+    it('executes the message:sending hook (message:sent now fires once from the engine message_create path)', async () => {
       await service.sendText('sess-1', {
         chatId: '628123456789@c.us',
         text: 'Hello',
@@ -114,11 +160,9 @@ describe('MessageService', () => {
         expect.objectContaining({ type: 'text' }),
         expect.any(Object),
       );
-      expect(hookManager.execute).toHaveBeenCalledWith(
-        'message:sent',
-        expect.objectContaining({ result: mockEngineResult }),
-        expect.any(Object),
-      );
+      // message:sent is no longer fired here — it is emitted solely by SessionService.onMessageCreate
+      // with a consistent IncomingMessage payload for ALL sends (avoids the prior double dispatch).
+      expect(hookManager.execute).not.toHaveBeenCalledWith('message:sent', expect.anything(), expect.anything());
     });
 
     it('should throw BadRequestException when plugin blocks sending', async () => {
@@ -137,6 +181,91 @@ describe('MessageService', () => {
       await expect(service.sendText('inactive', { chatId: 'test@c.us', text: 'hello' })).rejects.toThrow(
         BadRequestException,
       );
+    });
+  });
+
+  // ── sendTemplate ──────────────────────────────────────────────────
+
+  describe('sendTemplate', () => {
+    function mockTemplate(overrides: Partial<Template> = {}): Template {
+      return {
+        id: 'tpl-1',
+        sessionId: 'sess-1',
+        name: 'order-confirmation',
+        body: 'Hi {{customer}}, your order {{orderId}} shipped.',
+        header: null,
+        footer: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        session: undefined as unknown as Template['session'],
+        ...overrides,
+      };
+    }
+
+    beforeEach(() => {
+      // Echo the supplied input back through the hook so the rendered text
+      // reaches the engine via the delegated sendText path.
+      (hookManager.execute as jest.Mock).mockImplementation((event: string, data: unknown) =>
+        Promise.resolve({ continue: true, data }),
+      );
+    });
+
+    it('should resolve the template, render variables, and delegate to sendText', async () => {
+      (templateService.resolve as jest.Mock).mockResolvedValue(mockTemplate());
+
+      const result = await service.sendTemplate('sess-1', {
+        chatId: '628123456789@c.us',
+        templateName: 'order-confirmation',
+        vars: { customer: 'Alice', orderId: '1234' },
+      });
+
+      expect(templateService.resolve).toHaveBeenCalledWith('sess-1', {
+        templateId: undefined,
+        templateName: 'order-confirmation',
+      });
+      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith(
+        '628123456789@c.us',
+        'Hi Alice, your order 1234 shipped.',
+      );
+      expect(result.messageId).toBe('wa-msg-1');
+    });
+
+    it('should flatten header and footer around the body with blank lines', async () => {
+      (templateService.resolve as jest.Mock).mockResolvedValue(
+        mockTemplate({ header: 'OpenWA Store', body: 'Hello {{customer}}', footer: 'Reply STOP to opt out' }),
+      );
+
+      await service.sendTemplate('sess-1', {
+        chatId: 'test@c.us',
+        templateId: 'tpl-1',
+        vars: { customer: 'Bob' },
+      });
+
+      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith(
+        'test@c.us',
+        'OpenWA Store\n\nHello Bob\n\nReply STOP to opt out',
+      );
+    });
+
+    it('should leave unmatched placeholders literal', async () => {
+      (templateService.resolve as jest.Mock).mockResolvedValue(mockTemplate({ body: 'Hi {{customer}} {{unknown}}' }));
+
+      await service.sendTemplate('sess-1', {
+        chatId: 'test@c.us',
+        templateId: 'tpl-1',
+        vars: { customer: 'Alice' },
+      });
+
+      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('test@c.us', 'Hi Alice {{unknown}}');
+    });
+
+    it('should propagate NotFoundException when the template cannot be resolved', async () => {
+      (templateService.resolve as jest.Mock).mockRejectedValue(new NotFoundException('Template not found'));
+
+      await expect(service.sendTemplate('sess-1', { chatId: 'test@c.us', templateName: 'missing' })).rejects.toThrow(
+        NotFoundException,
+      );
+      expect(mockEngine.sendTextMessage).not.toHaveBeenCalled();
     });
   });
 
@@ -168,6 +297,160 @@ describe('MessageService', () => {
         '628123456789@c.us',
         expect.objectContaining({ data: 'iVBORw0KGgoAAAAN...', mimetype: 'image/png' }),
       );
+    });
+
+    it('maps a blocked-media-URL SSRF error to HTTP 400', async () => {
+      mockEngine.sendImageMessage.mockRejectedValueOnce(new SsrfBlockedError('Blocked internal address: 127.0.0.1'));
+
+      await expect(
+        service.sendImage('sess-1', { chatId: '628123456789@c.us', url: 'http://127.0.0.1/x.png' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('rejects a base64 image over the media cap before sending or persisting', async () => {
+      process.env.MEDIA_DOWNLOAD_MAX_BYTES = '1024';
+      try {
+        await expect(
+          service.sendImage('sess-1', {
+            chatId: '628123456789@c.us',
+            base64: Buffer.alloc(1025).toString('base64'),
+            mimetype: 'image/png',
+          }),
+        ).rejects.toBeInstanceOf(PayloadTooLargeException);
+        expect(mockEngine.sendImageMessage).not.toHaveBeenCalled();
+      } finally {
+        delete process.env.MEDIA_DOWNLOAD_MAX_BYTES;
+      }
+    });
+  });
+
+  // ── getMessages pagination guard ──────────────────────────────────
+
+  describe('getMessages pagination guard', () => {
+    interface QbMock {
+      where: jest.Mock;
+      orderBy: jest.Mock;
+      skip: jest.Mock;
+      take: jest.Mock;
+      andWhere: jest.Mock;
+      getManyAndCount: jest.Mock;
+    }
+    const makeQb = (): QbMock => {
+      const qb: QbMock = {
+        where: jest.fn(),
+        orderBy: jest.fn(),
+        skip: jest.fn(),
+        take: jest.fn(),
+        andWhere: jest.fn(),
+        getManyAndCount: jest.fn().mockResolvedValue([[], 0]),
+      };
+      qb.where.mockReturnValue(qb);
+      qb.orderBy.mockReturnValue(qb);
+      qb.skip.mockReturnValue(qb);
+      qb.take.mockReturnValue(qb);
+      qb.andWhere.mockReturnValue(qb);
+      return qb;
+    };
+
+    it('falls back to defaults on NaN limit/offset (never take(NaN))', async () => {
+      const qb = makeQb();
+      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+      await service.getMessages('sess-1', { limit: NaN, offset: NaN });
+      expect(qb.take).toHaveBeenCalledWith(50);
+      expect(qb.skip).toHaveBeenCalledWith(0);
+    });
+
+    it('clamps an oversized limit to 100 and a negative offset to 0', async () => {
+      const qb = makeQb();
+      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+      await service.getMessages('sess-1', { limit: 999, offset: -5 });
+      expect(qb.take).toHaveBeenCalledWith(100);
+      expect(qb.skip).toHaveBeenCalledWith(0);
+    });
+  });
+
+  // ── getMessages from-filter (lid resolution becomes a hit) ─────────
+  describe('getMessages from-filter resolves a lid to a phone', () => {
+    // A group message whose stored author is an unresolved lid, plus a plain DM from the same person.
+    const lidRow = { id: 'm-lid', from: '111@lid', chatId: 'grp@g.us' } as Message;
+    const dmRow = { id: 'm-dm', from: '628999@c.us', chatId: '628999@c.us' } as Message;
+    const rows = [lidRow, dmRow];
+
+    // A query-builder fake that actually filters by the `from IN (:...froms)` clause it receives, so the
+    // test exercises the resolution-driven expansion end to end (filter -> rows returned).
+    const makeFilteringQb = () => {
+      let froms: string[] | null = null;
+      const qb = {
+        where: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        skip: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockImplementation((_clause: string, params?: { froms?: string[] }) => {
+          if (params?.froms) froms = params.froms;
+          return qb;
+        }),
+        getManyAndCount: jest.fn().mockImplementation(() => {
+          const matched = froms ? rows.filter(r => froms!.includes(r.from)) : rows;
+          return Promise.resolve([matched, matched.length]);
+        }),
+      };
+      return qb;
+    };
+
+    it('returns the lid-authored message once the table maps the lid to that phone (the hit)', async () => {
+      lidMappingStore.lidsForPhone.mockReturnValue(['111']); // table: lid 111 -> phone 628999
+      const qb = makeFilteringQb();
+      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      const { messages } = await service.getMessages('sess-1', { from: '628999' });
+
+      expect(lidMappingStore.lidsForPhone).toHaveBeenCalledWith('628999');
+      expect(messages.map(m => m.id).sort()).toEqual(['m-dm', 'm-lid']);
+    });
+
+    it('misses the lid-authored message when the table has no mapping (the prior silent miss)', async () => {
+      lidMappingStore.lidsForPhone.mockReturnValue([]); // unresolved: no lid -> phone row yet
+      const qb = makeFilteringQb();
+      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      const { messages } = await service.getMessages('sess-1', { from: '628999' });
+
+      expect(messages.map(m => m.id)).toEqual(['m-dm']); // only the @c.us DM matches
+    });
+  });
+
+  // ── getMessages chatId filter is dialect-agnostic ─────────────────
+  describe('getMessages chatId filter matches across dialects', () => {
+    // A message stored with the raw @s.whatsapp.net chatId (e.g. an outbound send addressed by a raw id).
+    const stored = { id: 'm1', from: '628113@c.us', chatId: '6281316434311@s.whatsapp.net' } as Message;
+
+    const makeChatQb = () => {
+      let chatIds: string[] | null = null;
+      const qb = {
+        where: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        skip: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockImplementation((_clause: string, params?: { chatIds?: string[] }) => {
+          if (params?.chatIds) chatIds = params.chatIds;
+          return qb;
+        }),
+        getManyAndCount: jest.fn().mockImplementation(() => {
+          const matched = chatIds && chatIds.includes(stored.chatId) ? [stored] : [];
+          return Promise.resolve([matched, matched.length]);
+        }),
+      };
+      return qb;
+    };
+
+    it('returns a @s.whatsapp.net-stored message when filtering by the neutral @c.us chat id', async () => {
+      lidMappingStore.lidsForPhone.mockReturnValue([]);
+      const qb = makeChatQb();
+      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      const { messages } = await service.getMessages('sess-1', { chatId: '6281316434311@c.us' });
+
+      expect(messages.map(m => m.id)).toEqual(['m1']);
     });
   });
 
@@ -346,6 +629,63 @@ describe('MessageService', () => {
       });
 
       expect(mockEngine.reactToMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', '👍');
+    });
+  });
+
+  describe('getChatHistory', () => {
+    it('should call engine.getChatHistory with default limit and includeMedia=false', async () => {
+      await service.getChatHistory('sess-1', 'test@c.us');
+      expect(mockEngine.getChatHistory).toHaveBeenCalledWith('test@c.us', 50, false);
+    });
+
+    it('should pass through custom limit', async () => {
+      await service.getChatHistory('sess-1', 'test@c.us', 10);
+      expect(mockEngine.getChatHistory).toHaveBeenCalledWith('test@c.us', 10, false);
+    });
+
+    it('should pass through includeMedia flag', async () => {
+      await service.getChatHistory('sess-1', 'test@c.us', 5, true);
+      expect(mockEngine.getChatHistory).toHaveBeenCalledWith('test@c.us', 5, true);
+    });
+
+    it('should clamp the limit to [1, 100] and default non-finite values to 50', async () => {
+      await service.getChatHistory('sess-1', 'test@c.us', 500);
+      expect(mockEngine.getChatHistory).toHaveBeenLastCalledWith('test@c.us', 100, false);
+
+      await service.getChatHistory('sess-1', 'test@c.us', 0);
+      expect(mockEngine.getChatHistory).toHaveBeenLastCalledWith('test@c.us', 1, false);
+
+      await service.getChatHistory('sess-1', 'test@c.us', Number.NaN);
+      expect(mockEngine.getChatHistory).toHaveBeenLastCalledWith('test@c.us', 50, false);
+    });
+
+    it('should return engine result', async () => {
+      const fake = [{ id: 'm1', body: 'hi', from: 'a', to: 'b', chatId: 'test@c.us' }];
+      mockEngine.getChatHistory.mockResolvedValueOnce(fake);
+      const result = await service.getChatHistory('sess-1', 'test@c.us');
+      expect(result).toBe(fake);
+    });
+
+    describe('deep mode (#347)', () => {
+      it('allows a limit above the standard 100 cap when deep=true', async () => {
+        await service.getChatHistory('sess-1', 'test@c.us', 500, false, true);
+        expect(mockEngine.getChatHistory).toHaveBeenLastCalledWith('test@c.us', 500, false);
+      });
+
+      it('clamps a deep limit to the 2000 ceiling', async () => {
+        await service.getChatHistory('sess-1', 'test@c.us', 5000, false, true);
+        expect(mockEngine.getChatHistory).toHaveBeenLastCalledWith('test@c.us', 2000, false);
+      });
+
+      it('forces includeMedia off in deep mode (metadata-only)', async () => {
+        await service.getChatHistory('sess-1', 'test@c.us', 300, true, true);
+        expect(mockEngine.getChatHistory).toHaveBeenLastCalledWith('test@c.us', 300, false);
+      });
+
+      it('still clamps to 100 when deep is not set (regression guard)', async () => {
+        await service.getChatHistory('sess-1', 'test@c.us', 500, false, false);
+        expect(mockEngine.getChatHistory).toHaveBeenLastCalledWith('test@c.us', 100, false);
+      });
     });
   });
 

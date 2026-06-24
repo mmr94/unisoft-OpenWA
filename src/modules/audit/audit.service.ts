@@ -1,8 +1,9 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, Between, LessThan } from 'typeorm';
 import { AuditLog, AuditAction, AuditSeverity } from './entities/audit-log.entity';
 import { ApiKey } from '../auth/entities/api-key.entity';
+import { createLogger } from '../../common/services/logger.service';
 
 interface AuditContext {
   apiKey?: ApiKey;
@@ -29,17 +30,50 @@ export interface AuditQueryOptions {
 }
 
 @Injectable()
-export class AuditService {
+export class AuditService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = createLogger('AuditService');
+  private cleanupTimer?: ReturnType<typeof setInterval>;
+
   constructor(
     @InjectRepository(AuditLog, 'main')
     private readonly auditRepository: Repository<AuditLog>,
   ) {}
 
+  /**
+   * Periodically prune audit logs older than AUDIT_RETENTION_DAYS (default 90; set <= 0 to disable).
+   * Runs once at startup, then daily. Without this the audit_logs table grows without bound — the
+   * existing cleanup() method was never scheduled or called anywhere.
+   */
+  onModuleInit(): void {
+    const parsed = Number.parseInt(process.env.AUDIT_RETENTION_DAYS ?? '', 10);
+    const retentionDays = Number.isInteger(parsed) ? Math.max(0, parsed) : 90;
+    if (retentionDays <= 0) {
+      this.logger.log('Audit-log retention disabled (AUDIT_RETENTION_DAYS <= 0)');
+      return;
+    }
+    const runCleanup = (): void => {
+      this.cleanup(retentionDays)
+        .then(n => {
+          if (n > 0) this.logger.log(`Pruned ${n} audit log(s) older than ${retentionDays} day(s)`);
+        })
+        .catch(err => this.logger.error('Audit-log cleanup failed', err instanceof Error ? err.stack : String(err)));
+    };
+    runCleanup(); // prune once at startup
+    this.cleanupTimer = setInterval(runCleanup, 24 * 60 * 60 * 1000);
+    this.cleanupTimer.unref?.();
+  }
+
+  onModuleDestroy(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+    }
+  }
+
   async log(
     action: AuditAction,
     context: AuditContext = {},
     severity: AuditSeverity = AuditSeverity.INFO,
-  ): Promise<AuditLog> {
+  ): Promise<AuditLog | null> {
     const auditLog = this.auditRepository.create({
       action,
       severity,
@@ -56,18 +90,29 @@ export class AuditService {
       errorMessage: context.errorMessage || null,
     });
 
-    return this.auditRepository.save(auditLog);
+    // Audit logging is best-effort: a failed insert must never turn a succeeded operation into a 500
+    // (callers await this after the primary side-effect). Log and swallow.
+    try {
+      return await this.auditRepository.save(auditLog);
+    } catch (error) {
+      this.logger.error(
+        `Failed to write audit log for ${String(action)}`,
+        error instanceof Error ? error.stack : String(error),
+        { action: String(action) },
+      );
+      return null;
+    }
   }
 
-  async logInfo(action: AuditAction, context: AuditContext = {}): Promise<AuditLog> {
+  async logInfo(action: AuditAction, context: AuditContext = {}): Promise<AuditLog | null> {
     return this.log(action, context, AuditSeverity.INFO);
   }
 
-  async logWarn(action: AuditAction, context: AuditContext = {}): Promise<AuditLog> {
+  async logWarn(action: AuditAction, context: AuditContext = {}): Promise<AuditLog | null> {
     return this.log(action, context, AuditSeverity.WARN);
   }
 
-  async logError(action: AuditAction, context: AuditContext = {}): Promise<AuditLog> {
+  async logError(action: AuditAction, context: AuditContext = {}): Promise<AuditLog | null> {
     return this.log(action, context, AuditSeverity.ERROR);
   }
 

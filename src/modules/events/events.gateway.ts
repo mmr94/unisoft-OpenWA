@@ -11,6 +11,17 @@ import {
 import { Server, Socket } from 'socket.io';
 import { Logger } from '@nestjs/common';
 import { AuthService } from '../auth/auth.service';
+import { resolveCorsPolicy } from '../../config/bootstrap-security';
+
+/**
+ * WebSocket CORS origin: reuse the HTTP CORS policy instead of a hardcoded '*'.
+ * Dev → allow any origin; production → the configured CORS_ORIGINS allowlist (or none).
+ * Read from process.env at module load (real env vars apply; same-origin is unaffected).
+ */
+function resolveWsCorsOrigin(): boolean | string[] {
+  const policy = resolveCorsPolicy(process.env.CORS_ORIGINS, process.env.NODE_ENV);
+  return policy.allowAnyOrigin ? true : policy.origins;
+}
 import type {
   WSClientMessage,
   WSSubscribeRequest,
@@ -22,10 +33,28 @@ import type {
   WSPongResponse,
 } from './dto/ws-messages.dto';
 import { SUBSCRIBABLE_EVENTS, buildRoomName } from './dto/ws-messages.dto';
+import type { DeliveryStatus } from '../../engine/interfaces/whatsapp-engine.interface';
+
+/**
+ * Whether an API key may subscribe to a session's WebSocket event rooms.
+ * An unrestricted key (no `allowedSessions`) may subscribe to anything, including
+ * the `*` wildcard. A key scoped to specific sessions may NOT subscribe to `*`
+ * (which would receive every session's events) nor to a session outside its
+ * allowlist — preventing cross-tenant event leakage (#221).
+ */
+export function isSessionSubscriptionAllowed(allowedSessions: string[] | null | undefined, sessionId: string): boolean {
+  if (!allowedSessions || allowedSessions.length === 0) {
+    return true;
+  }
+  if (sessionId === '*') {
+    return false;
+  }
+  return allowedSessions.includes(sessionId);
+}
 
 @WebSocketGateway({
   cors: {
-    origin: '*', // In production, restrict this
+    origin: resolveWsCorsOrigin(),
   },
   namespace: '/events',
 })
@@ -42,8 +71,13 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   }
 
   async handleConnection(client: Socket) {
-    // Extract API key from header or query param
-    const apiKey = (client.handshake.headers['x-api-key'] as string) || (client.handshake.query.apiKey as string);
+    // Prefer Socket.IO's `auth` field (not logged in URLs), then the header; the query
+    // param is a deprecated transition fallback (the key leaks into access logs).
+    const handshakeAuth = client.handshake.auth as { apiKey?: string } | undefined;
+    const apiKey =
+      handshakeAuth?.apiKey ||
+      (client.handshake.headers['x-api-key'] as string) ||
+      (client.handshake.query.apiKey as string);
 
     if (!apiKey) {
       this.logger.warn(`Client ${client.id} rejected: No API key provided`);
@@ -53,16 +87,14 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     }
 
     try {
+      // validateApiKey THROWS on any failure (it never resolves to a falsy value), so the rejection
+      // path is the catch below — a separate `if (!validKey)` branch here was dead code.
       const validKey = await this.authService.validateApiKey(apiKey);
-      if (!validKey) {
-        this.logger.warn(`Client ${client.id} rejected: Invalid API key`);
-        client.emit('message', this.createError('UNAUTHORIZED', 'Invalid API key'));
-        client.disconnect();
-        return;
-      }
 
-      // Store API key info on socket for later use
-      (client.data as { apiKey: unknown }).apiKey = validKey;
+      // Store the validated key AND the raw key — the raw key lets handleSubscribe
+      // RE-validate on each subscription so a key revoked mid-connection is caught.
+      (client.data as { apiKey: unknown; rawApiKey: string }).apiKey = validKey;
+      (client.data as { rawApiKey: string }).rawApiKey = apiKey;
       this.logger.log(`Client connected: ${client.id} (key: ${validKey.name})`);
     } catch (error) {
       this.logger.warn(`Client ${client.id} rejected: Auth error`, {
@@ -95,12 +127,36 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     }
   }
 
-  private handleSubscribe(client: Socket, message: WSSubscribeRequest): WSSubscribedResponse | WSErrorResponse {
+  private async handleSubscribe(
+    client: Socket,
+    message: WSSubscribeRequest,
+  ): Promise<WSSubscribedResponse | WSErrorResponse> {
     const { sessionId, events, requestId } = message;
 
     // Validate sessionId
     if (!sessionId || typeof sessionId !== 'string') {
       return this.createError('INVALID_SESSION', 'sessionId is required', requestId);
+    }
+
+    // Re-validate the API key on every subscribe: a long-lived socket whose key was
+    // revoked/expired after connect must not be able to keep opening new subscriptions.
+    const rawApiKey = (client.data as { rawApiKey?: string }).rawApiKey;
+    let subscriberKey: { allowedSessions?: string[] | null } | null;
+    try {
+      subscriberKey = rawApiKey ? await this.authService.validateApiKey(rawApiKey) : null;
+    } catch {
+      subscriberKey = null;
+    }
+    if (!subscriberKey) {
+      client.emit('message', this.createError('UNAUTHORIZED', 'API key is no longer valid', requestId));
+      client.disconnect();
+      return this.createError('UNAUTHORIZED', 'API key is no longer valid', requestId);
+    }
+
+    // Enforce per-key session scope against the FRESH key: a key restricted to specific
+    // sessions must not subscribe to '*' or a session outside its allowlist (#221).
+    if (!isSessionSubscriptionAllowed(subscriberKey.allowedSessions, sessionId)) {
+      return this.createError('FORBIDDEN_SESSION', 'API key is not authorized for this session', requestId);
     }
 
     // Validate events
@@ -230,11 +286,25 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   }
 
   /**
-   * Emit message acknowledgment (delivery/read receipt).
-   * ack: 1 sent (✓), 2 delivered (✓✓), 3 read (✓✓ blue), 4 played.
+   * Emit a live delivery-status update (neutral DeliveryStatus, e.g. delivered/read/failed).
+   * Maps from WhatsApp ack levels: 1 sent (✓), 2 delivered (✓✓), 3 read (✓✓ blue), 4 played.
    */
-  emitMessageAck(sessionId: string, data: { messageId: string; ack: number; ackName: string }) {
+  emitMessageAck(sessionId: string, data: { messageId: string; status: DeliveryStatus }) {
     this.emitToRooms(sessionId, 'message.ack', data);
+  }
+
+  /**
+   * Emit message revoked ("deleted for everyone") notification
+   */
+  emitMessageRevoked(sessionId: string, message: Record<string, unknown>) {
+    this.emitToRooms(sessionId, 'message.revoked', message);
+  }
+
+  /**
+   * Emit message reaction notification
+   */
+  emitMessageReaction(sessionId: string, data: Record<string, unknown>) {
+    this.emitToRooms(sessionId, 'message.reaction', data);
   }
 
   /**

@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Send, CheckCircle, XCircle, Loader2 } from 'lucide-react';
-import { messageApi } from '../services/api';
+import { messageApi, contactApi } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { useRole } from '../hooks/useRole';
 import { useSessionsQuery, useSessionGroupsQuery } from '../hooks/queries';
@@ -59,9 +59,23 @@ export function MessageTester() {
     setIsLoading(true);
     setResponse(null);
 
-    const chatId = recipientType === 'group' ? targetId : targetId.replace(/[^0-9]/g, '') + '@c.us';
-
     try {
+      // For a personal recipient, let the engine resolve the number to its canonical chat id rather
+      // than hand-building an engine-specific JID here (#265) — also surfaces unregistered numbers.
+      let chatId = targetId;
+      if (recipientType !== 'group') {
+        const resolved = await contactApi.checkNumber(session, targetId.replace(/[^0-9]/g, ''));
+        if (!resolved.exists || !resolved.whatsappId) {
+          setResponse({
+            success: false,
+            timestamp: new Date().toISOString(),
+            error: t('messageTester.notOnWhatsApp'),
+          });
+          return;
+        }
+        chatId = resolved.whatsappId;
+      }
+
       let result;
       if (messageType === 'text') {
         result = await messageApi.sendText(session, chatId, content);

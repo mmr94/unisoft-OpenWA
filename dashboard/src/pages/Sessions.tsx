@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
-import { Plus, QrCode, RefreshCw, Trash2, Eye, Loader2, Play, Square, X, Search, Filter } from 'lucide-react';
+import { Plus, QrCode, RefreshCw, Trash2, Eye, Loader2, Play, Square, X, Search, Filter, Skull } from 'lucide-react';
 import { sessionApi, type Session } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { useToast } from '../components/Toast';
@@ -25,8 +25,23 @@ export function Sessions() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [selectedSession, setSelectedSession] = useState<Session | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [killConfirmId, setKillConfirmId] = useState<string | null>(null);
 
-  useWebSocket({
+  const fetchSessions = useCallback(async (): Promise<Session[]> => {
+    try {
+      setLoading(true);
+      const data = await sessionApi.list();
+      setSessions(data);
+      return data;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('sessions.create.errorDefault'));
+      return [];
+    } finally {
+      setLoading(false);
+    }
+  }, [t]);
+
+  const { isConnected, subscribe } = useWebSocket({
     onSessionStatus: useCallback(
       (event: { sessionId: string; status: string }) => {
         setSessions(prev =>
@@ -36,23 +51,23 @@ export function Sessions() {
           toast.success(t('sessions.toasts.readyTitle'), t('sessions.toasts.readyDesc'));
         } else if (event.status === 'disconnected') {
           toast.warning(t('sessions.toasts.disconnectedTitle'), t('sessions.toasts.disconnectedDesc'));
+        } else if (event.status === 'failed') {
+          // Refresh so the card picks up the lastError reason from the API.
+          void fetchSessions();
+          toast.error(t('sessions.toasts.failedTitle'), t('sessions.toasts.failedDesc'));
         }
       },
-      [toast, t],
+      [toast, t, fetchSessions],
     ),
   });
 
-  const fetchSessions = async () => {
-    try {
-      setLoading(true);
-      const data = await sessionApi.list();
-      setSessions(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : t('sessions.create.errorDefault'));
-    } finally {
-      setLoading(false);
+  // The gateway delivers events only to subscribed rooms; join the wildcard
+  // session.status room so status changes for every session are received live.
+  useEffect(() => {
+    if (isConnected) {
+      subscribe('*', ['session.status', 'session.qr']);
     }
-  };
+  }, [isConnected, subscribe]);
 
   useEffect(() => {
     fetchSessions();
@@ -63,6 +78,13 @@ export function Sessions() {
   const currentSessionName = useRef<string>('');
 
   const fetchQR = useCallback(async (sessionId: string) => {
+    // Guard: if session is already connected, stop polling immediately.
+    const currentSession = sessions.find(s => s.id === sessionId);
+    if (currentSession?.status === 'ready') {
+      setQrData(null);
+      currentSessionName.current = '';
+      return;
+    }
     try {
       const qr = await sessionApi.getQR(sessionId);
       setQrData({ sessionId, sessionName: currentSessionName.current, qrCode: qr.qrCode });
@@ -72,11 +94,18 @@ export function Sessions() {
         fetchSessions();
       }
     } catch {
-      setQrData(null);
-      currentSessionName.current = '';
-      fetchSessions();
+      // Keep qrData alive so the polling interval keeps retrying until the QR
+      // is ready. Only stop polling if the session itself has failed.
+      const updated = await sessionApi.get(sessionId).catch(() => null);
+      const stillInitializing = updated &&
+        ['initializing', 'connecting', 'qr_ready'].includes(updated.status);
+      if (!stillInitializing) {
+        setQrData(null);
+        currentSessionName.current = '';
+        fetchSessions();
+      }
     }
-  }, []);
+  }, [sessions]);
 
   useEffect(() => {
     if (qrData) {
@@ -140,22 +169,28 @@ export function Sessions() {
       handleShowQR(id);
     } catch (err) {
       console.error('Failed to start:', err);
-      await fetchSessions();
-      if (err instanceof Error && err.message.includes('already started')) {
-        handleShowQR(id);
-      }
+      const fresh = await fetchSessions();
+      const current = fresh.find(s => s.id === id);
+      if (current?.status !== 'ready') handleShowQR(id);
     }
   };
 
   const handleShowQR = async (id: string) => {
     const session = sessions.find(s => s.id === id);
+    // Nothing to show for an already-connected session.
+    if (session?.status === 'ready') return;
     const sessionName = session?.name || '';
+    // Show loading state immediately so the modal opens and polling starts
+    // even before Chromium has finished initializing.
+    setQrData({ sessionId: id, sessionName, qrCode: '' });
+    currentSessionName.current = sessionName;
     try {
       const qr = await sessionApi.getQR(id);
       setQrData({ sessionId: id, sessionName, qrCode: qr.qrCode });
     } catch (err) {
       console.error('Failed to get QR:', err);
-      setError(t('sessions.qr.unavailable'));
+      // Do not clear qrData here — keep the loading modal open so the
+      // polling interval (every 5 s) retries until the QR becomes available.
     }
   };
 
@@ -167,6 +202,20 @@ export function Sessions() {
     } catch (err) {
       console.error('Failed to stop:', err);
       fetchSessions();
+    }
+  };
+
+  const handleForceKill = async (id: string) => {
+    try {
+      await sessionApi.forceKill(id);
+      setSessions(sessions.map(s => (s.id === id ? { ...s, status: 'disconnected' } : s)));
+      toast.success(t('sessions.forceKill.successTitle'), t('sessions.forceKill.success'));
+    } catch (err) {
+      console.error('Failed to force-kill:', err);
+      toast.error(t('sessions.forceKill.failedTitle'), t('sessions.forceKill.failed'));
+      fetchSessions();
+    } finally {
+      setKillConfirmId(null);
     }
   };
 
@@ -428,6 +477,37 @@ export function Sessions() {
         </div>
       )}
 
+      {killConfirmId && (
+        <div className="modal-overlay" onClick={() => setKillConfirmId(null)}>
+          <div className="modal confirm-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>{t('sessions.forceKill.title')}</h2>
+              <button className="btn-icon" onClick={() => setKillConfirmId(null)}>
+                <X size={20} />
+              </button>
+            </div>
+            <div className="modal-body">
+              <p>
+                <Trans
+                  i18nKey="sessions.forceKill.message"
+                  values={{ name: sessions.find(s => s.id === killConfirmId)?.name }}
+                  components={{ strong: <strong /> }}
+                />
+              </p>
+              <p className="text-muted">{t('sessions.forceKill.warning')}</p>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setKillConfirmId(null)}>
+                {t('common.cancel')}
+              </button>
+              <button className="btn-danger" onClick={() => handleForceKill(killConfirmId)}>
+                {t('sessions.forceKill.confirm')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="sessions-grid">
         {filteredSessions.length === 0 ? (
           <div className="empty-state">
@@ -469,6 +549,14 @@ export function Sessions() {
                     <span className="info-label">{t('sessions.card.lastActive')}</span>
                     <span className="info-value">{formatLastActive(session.lastActive)}</span>
                   </div>
+                  {session.status === 'failed' && session.lastError ? (
+                    <div className="info-row session-error">
+                      <span className="info-label">{t('sessions.card.error')}</span>
+                      <span className="info-value error-text" title={session.lastError}>
+                        {session.lastError}
+                      </span>
+                    </div>
+                  ) : null}
                 </div>
               )}
 
@@ -498,6 +586,12 @@ export function Sessions() {
                   <button className="btn-action danger" onClick={() => setDeleteConfirmId(session.id)}>
                     <Trash2 size={16} />
                     {t('sessions.actions.delete')}
+                  </button>
+                )}
+                {canWrite && session.status === 'failed' && (
+                  <button className="btn-action danger" onClick={() => setKillConfirmId(session.id)}>
+                    <Skull size={16} />
+                    {t('sessions.actions.killStuck')}
                   </button>
                 )}
               </div>

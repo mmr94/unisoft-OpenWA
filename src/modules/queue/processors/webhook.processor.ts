@@ -1,12 +1,14 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
 import { InjectRepository } from '@nestjs/typeorm';
+import { ConfigService } from '@nestjs/config';
 import { Repository } from 'typeorm';
 import { createLogger } from '../../../common/services/logger.service';
 import { QUEUE_NAMES } from '../queue-names';
 import { WebhookJobData } from '../../webhook/webhook.service';
 import { Webhook } from '../../webhook/entities/webhook.entity';
 import { HookManager } from '../../../core/hooks';
+import { withSafeFetch, isSsrfProtectionEnabled } from '../../../common/security/ssrf-guard';
 
 export interface WebhookJobResult {
   statusCode: number;
@@ -23,6 +25,7 @@ export class WebhookProcessor extends WorkerHost {
     @InjectRepository(Webhook, 'data')
     private readonly webhookRepository: Repository<Webhook>,
     private readonly hookManager: HookManager,
+    private readonly configService: ConfigService,
   ) {
     super();
   }
@@ -48,18 +51,23 @@ export class WebhookProcessor extends WorkerHost {
     };
 
     try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: requestHeaders,
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(10000),
-      });
+      const { status, statusText, ok } = await withSafeFetch(
+        url,
+        {
+          method: 'POST',
+          headers: requestHeaders,
+          body: JSON.stringify(payload),
+          // Honor WEBHOOK_TIMEOUT on the primary (queued) path too — not just the deprecated direct one.
+          signal: AbortSignal.timeout(this.configService.get<number>('webhook.timeout', 10000)),
+        },
+        response => ({ status: response.status, statusText: response.statusText, ok: response.ok }),
+        { guard: isSsrfProtectionEnabled() },
+      );
 
       const responseTime = Date.now() - startTime;
-      const success = response.ok;
 
-      if (!success) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      if (!ok) {
+        throw new Error(`HTTP ${status}: ${statusText}`);
       }
 
       // Update lastTriggeredAt on successful delivery
@@ -75,7 +83,7 @@ export class WebhookProcessor extends WorkerHost {
           event,
           webhookId,
           deliveryId: payload.deliveryId,
-          statusCode: response.status,
+          statusCode: status,
           responseTime,
           attempt: job.attemptsMade + 1,
         },
@@ -87,14 +95,14 @@ export class WebhookProcessor extends WorkerHost {
         event,
         deliveryId: payload.deliveryId,
         idempotencyKey: payload.idempotencyKey,
-        statusCode: response.status,
+        statusCode: status,
         responseTime,
         attempt: job.attemptsMade + 1,
         action: 'webhook_delivered',
       });
 
       return {
-        statusCode: response.status,
+        statusCode: status,
         success: true,
         responseTime,
       };

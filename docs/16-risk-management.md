@@ -52,13 +52,13 @@ flowchart TB
     
     M1 --> A1[Watch releases & issues]
     M2 --> A2[Engine interface pattern]
-    M3 --> A3[Baileys as backup]
+    M3 --> A3[Baileys engine available - ENGINE_TYPE env]
     M4 --> A4[< 24h patch capability]
 ```
 
 **Action Items:**
 1. Subscribe to `whatsapp-web.js` releases
-2. Design the engine abstraction layer
+2. Engine abstraction layer — implemented (pluggable `ENGINE_TYPE`: `whatsapp-web.js` default, `baileys` alternative)
 3. Document fallback procedures
 4. Maintain relationships with library maintainers
 
@@ -431,7 +431,7 @@ flowchart TB
     M2 --> C1[Notify users]
     C1 --> C2[Switch to maintenance mode]
     C2 --> C3[Evaluate alternatives]
-    C3 --> |Baileys viable| C4[Implement Baileys engine]
+    C3 --> |Baileys viable| C4[Switch to Baileys engine - set ENGINE_TYPE=baileys]
     C3 --> |No alternatives| C5[Project pause/EOL]
 ```
 

@@ -1,9 +1,23 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
-import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import { ConfigService } from '@nestjs/config';
+import { SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
-import { AppModule } from './app.module';
+import { AppModule, DASHBOARD_DIST, dashboardServingEnabled, dashboardBuildPresent } from './app.module';
 import { ShutdownService } from './common/services/shutdown.service';
+import { LoggerService, LogLevel, createLogger } from './common/services/logger.service';
+import { createSwaggerConfig } from './config/swagger.config';
+import {
+  resolveCorsPolicy,
+  isSwaggerEnabled,
+  resolveBodyLimit,
+  assertNoDefaultSecretsInProduction,
+} from './config/bootstrap-security';
+import { BullBoardAuthMiddleware } from './common/security/bull-board-auth.middleware';
+import { AuthService } from './modules/auth/auth.service';
+import { Request, Response, NextFunction, json, urlencoded } from 'express';
+import { writeSecretFile } from './common/utils/secret-file';
+import { clearBlankEnv } from './config/env-precedence';
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -24,6 +38,24 @@ const dataDir = path.dirname(generatedEnvPath);
 if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
 }
+
+// Tighten any pre-existing secret files written before per-file 0600 perms (best-effort) — the
+// generated .env holds S3/DB/Redis secrets and .api-key holds the raw admin key.
+for (const secret of [generatedEnvPath, path.resolve(dataDir, '.api-key')]) {
+  if (fs.existsSync(secret)) {
+    try {
+      fs.chmodSync(secret, 0o600);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
+// A compose `- ENGINE_TYPE=${ENGINE_TYPE:-}` line forwards a real operator engine choice into the
+// container, but renders an empty value when none is set. An empty process.env.ENGINE_TYPE would
+// still block .env / .env.generated (loaded below with override:false) from supplying one, silently
+// pinning the default and ignoring the dashboard's selection — so treat a blank value as unset.
+clearBlankEnv(process.env, ['ENGINE_TYPE']);
 
 // 2. User-managed .env (does not override real process env)
 if (fs.existsSync(userEnvPath)) {
@@ -59,13 +91,48 @@ STORAGE_PATH=./data/media
 
 # Docker Profiles: none (minimal setup)
 `;
-  fs.writeFileSync(generatedEnvPath, minimalConfig);
+  writeSecretFile(generatedEnvPath, minimalConfig);
   console.log('[Bootstrap] Created default configuration at:', generatedEnvPath);
   dotenv.config({ path: generatedEnvPath, override: false });
 }
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // Apply the operator-configured log verbosity (LOG_LEVEL) before anything logs. Unset/invalid → INFO.
+  const requestedLevel = process.env.LOG_LEVEL?.trim().toLowerCase();
+  if (requestedLevel && (Object.values(LogLevel) as string[]).includes(requestedLevel)) {
+    LoggerService.setLogLevel(requestedLevel as LogLevel);
+  }
+
+  // Backstop for promise rejections that escaped a local handler (e.g. a fire-and-forget engine-event
+  // dispatch). Node terminates the process on an unhandled rejection by default; for a long-running
+  // self-hosted gateway we'd rather log it and stay up than let one stray rejection kill all sessions.
+  const bootstrapLogger = createLogger('Bootstrap');
+  process.on('unhandledRejection', (reason: unknown) => {
+    bootstrapLogger.error('Unhandled promise rejection', reason instanceof Error ? reason.stack : String(reason));
+  });
+
+  // Fail fast: never start production with default/placeholder secrets.
+  assertNoDefaultSecretsInProduction({
+    nodeEnv: process.env.NODE_ENV,
+    databaseType: process.env.DATABASE_TYPE,
+    databasePassword: process.env.DATABASE_PASSWORD,
+    storageType: process.env.STORAGE_TYPE,
+    // Mirror storage.service's canonical-with-legacy fallback so the guard inspects the var the app
+    // actually uses (it reads S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY first).
+    s3AccessKey: process.env.S3_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY,
+    s3SecretKey: process.env.S3_SECRET_ACCESS_KEY || process.env.S3_SECRET_KEY,
+    apiMasterKey: process.env.API_MASTER_KEY,
+    allowDevApiKey: process.env.ALLOW_DEV_API_KEY,
+  });
+
+  // Disable Nest's default body parser so we can set an explicit size cap below.
+  const app = await NestFactory.create(AppModule, { bodyParser: false });
+
+  // Cap request body size (DoS hardening). Media sends carry base64 in the JSON body,
+  // so the default is generous; tune with BODY_SIZE_LIMIT.
+  const bodyLimit = resolveBodyLimit(process.env.BODY_SIZE_LIMIT);
+  app.use(json({ limit: bodyLimit }));
+  app.use(urlencoded({ extended: true, limit: bodyLimit }));
 
   // Enable shutdown hooks for graceful shutdown
   app.enableShutdownHooks();
@@ -76,17 +143,31 @@ async function bootstrap() {
     await app.close();
   });
 
-  // Enhanced Security Headers (Phase 3 Security Audit)
+  // On a termination signal, flip readiness to 503 immediately so the load
+  // balancer/orchestrator stops routing new traffic. This only sets a flag — NestJS's
+  // own shutdown hooks (enabled above) still perform the actual app.close()/teardown.
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    process.on(signal, () => shutdownService.markShuttingDown());
+  }
+
+  // Enhanced Security Headers
   app.use(
     helmet({
       contentSecurityPolicy: {
         directives: {
           defaultSrc: ["'self'"],
-          styleSrc: ["'self'", "'unsafe-inline'"],
+          // The bundled dashboard pulls webfonts from Google Fonts (CSS from fonts.googleapis.com,
+          // font files from fonts.gstatic.com). Now that NestJS serves the dashboard under this CSP,
+          // allow those origins or the @import'd fonts are blocked and the UI falls back to system fonts.
+          styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
           scriptSrc: ["'self'"],
           imgSrc: ["'self'", 'data:', 'https:'],
+          // Chat media (voice notes, video) is served to the dashboard as data: URIs. Without an
+          // explicit media-src, <audio>/<video> fall back to default-src 'self' and are blocked.
+          // Mirror imgSrc so audio/video render the same way images already do.
+          mediaSrc: ["'self'", 'data:', 'blob:', 'https:'],
           connectSrc: ["'self'"],
-          fontSrc: ["'self'"],
+          fontSrc: ["'self'", 'https://fonts.gstatic.com'],
           objectSrc: ["'none'"],
           upgradeInsecureRequests: process.env.NODE_ENV === 'production' ? [] : null,
         },
@@ -103,21 +184,31 @@ async function bootstrap() {
     }),
   );
 
-  // CORS Configuration (Phase 3 Security Audit)
-  const allowedOrigins = process.env.CORS_ORIGINS?.split(',').map(o => o.trim()) || ['*'];
+  // CORS Configuration (#221 hardening)
+  const corsPolicy = resolveCorsPolicy(process.env.CORS_ORIGINS, process.env.NODE_ENV);
+  if (process.env.NODE_ENV === 'production' && corsPolicy.origins.length === 0 && !corsPolicy.allowAnyOrigin) {
+    console.warn(
+      '[Bootstrap] No explicit CORS_ORIGINS in production (wildcard "*" is refused): cross-origin browser ' +
+        'requests will be blocked. Set CORS_ORIGINS to your dashboard origin(s).',
+    );
+  }
   app.enableCors({
     origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
       // Allow requests with no origin (mobile apps, Postman, server-to-server)
       if (!origin) return callback(null, true);
 
-      // Check if wildcard or origin matches
-      if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+      if (corsPolicy.allowAnyOrigin || corsPolicy.origins.includes(origin)) {
         callback(null, true);
       } else {
-        callback(new Error('Not allowed by CORS'));
+        // Deny WITHOUT throwing. Throwing here surfaced as a 500 Internal Server Error (#250).
+        // Returning false simply omits the CORS headers: the browser blocks a true cross-origin
+        // request itself (correct), while same-origin requests — e.g. the bundled dashboard served
+        // through the proxy, which the browser never subjects to CORS — keep working. A genuine
+        // cross-origin dashboard still needs its origin in CORS_ORIGINS.
+        callback(null, false);
       }
     },
-    credentials: true,
+    credentials: corsPolicy.credentials,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'X-API-Key', 'Authorization', 'X-Request-ID'],
     exposedHeaders: ['X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
@@ -140,30 +231,44 @@ async function bootstrap() {
     }),
   );
 
-  // Swagger documentation
-  const config = new DocumentBuilder()
-    .setTitle('OpenWA API')
-    .setDescription('Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API')
-    .setVersion('0.1.6')
-    .addApiKey({ type: 'apiKey', name: 'X-API-Key', in: 'header' }, 'X-API-Key')
-    .addTag('sessions', 'WhatsApp session management')
-    .addTag('messages', 'Send and manage messages')
-    .addTag('webhooks', 'Webhook configuration')
-    .addTag('contacts', 'Contact management')
-    .addTag('groups', 'Group management')
-    .addTag('labels', 'Label management (WhatsApp Business)')
-    .addTag('channels', 'Channel/Newsletter management')
-    .addTag('health', 'Health check endpoints')
-    .build();
+  // Swagger documentation. ENABLE_SWAGGER wins; otherwise default on outside production, off in
+  // production (the API schema is reconnaissance surface — production opts in with ENABLE_SWAGGER=true).
+  const swaggerEnabled = isSwaggerEnabled(process.env.ENABLE_SWAGGER, process.env.NODE_ENV);
+  if (swaggerEnabled) {
+    const config = createSwaggerConfig();
+    const document = SwaggerModule.createDocument(app, config);
+    SwaggerModule.setup('api/docs', app, document);
+  }
 
-  const document = SwaggerModule.createDocument(app, config);
-  SwaggerModule.setup('api/docs', app, document);
+  // Protect the Bull Board queue UI (/api/admin/queues). It is mounted by
+  // @bull-board/nestjs as raw Express middleware that the global ApiKeyGuard
+  // does not cover; registering this before app.listen() ensures it runs ahead
+  // of the Bull Board router. Requires a valid ADMIN API key.
+  const bullBoardAuth = new BullBoardAuthMiddleware(app.get(AuthService), app.get(ConfigService));
+  app.use('/api/admin/queues', (req: Request, res: Response, next: NextFunction) => {
+    void bullBoardAuth.use(req, res, next);
+  });
 
   const port = process.env.PORT || 2785;
   await app.listen(port);
 
   console.log(`🚀 OpenWA is running on: http://localhost:${port}`);
-  console.log(`📚 Swagger docs: http://localhost:${port}/api/docs`);
+  if (swaggerEnabled) {
+    console.log(`📚 Swagger docs: http://localhost:${port}/api/docs`);
+  }
+
+  // Make the dashboard-serving outcome explicit so a missing build (no UI on `/`)
+  // is obvious instead of a silent 404.
+  if (!dashboardServingEnabled) {
+    console.log('🖥️  Dashboard: serving disabled (SERVE_DASHBOARD=false); API only');
+  } else if (dashboardBuildPresent) {
+    console.log(`🖥️  Dashboard: serving bundled UI at http://localhost:${port}`);
+  } else {
+    console.warn(
+      `⚠️  Dashboard: no build at ${DASHBOARD_DIST} - UI disabled (API still serves /api). ` +
+        'Run `npm run build:all` to bundle it, or use the Vite dev server (`npm run dev`).',
+    );
+  }
 }
 
 void bootstrap();

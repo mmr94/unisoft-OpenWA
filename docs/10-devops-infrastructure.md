@@ -1,5 +1,12 @@
 # 10 - DevOps & Infrastructure
 
+> **⚠️ Conceptual reference (M9).** Some examples here predate the shipped runtime and may not
+> match it exactly. The **authoritative** sources are the repo's `Dockerfile`, `docker-compose.yml`
+> (Docker socket-proxy threat model, gosu non-root drop, loopback-bound datastores, container
+> hardening), and `.env.example` (canonical env var names). Where this doc and those disagree,
+> the files win. In particular: the API master key env is `API_MASTER_KEY`, datastores have no
+> default credentials, and production migrations use `npm run migration:run:prod`.
+
 ## 10.1 Infrastructure Overview
 
 ```mermaid
@@ -34,7 +41,7 @@ flowchart TB
 # Dockerfile (multi-stage build)
 
 # Build stage
-FROM node:20-slim AS build
+FROM node:22-slim AS build
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
@@ -42,7 +49,7 @@ COPY . .
 RUN npm run build
 
 # Runtime stage
-FROM node:20-slim
+FROM node:22-slim
 
 # Install Chrome dependencies
 RUN apt-get update && apt-get install -y \
@@ -105,7 +112,9 @@ services:
       - NODE_ENV=development
       - DATABASE_URL=postgresql://openwa:openwa@postgres:5432/openwa
       - REDIS_URL=redis://redis:6379
-      - API_KEY_MASTER=dev-master-key
+      # The env var is API_MASTER_KEY (not API_KEY_MASTER); never hardcode a key — set a
+      # strong secret. Production refuses to boot with a placeholder/default (M9/M16).
+      - API_MASTER_KEY=
     volumes:
       - ./:/app
       - /app/node_modules
@@ -133,15 +142,8 @@ services:
     ports:
       - "6379:6379"
 
-  dashboard:
-    build:
-      context: ./dashboard
-    ports:
-      - "2886:2886"
-    environment:
-      - VITE_API_URL=http://localhost:2785
-    depends_on:
-      - app
+  # No separate dashboard service: the `app` image bundles the dashboard SPA and serves it
+  # from the same port (2785) via NestJS. Open http://localhost:2785 for the UI.
 
 volumes:
   postgres-data:
@@ -244,7 +246,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
       
       - name: Install dependencies
@@ -296,6 +298,7 @@ jobs:
         with:
           context: .
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

@@ -1,18 +1,42 @@
 import { Injectable, NotFoundException, UnauthorizedException, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { createHash, randomBytes } from 'crypto';
-import { existsSync, writeFileSync, readFileSync } from 'fs';
+import { randomBytes } from 'crypto';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { writeSecretFile } from '../../common/utils/secret-file';
+import { hashApiKey } from './api-key-hash';
 import { ApiKey, ApiKeyRole } from './entities/api-key.entity';
 import { CreateApiKeyDto, UpdateApiKeyDto } from './dto';
 import { createLogger } from '../../common/services/logger.service';
 
 const API_KEY_FILE = join(process.cwd(), 'data', '.api-key');
 
+/**
+ * Resolves the API key to seed on first boot (when no keys exist yet).
+ * Precedence: an explicit `API_MASTER_KEY` always wins; otherwise a
+ * cryptographically random `owa_k1_` key is generated — the secure default,
+ * including in non-production. The legacy fixed `dev-admin-key` is used only when
+ * a developer explicitly opts in with `ALLOW_DEV_API_KEY=true`, never by default.
+ */
+export function resolveSeedApiKey(): string {
+  if (process.env.API_MASTER_KEY) {
+    return process.env.API_MASTER_KEY;
+  }
+  if (process.env.ALLOW_DEV_API_KEY === 'true') {
+    return 'dev-admin-key';
+  }
+  return `owa_k1_${randomBytes(32).toString('hex')}`;
+}
+
 @Injectable()
 export class AuthService implements OnModuleInit {
   private readonly logger = createLogger('AuthService');
+
+  /** Coalesce per-request usage-stat writes to at most one DB write per key per window. */
+  private static readonly STAT_FLUSH_INTERVAL_MS = 60_000;
+  /** keyId -> usage increments observed but not yet persisted (flushed on the next windowed write). */
+  private readonly pendingUsage = new Map<string, number>();
 
   constructor(
     @InjectRepository(ApiKey, 'main')
@@ -26,16 +50,14 @@ export class AuthService implements OnModuleInit {
     let isNewKey = false;
 
     if (count === 0) {
-      // Use predictable key in development, random key in production
-      displayKey =
-        process.env.NODE_ENV === 'production' ? `owa_k1_${randomBytes(32).toString('hex')}` : 'dev-admin-key';
+      displayKey = resolveSeedApiKey();
 
       await this.seedApiKey(displayKey, 'Default Admin Key', ApiKeyRole.ADMIN);
       isNewKey = true;
 
-      // Save raw key to file for startup script to read
+      // Save raw key to file for startup script to read (owner-only — it's the raw admin key).
       try {
-        writeFileSync(API_KEY_FILE, displayKey, 'utf-8');
+        writeSecretFile(API_KEY_FILE, displayKey);
       } catch (err) {
         this.logger.warn('Could not save API key file', { error: String(err) });
       }
@@ -55,7 +77,8 @@ export class AuthService implements OnModuleInit {
 
     // Always show the welcome banner on startup
     const apiBaseUrl = process.env.BASE_URL || `http://localhost:${process.env.PORT || 2785}`;
-    const dashboardUrl = process.env.DASHBOARD_URL || `http://localhost:${process.env.DASHBOARD_PORT || 2886}`;
+    // The dashboard is served by NestJS at the same origin as the API now, so default to it.
+    const dashboardUrl = process.env.DASHBOARD_URL || apiBaseUrl;
 
     this.logger.log('');
     this.logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
@@ -144,6 +167,8 @@ export class AuthService implements OnModuleInit {
 
   async delete(id: string): Promise<void> {
     const apiKey = await this.findOne(id);
+    // Drop any un-flushed usage accumulator so a deleted key leaves nothing behind in the Map.
+    this.pendingUsage.delete(id);
     await this.apiKeyRepository.remove(apiKey);
     this.logger.log(`API key deleted: ${apiKey.name}`, {
       keyId: id,
@@ -153,6 +178,9 @@ export class AuthService implements OnModuleInit {
 
   async revoke(id: string): Promise<ApiKey> {
     const apiKey = await this.findOne(id);
+    // A revoked key fails validation before its next flush, so its accumulator would orphan —
+    // drop it here.
+    this.pendingUsage.delete(id);
     apiKey.isActive = false;
     return this.apiKeyRepository.save(apiKey);
   }
@@ -173,8 +201,12 @@ export class AuthService implements OnModuleInit {
       throw new UnauthorizedException('API key has expired');
     }
 
-    // Check IP whitelist
-    if (apiKey.allowedIps && apiKey.allowedIps.length > 0 && clientIp) {
+    // Check IP whitelist (fail closed: if a whitelist is configured but the client
+    // IP could not be determined, reject rather than silently skipping the check)
+    if (apiKey.allowedIps && apiKey.allowedIps.length > 0) {
+      if (!clientIp) {
+        throw new UnauthorizedException('Client IP could not be determined');
+      }
       if (!this.isIpAllowed(clientIp, apiKey.allowedIps)) {
         this.logger.warn(`IP not allowed: ${clientIp}`, {
           keyId: apiKey.id,
@@ -191,20 +223,33 @@ export class AuthService implements OnModuleInit {
       }
     }
 
-    // Update usage stats
+    // Update usage stats — coalesced. Validation above is unchanged/synchronous; only
+    // the stat WRITE is throttled to at most once per key per window. usageCount stays
+    // accurate via an in-memory accumulator; the returned object reflects the true count.
+    const pending = (this.pendingUsage.get(apiKey.id) ?? 0) + 1;
+    const previousLastUsedAt = apiKey.lastUsedAt;
     apiKey.lastUsedAt = new Date();
-    apiKey.usageCount += 1;
-    await this.apiKeyRepository.save(apiKey);
+    apiKey.usageCount += pending; // DB value + all not-yet-persisted increments (incl. this request)
+
+    const due =
+      !previousLastUsedAt ||
+      apiKey.lastUsedAt.getTime() - previousLastUsedAt.getTime() >= AuthService.STAT_FLUSH_INTERVAL_MS;
+    if (due) {
+      this.pendingUsage.delete(apiKey.id);
+      await this.apiKeyRepository.save(apiKey);
+    } else {
+      this.pendingUsage.set(apiKey.id, pending);
+    }
 
     return apiKey;
   }
 
   private hashKey(rawKey: string): string {
-    return createHash('sha256').update(rawKey).digest('hex');
+    return hashApiKey(rawKey, process.env.API_KEY_PEPPER);
   }
 
   private isIpAllowed(clientIp: string, allowedIps: string[]): boolean {
-    // Phase 3 Security Audit: Support both exact match and CIDR notation
+    // Support both exact match and CIDR notation
     for (const entry of allowedIps) {
       if (entry.includes('/')) {
         // CIDR notation (e.g., "10.0.0.0/24")

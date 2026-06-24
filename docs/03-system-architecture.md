@@ -26,10 +26,9 @@ flowchart TB
             QM[Queue<br/>Manager]
         end
         
-        subgraph Engine["WhatsApp Engine"]
-            WW[whatsapp-web.js]
-            PP[Puppeteer]
-            CH[Chrome/Chromium]
+        subgraph Engine["WhatsApp Engine (pluggable)"]
+            WW[whatsapp-web.js<br/>Puppeteer/Chromium]
+            BY[Baileys<br/>WebSocket/No browser]
         end
         
         subgraph Storage["Storage Layer"]
@@ -76,7 +75,12 @@ sequenceDiagram
 
 ## 3.2 Pluggable Architecture Philosophy
 
-OpenWA is designed with a **Pluggable Architecture** that allows infrastructure components to be swapped without changing application code. This enables flexible deployments ranging from minimal single-session bots to enterprise-scale multi-tenant platforms.
+OpenWA is designed with a **Pluggable Architecture** that allows infrastructure components to be swapped without changing application code. This enables flexible deployments ranging from minimal single-session bots to larger single-node, multi-session installs.
+
+> **Note — single-instance:** the live WhatsApp engine layer is stateful and held in-process
+> (an in-memory `Map` in `SessionService`). OpenWA currently runs as **one API instance per
+> session-data volume**; horizontal scaling across multiple API replicas is a future design
+> (not implemented). See [13 - Horizontal Scaling](13-horizontal-scaling.md).
 
 ### Design Philosophy
 
@@ -152,6 +156,33 @@ flowchart LR
     IS -.-> Storage
     IC -.-> Cache
 ```
+
+### WhatsApp Identity Contract (engine-neutral ids)
+
+WhatsApp addresses the same entity through several id dialects, and each engine speaks a different one:
+whatsapp-web.js uses `<phone>@c.us`, while Baileys speaks the raw protocol forms `<phone>@s.whatsapp.net`
+and `<lid>@lid` (a privacy id whose number is **not** a phone number). To keep application code, the
+REST/webhook payloads, and plugins free of that, the **engine boundary is an anti-corruption layer**:
+every WhatsApp id an engine emits in a neutral field (`from` / `to` / `chatId` / `author`, contact and
+chat `id`) is reduced to one small **neutral dialect**:
+
+| Neutral form | Meaning |
+| --- | --- |
+| `<phone>@c.us` | a user, by phone (the raw `@s.whatsapp.net` form folds into this) |
+| `<id>@g.us` | a group |
+| `<lid>@lid` | a user known **only** by privacy id - phone genuinely unknown (a first-class state) |
+| `status@broadcast`, `<id>@newsletter`, `<id>@broadcast` | special channels |
+
+Never `@s.whatsapp.net`, never a `:device` suffix. **Resolution rule:** prefer `@c.us` (resolve a lid
+to its phone when the mapping is known), and fall back to `@lid` only when it can't be resolved - an
+unresolved lid is never faked into a phone number.
+
+The shared implementation lives in `src/engine/identity/wa-id.ts` (`parseWaId` / `toNeutralJid`); the
+contract is documented on the `IWhatsAppEngine` interface.
+
+> **Rollout status:** the contract is applied per-engine. It currently covers the **Baileys inbound
+> read path** (message / revoked / reaction payloads). Outbound id de-normalization (neutral -> engine
+> dialect on send) and contact/chat list ids are tracked follow-ups.
 
 ### Adapter Lifecycle State Machine
 
@@ -666,14 +697,14 @@ flowchart TB
     subgraph Container["Docker Container"]
         subgraph Node["Node.js Runtime"]
             NEST[NestJS Application]
-            WW[whatsapp-web.js]
+            WW[whatsapp-web.js<br/>or Baileys]
         end
         
-        subgraph Browser["Headless Browser"]
+        subgraph Browser["Headless Browser (wwebjs only)"]
             CHROME[Chromium]
         end
         
-        Node --> Browser
+        Node -.->|ENGINE_TYPE=whatsapp-web.js| Browser
     end
     
     subgraph External["External Services"]
@@ -743,41 +774,29 @@ flowchart LR
 
 ### API Response Structure
 
+Responses are the **raw handler payload** — there is no `{success, data, meta}` envelope.
+A controller that returns an object sends exactly that object; a list endpoint returns a bare array.
+Errors use the NestJS default shape.
+
 ```typescript
-// Success Response
+// Success Response — the resource itself
 {
-  "success": true,
-  "data": { ... },
-  "meta": {
-    "timestamp": "2025-02-02T10:00:00Z",
-    "requestId": "uuid"
-  }
+  "id": "abc",
+  "name": "my-session",
+  "status": "READY"
 }
 
-// Error Response
-{
-  "success": false,
-  "error": {
-    "code": "SESSION_NOT_FOUND",
-    "message": "Session with id 'xxx' not found",
-    "details": { ... }
-  },
-  "meta": {
-    "timestamp": "2025-02-02T10:00:00Z",
-    "requestId": "uuid"
-  }
-}
+// List Response — a bare array
+[
+  { "id": "abc", "name": "my-session", "status": "READY" },
+  { "id": "def", "name": "other-session", "status": "DISCONNECTED" }
+]
 
-// Paginated Response
+// Error Response — NestJS default shape
 {
-  "success": true,
-  "data": [ ... ],
-  "pagination": {
-    "page": 1,
-    "limit": 20,
-    "total": 100,
-    "totalPages": 5
-  }
+  "statusCode": 404,
+  "message": "Session with id 'xxx' not found",
+  "error": "Not Found"
 }
 ```
 
@@ -878,7 +897,7 @@ flowchart LR
 ## 3.12 Engine Abstraction Layer
 
 > [!IMPORTANT]
-> Engine abstraction is critical to mitigate **R001: WhatsApp Protocol Changes** in Risk Management. With an abstraction layer, we can easily switch to an alternative engine (e.g., Baileys) when needed.
+> Engine abstraction is critical to mitigate **R001: WhatsApp Protocol Changes** in Risk Management. OpenWA ships two production-ready engines selectable via `ENGINE_TYPE`: `whatsapp-web.js` (default, Chromium/Puppeteer-based) and `baileys` (browser-free, WebSocket/Noise protocol). With the abstraction layer, adding further engines requires no changes to application code.
 
 ### Strategy Pattern for Engine
 
@@ -1187,8 +1206,9 @@ ENGINE_TYPE=mock
 
 ```mermaid
 flowchart TB
-    subgraph Current["Current State"]
-        A[whatsapp-web.js\nPuppeteer-based]
+    subgraph Current["Available Engines"]
+        A[whatsapp-web.js\nPuppeteer-based\ndefault]
+        A2[Baileys\nWebSocket-based\nENGINE_TYPE=baileys]
     end
     
     subgraph Risk["Risk Detection"]

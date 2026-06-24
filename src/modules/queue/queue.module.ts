@@ -30,7 +30,15 @@ export { QUEUE_NAMES } from './queue-names';
         },
       }),
     }),
-    BullModule.registerQueue({ name: QUEUE_NAMES.WEBHOOK }),
+    BullModule.registerQueue({
+      name: QUEUE_NAMES.WEBHOOK,
+      // Auto-evict finished jobs so completed/failed webhook payloads don't accumulate in Redis
+      // unbounded (M19). Keep a small recent window for debugging; cap age too.
+      defaultJobOptions: {
+        removeOnComplete: { age: 3600, count: 1000 },
+        removeOnFail: { age: 86400, count: 5000 },
+      },
+    }),
     BullBoardModule.forRoot({
       route: '/admin/queues',
       adapter: ExpressAdapter,
