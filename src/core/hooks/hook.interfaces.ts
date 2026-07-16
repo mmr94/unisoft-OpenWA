@@ -21,12 +21,15 @@ export type HookEvent =
   | 'message:sent'
   | 'message:failed'
   | 'message:ack'
+  | 'message:persisted'
   // Webhook lifecycle
   | 'webhook:before'
   | 'webhook:queued' // After webhook job added to queue (queue mode only)
   | 'webhook:delivered' // After webhook successfully delivered (direct or queue)
   | 'webhook:after' // After webhook attempt (direct mode only, deprecated for queue)
-  | 'webhook:error'; // After webhook delivery failed (all retries exhausted)
+  | 'webhook:error' // After webhook delivery failed (all retries exhausted)
+  // Ingress (inbound provider webhook -> plugin) lifecycle
+  | 'ingress:error'; // After an ingress dispatch failed (all retries exhausted)
 
 // Runtime allowlist of every HookEvent. The Record is exhaustively typed, so adding a HookEvent above
 // without listing it here is a COMPILE error — keeping the runtime set in lockstep with the type.
@@ -48,11 +51,13 @@ const HOOK_EVENT_REGISTRY: Record<HookEvent, true> = {
   'message:sent': true,
   'message:failed': true,
   'message:ack': true,
+  'message:persisted': true,
   'webhook:before': true,
   'webhook:queued': true,
   'webhook:delivered': true,
   'webhook:after': true,
   'webhook:error': true,
+  'ingress:error': true,
 };
 
 export const KNOWN_HOOK_EVENTS: ReadonlySet<HookEvent> = new Set(Object.keys(HOOK_EVENT_REGISTRY) as HookEvent[]);

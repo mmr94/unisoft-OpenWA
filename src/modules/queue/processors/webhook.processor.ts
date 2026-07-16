@@ -5,10 +5,14 @@ import { ConfigService } from '@nestjs/config';
 import { Repository } from 'typeorm';
 import { createLogger } from '../../../common/services/logger.service';
 import { QUEUE_NAMES } from '../queue-names';
+import { workerConnectionOptions, webhookWorkerConcurrency } from '../redis-connection';
 import { WebhookJobData } from '../../webhook/webhook.service';
 import { Webhook } from '../../webhook/entities/webhook.entity';
+import { WebhookDeliveryFailure } from '../../webhook/entities/webhook-delivery-failure.entity';
+import { recordWebhookDeliveryFailure, statusCodeFromError } from '../../webhook/utils/record-delivery-failure';
 import { HookManager } from '../../../core/hooks';
-import { withSafeFetch, isSsrfProtectionEnabled } from '../../../common/security/ssrf-guard';
+import { withSafeFetch, isSsrfProtectionEnabled, redactSsrfError } from '../../../common/security/ssrf-guard';
+import { incrementWebhookDeliveryFailures } from '../../../common/metrics/webhook-delivery-metrics';
 
 export interface WebhookJobResult {
   statusCode: number;
@@ -17,13 +21,19 @@ export interface WebhookJobResult {
   responseTime: number;
 }
 
-@Processor(QUEUE_NAMES.WEBHOOK)
+// Override the Worker's connection so it does NOT inherit the producer's `enableOfflineQueue: false`
+// from the shared BullModule connection — the Worker must tolerate a brief Redis reconnect. Set an
+// explicit concurrency: BullMQ defaults a Worker to 1, which serializes every session's webhook
+// deliveries behind one slow/timing-out receiver.
+@Processor(QUEUE_NAMES.WEBHOOK, { connection: workerConnectionOptions(), concurrency: webhookWorkerConcurrency() })
 export class WebhookProcessor extends WorkerHost {
   private readonly logger = createLogger('WebhookProcessor');
 
   constructor(
     @InjectRepository(Webhook, 'data')
     private readonly webhookRepository: Repository<Webhook>,
+    @InjectRepository(WebhookDeliveryFailure, 'data')
+    private readonly failureRepository: Repository<WebhookDeliveryFailure>,
     private readonly hookManager: HookManager,
     private readonly configService: ConfigService,
   ) {
@@ -123,8 +133,13 @@ export class WebhookProcessor extends WorkerHost {
         action: 'webhook_failed',
       });
 
-      // Execute error hook only on final failure (all retries exhausted)
+      // On final failure (all retries exhausted): fire the error hook AND persist a durable record so
+      // the lost event is visible after the BullMQ failed-set / logs roll off.
       if (isFinalAttempt) {
+        // The hook payload and the durable row are surfaced to operators/plugins — redact SSRF detail
+        // (resolved internal IP) from the client-facing message. The full `errorMessage` is already
+        // logged server-side above; statusCodeFromError never matches an SSRF block (matches ^HTTP \d{3}).
+        const clientError = redactSsrfError(error);
         await this.hookManager.execute(
           'webhook:error',
           {
@@ -132,11 +147,23 @@ export class WebhookProcessor extends WorkerHost {
             event,
             webhookId,
             deliveryId: payload.deliveryId,
-            error: errorMessage,
+            error: clientError,
             attempt: job.attemptsMade + 1,
           },
           { sessionId, source: 'WebhookProcessor' },
         );
+        await recordWebhookDeliveryFailure(this.failureRepository, this.logger, {
+          webhookId,
+          sessionId,
+          event,
+          url,
+          idempotencyKey: payload.idempotencyKey,
+          deliveryId: payload.deliveryId,
+          attempts: job.attemptsMade + 1,
+          lastStatusCode: statusCodeFromError(errorMessage),
+          lastError: clientError,
+        });
+        incrementWebhookDeliveryFailures();
       }
 
       // Re-throw to trigger BullMQ retry

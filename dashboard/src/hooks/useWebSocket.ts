@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
+import { warnIfInsecureHttpUrl } from '../utils/urlSecurity';
 
 interface SessionStatusEvent {
   sessionId: string;
@@ -21,10 +22,12 @@ interface MessageEvent {
 
 interface MessageAckEvent {
   sessionId: string;
+  id: string;
   messageId: string;
   // Neutral delivery status emitted by the backend (engine-agnostic), not a raw wwebjs ack integer.
   status: 'pending' | 'sent' | 'delivered' | 'read' | 'failed';
-  chatId?: string;
+  // Deprecated legacy numeric ack kept for backward compatibility; prefer `status`.
+  ack?: number;
   timestamp?: string;
 }
 
@@ -72,6 +75,8 @@ interface ServerEventEnvelope {
 // Use current origin for WebSocket (goes through nginx proxy in Docker)
 // Falls back to env var or localhost for development
 const SOCKET_URL = import.meta.env.VITE_WS_URL || window.location.origin;
+// Warn when the WebSocket origin is an insecure http:// URL on a non-localhost host.
+warnIfInsecureHttpUrl(SOCKET_URL, 'VITE_WS_URL');
 
 export function useWebSocket(events: WebSocketEvents = {}) {
   const socketRef = useRef<Socket | null>(null);
@@ -191,9 +196,10 @@ export function useWebSocket(events: WebSocketEvents = {}) {
         case 'message.ack':
           events.onMessageAck?.({
             sessionId,
+            id: String(data.id),
             messageId: String(data.messageId),
             status: data.status as MessageAckEvent['status'],
-            chatId: data.chatId as string | undefined,
+            ack: typeof data.ack === 'number' ? data.ack : undefined,
             timestamp: msg.timestamp,
           });
           break;

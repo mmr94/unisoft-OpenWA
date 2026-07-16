@@ -9,6 +9,49 @@
  * pinning the default and ignoring the dashboard's selection. Clearing the blank lets the lower layers
  * provide the value, while a real (non-empty) value is preserved and keeps its top precedence.
  */
+/**
+ * Keys the bundled compose forwards with `- KEY=${KEY:-}` (rendering blank when unset) AND the
+ * dashboard saves to `data/.env.generated`. A blank forward of one of these would shadow the
+ * dashboard's value, so each is cleared when blank — letting a dashboard switch (database, storage,
+ * redis, engine) actually apply at runtime while a real host value still pins. Only add a key that
+ * meets BOTH conditions (blank-forwarded by compose AND dashboard-managed); keep this list in sync
+ * with the `${KEY:-}` forwards in docker-compose.yml.
+ */
+export const BLANK_SHADOWED_ENV_KEYS: string[] = [
+  'ENGINE_TYPE',
+  // Database selection + connection details (#488)
+  'DATABASE_TYPE',
+  'DATABASE_HOST',
+  'DATABASE_PORT',
+  'DATABASE_USERNAME',
+  'DATABASE_NAME',
+  'DATABASE_PASSWORD',
+  // PostgreSQL schema (dashboard-managed + compose blank-forwarded, like the other DATABASE_* keys)
+  'POSTGRES_SCHEMA',
+  // Storage selection + S3 details (#488)
+  'STORAGE_TYPE',
+  'STORAGE_LOCAL_PATH',
+  'S3_BUCKET',
+  'S3_ENDPOINT',
+  'S3_REGION',
+  'S3_ACCESS_KEY_ID',
+  'S3_SECRET_ACCESS_KEY',
+  // Legacy S3 credential names — compose forwards them blank for backward compat, so clear a blank
+  // forward too (otherwise it could shadow a value in data/.env.generated).
+  'S3_ACCESS_KEY',
+  'S3_SECRET_KEY',
+  // Redis selection + connection details (#488)
+  'REDIS_ENABLED',
+  'REDIS_HOST',
+  'REDIS_PORT',
+  // Engine launch options the dashboard saves (data/.env.generated). Compose blank-forwards these so a
+  // dashboard edit is not shadowed by a pinned container default; the app layer (configuration.ts)
+  // supplies the sane default when nothing is set.
+  'PUPPETEER_HEADLESS',
+  'SESSION_DATA_PATH',
+  'PUPPETEER_ARGS',
+];
+
 export function clearBlankEnv(env: NodeJS.ProcessEnv, keys: string[]): void {
   for (const key of keys) {
     const value = env[key];

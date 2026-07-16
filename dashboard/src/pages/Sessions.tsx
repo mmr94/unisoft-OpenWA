@@ -1,12 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { Trans, useTranslation } from 'react-i18next';
 import { Plus, QrCode, RefreshCw, Trash2, Eye, Loader2, Play, Square, X, Search, Filter, Skull } from 'lucide-react';
 import { sessionApi, type Session } from '../services/api';
+import { queryKeys } from '../hooks/queries';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { useToast } from '../components/Toast';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useRole } from '../hooks/useRole';
 import { PageHeader } from '../components/PageHeader';
+import { CustomSelect } from '../components/CustomSelect';
 import './Sessions.css';
 
 export function Sessions() {
@@ -14,6 +17,7 @@ export function Sessions() {
   useDocumentTitle(t('sessions.title'));
   const toast = useToast();
   const { canWrite } = useRole();
+  const queryClient = useQueryClient();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -21,6 +25,11 @@ export function Sessions() {
   const [newSessionName, setNewSessionName] = useState('');
   const [creating, setCreating] = useState(false);
   const [qrData, setQrData] = useState<{ sessionId: string; sessionName: string; qrCode: string } | null>(null);
+  const [pairingMode, setPairingMode] = useState(false);
+  const [phoneNumber, setPhoneNumber] = useState('');
+  const [pairingCode, setPairingCode] = useState<string | null>(null);
+  const [requestingPairing, setRequestingPairing] = useState(false);
+  const [pairingError, setPairingError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [selectedSession, setSelectedSession] = useState<Session | null>(null);
@@ -32,6 +41,14 @@ export function Sessions() {
       setLoading(true);
       const data = await sessionApi.list();
       setSessions(data);
+      // Keep the shared React Query cache (read by the Dashboard via useSessionsQuery /
+      // useSessionStatsQuery) in sync after this page's mutations reload local state — otherwise the
+      // Dashboard shows stale session counts/status. This runs on every reload (mount / WS-failed /
+      // mutation), which is harmless: the Sessions page holds no active observer on a ['sessions', …]
+      // query, so invalidation only marks the shared cache stale (no refetch here, no loop) and the
+      // Dashboard/other views refetch lazily on next mount. Prefix-matches every session-scoped key
+      // (sessions, sessionStats, per-session groups/chats/templates).
+      void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
       return data;
     } catch (err) {
       setError(err instanceof Error ? err.message : t('sessions.create.errorDefault'));
@@ -39,14 +56,28 @@ export function Sessions() {
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [t, queryClient]);
+
+  // Mirror the latest sessions in a ref so the WS handler can compare against the current status without
+  // depending on `sessions` (which would churn the callback identity and re-subscribe the socket). Kept
+  // in sync with every state update (fetch / create / delete / WS) via the effect below.
+  const sessionsRef = useRef<Session[]>([]);
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
 
   const { isConnected, subscribe } = useWebSocket({
     onSessionStatus: useCallback(
       (event: { sessionId: string; status: string }) => {
-        setSessions(prev =>
-          prev.map(s => (s.id === event.sessionId ? { ...s, status: event.status as Session['status'] } : s)),
+        const prev = sessionsRef.current.find(s => s.id === event.sessionId);
+        // Some engines double-signal one transition; only react to an ACTUAL status change so the toast
+        // and the failed-refresh don't fire on every redundant envelope. Update the ref synchronously so
+        // a duplicate arriving in the same tick (before the sync effect runs) is also caught.
+        if (prev && prev.status === event.status) return;
+        sessionsRef.current = sessionsRef.current.map(s =>
+          s.id === event.sessionId ? { ...s, status: event.status as Session['status'] } : s,
         );
+        setSessions(sessionsRef.current);
         if (event.status === 'ready') {
           toast.success(t('sessions.toasts.readyTitle'), t('sessions.toasts.readyDesc'));
         } else if (event.status === 'disconnected') {
@@ -77,35 +108,42 @@ export function Sessions() {
   const qrRefreshInterval = useRef<ReturnType<typeof setInterval> | null>(null);
   const currentSessionName = useRef<string>('');
 
-  const fetchQR = useCallback(async (sessionId: string) => {
-    // Guard: if session is already connected, stop polling immediately.
-    const currentSession = sessions.find(s => s.id === sessionId);
-    if (currentSession?.status === 'ready') {
-      setQrData(null);
-      currentSessionName.current = '';
-      return;
-    }
-    try {
-      const qr = await sessionApi.getQR(sessionId);
-      setQrData({ sessionId, sessionName: currentSessionName.current, qrCode: qr.qrCode });
-      if (qr.status === 'ready') {
+  const fetchQR = useCallback(
+    async (sessionId: string) => {
+      // Guard: if session is already connected, stop polling immediately. Read the ref (not `sessions`)
+      // so fetchQR keeps a stable identity — otherwise the polling interval is torn down and restarted on
+      // every sessions update.
+      const currentSession = sessionsRef.current.find(s => s.id === sessionId);
+      if (currentSession?.status === 'ready') {
         setQrData(null);
         currentSessionName.current = '';
-        fetchSessions();
+        return;
       }
-    } catch {
-      // Keep qrData alive so the polling interval keeps retrying until the QR
-      // is ready. Only stop polling if the session itself has failed.
-      const updated = await sessionApi.get(sessionId).catch(() => null);
-      const stillInitializing = updated &&
-        ['initializing', 'connecting', 'qr_ready'].includes(updated.status);
-      if (!stillInitializing) {
-        setQrData(null);
-        currentSessionName.current = '';
-        fetchSessions();
+      try {
+        const qr = await sessionApi.getQR(sessionId);
+        setQrData({ sessionId, sessionName: currentSessionName.current, qrCode: qr.qrCode });
+        if (qr.status === 'ready') {
+          setQrData(null);
+          currentSessionName.current = '';
+          fetchSessions();
+        }
+      } catch {
+        // Keep qrData alive so the polling interval keeps retrying until the QR
+        // is ready. Only stop polling if the session itself has failed. 'authenticating' is included so
+        // the modal (and the pairing-code panel mounted in it) survives the brief post-link handshake
+        // instead of being torn down mid-pairing — it closes on the real 'ready'/'failed' transition.
+        const updated = await sessionApi.get(sessionId).catch(() => null);
+        const stillInitializing =
+          updated && ['initializing', 'connecting', 'qr_ready', 'authenticating'].includes(updated.status);
+        if (!stillInitializing) {
+          setQrData(null);
+          currentSessionName.current = '';
+          fetchSessions();
+        }
       }
-    }
-  }, [sessions]);
+    },
+    [fetchSessions],
+  );
 
   useEffect(() => {
     if (qrData) {
@@ -118,6 +156,35 @@ export function Sessions() {
       if (qrRefreshInterval.current) clearInterval(qrRefreshInterval.current);
     };
   }, [qrData, fetchQR]);
+
+  const handleCloseQRModal = useCallback(() => {
+    setQrData(null);
+    setPairingMode(false);
+    setPhoneNumber('');
+    setPairingCode(null);
+    setPairingError(null);
+  }, []);
+
+  const handleGeneratePairingCode = async () => {
+    // Guard against a second concurrent request: the button is disabled while in flight, but the
+    // input's Enter handler is not, so a rapid double-Enter would otherwise fire overlapping POSTs.
+    if (requestingPairing) return;
+    if (!qrData || !phoneNumber.trim()) return;
+    if (!/^[0-9]{6,15}$/.test(phoneNumber.trim())) {
+      setPairingError(t('sessions.pairing.invalidPhone'));
+      return;
+    }
+    try {
+      setRequestingPairing(true);
+      setPairingError(null);
+      const res = await sessionApi.requestPairingCode(qrData.sessionId, phoneNumber.trim());
+      setPairingCode(res.pairingCode);
+    } catch (err) {
+      setPairingError(err instanceof Error ? err.message : t('common.errorGeneric'));
+    } finally {
+      setRequestingPairing(false);
+    }
+  };
 
   const handleCreate = async () => {
     if (!newSessionName.trim()) return;
@@ -144,7 +211,9 @@ export function Sessions() {
       setSessions(sessions.filter(s => s.id !== id));
       toast.success(
         t('sessions.delete.successTitle'),
-        session ? t('sessions.delete.successDescNamed', { name: session.name }) : t('sessions.delete.successDescGeneric'),
+        session
+          ? t('sessions.delete.successDescNamed', { name: session.name })
+          : t('sessions.delete.successDescGeneric'),
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : t('sessions.delete.errorDefault');
@@ -180,6 +249,12 @@ export function Sessions() {
     // Nothing to show for an already-connected session.
     if (session?.status === 'ready') return;
     const sessionName = session?.name || '';
+    // Reset any pairing sub-state from a previous open so a freshly opened modal never shows a
+    // stale code/phone belonging to a different session.
+    setPairingMode(false);
+    setPhoneNumber('');
+    setPairingCode(null);
+    setPairingError(null);
     // Show loading state immediately so the modal opens and polling starts
     // even before Chromium has finished initializing.
     setQrData({ sessionId: id, sessionName, qrCode: '' });
@@ -280,22 +355,26 @@ export function Sessions() {
 
         <div className="filter-group">
           <Filter size={16} />
-          <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
-            <option value="all">{t('sessions.filter.all')}</option>
-            <option value="active">{t('sessions.filter.active')}</option>
-            <option value="inactive">{t('sessions.filter.inactive')}</option>
-            <option value="connecting">{t('sessions.filter.connecting')}</option>
-          </select>
+          <CustomSelect
+            value={statusFilter}
+            onChange={setStatusFilter}
+            options={[
+              { value: 'all', label: t('sessions.filter.all') },
+              { value: 'active', label: t('sessions.filter.active') },
+              { value: 'inactive', label: t('sessions.filter.inactive') },
+              { value: 'connecting', label: t('sessions.filter.connecting') },
+            ]}
+          />
         </div>
       </div>
 
       {error && (
         <div
           style={{
-            background: '#FEE2E2',
+            background: 'rgba(239, 68, 68, 0.12)',
             padding: '1rem',
             borderRadius: '8px',
-            color: '#DC2626',
+            color: 'var(--error)',
             marginBottom: '1rem',
           }}
         >
@@ -363,34 +442,154 @@ export function Sessions() {
       )}
 
       {qrData && (
-        <div className="modal-overlay" onClick={() => setQrData(null)}>
+        <div className="modal-overlay" onClick={handleCloseQRModal}>
           <div className="modal qr-modal" onClick={e => e.stopPropagation()}>
             <div className="modal-header">
               <div className="modal-title">
-                <h2>{t('sessions.qr.title')}</h2>
+                <h2>{pairingMode ? t('sessions.pairing.tabPhone') : t('sessions.qr.title')}</h2>
                 <span className="session-name">{qrData.sessionName}</span>
               </div>
-              <button className="btn-close" onClick={() => setQrData(null)} aria-label={t('common.close')}>
-                <X size={20} color="#64748b" />
+              <button className="btn-close" onClick={handleCloseQRModal} aria-label={t('common.close')}>
+                <X size={20} style={{ color: 'var(--text-muted)' }} />
               </button>
             </div>
             <div className="modal-body" style={{ textAlign: 'center' }}>
-              {qrData.qrCode ? (
-                <>
-                  <img src={qrData.qrCode} alt="QR" style={{ maxWidth: '280px', borderRadius: '12px' }} />
-                  <div className="qr-instructions">
-                    <p className="qr-step"><Trans i18nKey="sessions.qr.step1" components={{ strong: <strong /> }} /></p>
-                    <p className="qr-step"><Trans i18nKey="sessions.qr.step2" components={{ strong: <strong /> }} /></p>
-                    <p className="qr-step"><Trans i18nKey="sessions.qr.step3" components={{ strong: <strong /> }} /></p>
+              {!pairingCode && (
+                <div className="pairing-tabs" role="tablist">
+                  <button
+                    role="tab"
+                    aria-selected={!pairingMode}
+                    className={`pairing-tab-btn ${!pairingMode ? 'active' : ''}`}
+                    onClick={() => {
+                      setPairingMode(false);
+                      setPairingError(null);
+                    }}
+                  >
+                    {t('sessions.pairing.tabQr')}
+                  </button>
+                  <button
+                    role="tab"
+                    aria-selected={pairingMode}
+                    className={`pairing-tab-btn ${pairingMode ? 'active' : ''}`}
+                    onClick={() => {
+                      setPairingMode(true);
+                      setPairingError(null);
+                    }}
+                  >
+                    {t('sessions.pairing.tabPhone')}
+                  </button>
+                </div>
+              )}
+
+              {!pairingMode ? (
+                // QR Code Content
+                qrData.qrCode ? (
+                  <>
+                    <img src={qrData.qrCode} alt="QR" style={{ maxWidth: '280px', borderRadius: '12px' }} />
+                    <div className="qr-instructions">
+                      <p className="qr-step">
+                        <Trans i18nKey="sessions.qr.step1" components={{ strong: <strong /> }} />
+                      </p>
+                      <p className="qr-step">
+                        <Trans i18nKey="sessions.qr.step2" components={{ strong: <strong /> }} />
+                      </p>
+                      <p className="qr-step">
+                        <Trans i18nKey="sessions.qr.step3" components={{ strong: <strong /> }} />
+                      </p>
+                    </div>
+                    <p className="qr-auto-refresh">
+                      <RefreshCw size={14} className="spin-slow" /> {t('sessions.qr.autoRefresh')}
+                    </p>
+                  </>
+                ) : (
+                  <div style={{ padding: '2rem' }}>
+                    <Loader2 className="animate-spin" size={48} />
+                    <p>{t('sessions.qr.generating')}</p>
                   </div>
-                  <p className="qr-auto-refresh">
-                    <RefreshCw size={14} className="spin-slow" /> {t('sessions.qr.autoRefresh')}
-                  </p>
-                </>
+                )
               ) : (
-                <div style={{ padding: '2rem' }}>
-                  <Loader2 className="animate-spin" size={48} />
-                  <p>{t('sessions.qr.generating')}</p>
+                // Pairing Code Content
+                <div className="pairing-container" role="tabpanel">
+                  {pairingError && <div className="pairing-error">{pairingError}</div>}
+
+                  {!pairingCode ? (
+                    <div className="pairing-form">
+                      <label htmlFor="pairing-phone" className="pairing-label">
+                        {t('sessions.pairing.phoneLabel')}
+                      </label>
+                      <input
+                        id="pairing-phone"
+                        className="pairing-input"
+                        type="tel"
+                        inputMode="numeric"
+                        maxLength={15}
+                        placeholder={t('sessions.pairing.phonePlaceholder')}
+                        value={phoneNumber}
+                        onChange={e => setPhoneNumber(e.target.value.replace(/\D/g, ''))}
+                        onKeyDown={e => e.key === 'Enter' && handleGeneratePairingCode()}
+                      />
+                      <p className="input-hint" style={{ marginBottom: '1.5rem' }}>
+                        {t('sessions.pairing.phoneHint')}
+                      </p>
+                      <button
+                        className="btn-primary"
+                        onClick={handleGeneratePairingCode}
+                        disabled={requestingPairing || !/^[0-9]{6,15}$/.test(phoneNumber.trim())}
+                        style={{ width: '100%', justifyContent: 'center' }}
+                      >
+                        {requestingPairing ? (
+                          <>
+                            <Loader2 className="animate-spin" size={16} />
+                            <span style={{ marginLeft: '0.5rem' }}>{t('sessions.pairing.generating')}</span>
+                          </>
+                        ) : (
+                          t('sessions.pairing.generateButton')
+                        )}
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <label style={{ display: 'block', fontWeight: 600, color: 'var(--text-secondary)' }}>
+                        {t('sessions.pairing.codeLabel')}
+                      </label>
+                      <div className="pairing-code-display">
+                        {pairingCode.substring(0, 4)} - {pairingCode.substring(4)}
+                      </div>
+
+                      <div className="qr-instructions">
+                        <p className="pairing-instructions-title">{t('sessions.pairing.instructions')}</p>
+                        <p className="qr-step">
+                          <Trans i18nKey="sessions.pairing.step1" components={{ strong: <strong /> }} />
+                        </p>
+                        <p className="qr-step">
+                          <Trans i18nKey="sessions.pairing.step2" components={{ strong: <strong /> }} />
+                        </p>
+                        <p className="qr-step">
+                          <Trans i18nKey="sessions.pairing.step3" components={{ strong: <strong /> }} />
+                        </p>
+                        <p className="qr-step">
+                          <Trans i18nKey="sessions.pairing.step4" components={{ strong: <strong /> }} />
+                        </p>
+                      </div>
+
+                      <div style={{ marginTop: '1.5rem' }}>
+                        <button
+                          className="btn-secondary"
+                          onClick={() => {
+                            setPairingCode(null);
+                            setPhoneNumber('');
+                          }}
+                          style={{ width: '100%' }}
+                        >
+                          {t('sessions.pairing.changeNumber')}
+                        </button>
+                      </div>
+
+                      <p className="qr-auto-refresh">
+                        <RefreshCw size={14} className="spin-slow" /> {t('sessions.pairing.waitingConnection')}
+                      </p>
+                    </>
+                  )}
                 </div>
               )}
             </div>
@@ -415,7 +614,9 @@ export function Sessions() {
                 </div>
                 <div className="detail-item">
                   <span className="detail-label">{t('sessions.details.status')}</span>
-                  <span className={`status-badge ${selectedSession.status}`}>{formatStatus(selectedSession.status)}</span>
+                  <span className={`status-badge ${selectedSession.status}`}>
+                    {formatStatus(selectedSession.status)}
+                  </span>
                 </div>
                 <div className="detail-item">
                   <span className="detail-label">{t('sessions.details.sessionId')}</span>
@@ -432,7 +633,9 @@ export function Sessions() {
                 <div className="detail-item">
                   <span className="detail-label">{t('sessions.details.lastActive')}</span>
                   <span className="detail-value">
-                    {selectedSession.lastActive ? new Date(selectedSession.lastActive).toLocaleString() : t('common.never')}
+                    {selectedSession.lastActive
+                      ? new Date(selectedSession.lastActive).toLocaleString()
+                      : t('common.never')}
                   </span>
                 </div>
               </div>

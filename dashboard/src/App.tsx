@@ -1,5 +1,6 @@
-import { useState, useEffect, lazy, Suspense } from 'react';
+import { useState, useEffect, Suspense } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { lazyWithRetry as lazy } from './utils/lazyWithRetry';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Loader2 } from 'lucide-react';
 import { Layout } from './components/Layout';
@@ -110,7 +111,7 @@ function AppContent() {
             {role === 'admin' && <Route path="api-keys" element={<ApiKeys />} />}
             <Route path="logs" element={<Logs />} />
             <Route path="message-tester" element={<MessageTester />} />
-            <Route path="infrastructure" element={<Infrastructure />} />
+            {role === 'admin' && <Route path="infrastructure" element={<Infrastructure />} />}
             {role === 'admin' && <Route path="plugins" element={<Plugins />} />}
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

@@ -1,33 +1,50 @@
-import { Controller, Get, Put, Post, Body, BadRequestException } from '@nestjs/common';
+import { Controller, Get, Put, Post, Body, BadRequestException, HttpException, Optional } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBody } from '@nestjs/swagger';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
+import { QUEUE_NAMES } from '../queue/queue-names';
 import { ConfigService } from '@nestjs/config';
 import { DataSource } from 'typeorm';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { Public, RequireRole } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
-import { isPathWithin } from '../../common/utils/path-safety';
+import { isPathWithin, isSafeSessionName } from '../../common/utils/path-safety';
 import { writeSecretFile } from '../../common/utils/secret-file';
 import { EngineFactory } from '../../engine/engine.factory';
-import { DockerService } from '../docker';
+import { getEffectiveWebVersionInfo, resolveCurrentWebVersion } from '../../engine/wa-web-version';
+import { DockerService, MANAGED_DOCKER_PROFILES } from '../docker';
 import { CacheService } from '../../common/cache/cache.service';
 import { StorageService } from '../../common/storage/storage.service';
 import { ShutdownService } from '../../common/services/shutdown.service';
 import { createLogger } from '../../common/services/logger.service';
+import { isMissingTableError } from '../../common/utils/db-errors';
+import { ImportStorageDto } from './dto/import-storage.dto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import * as dotenv from 'dotenv';
 
 interface InfraStatus {
-  database: { connected: boolean; type: string; host: string };
-  redis: { enabled: boolean; connected: boolean; host: string; port: number };
+  // `builtIn` reflects whether OpenWA's own bundled container is actually running and backing this
+  // service (detected live from the labeled container), not merely the saved intent. Falls back to the
+  // saved flag when Docker is unavailable. (#488)
+  database: { connected: boolean; type: string; host: string; builtIn: boolean };
+  redis: { enabled: boolean; connected: boolean; host: string; port: number; builtIn: boolean };
   queue: {
     enabled: boolean;
-    messages: { pending: number; completed: number; failed: number };
     webhooks: { pending: number; completed: number; failed: number };
   };
-  storage: { type: 'local' | 's3'; path?: string; bucket?: string };
-  engine: { type: string; headless: boolean; sessionDataPath: string; browserArgs: string };
+  storage: { type: 'local' | 's3'; path?: string; bucket?: string; builtIn: boolean; s3Available?: boolean };
+  engine: {
+    type: string;
+    headless: boolean;
+    sessionDataPath: string;
+    browserArgs: string;
+    // whatsapp-web.js only: the actual WhatsApp Web build in use (distinct from the library version),
+    // and how it was chosen. Omitted for other engines (e.g. baileys). (#488)
+    webVersion?: string | null;
+    webVersionSource?: 'pinned' | 'auto' | 'native';
+  };
 }
 
 interface SaveConfigDto {
@@ -39,6 +56,7 @@ interface SaveConfigDto {
     username?: string;
     password?: string;
     database?: string;
+    schema?: string;
     poolSize?: number;
     sslEnabled?: boolean;
     sslRejectUnauthorized?: boolean;
@@ -160,6 +178,80 @@ interface BaileysStoredMessageRow {
   createdAt: string;
 }
 
+// The persisted lid->phone resolution cache. Not a FK to sessions (provenance only), so the import's
+// `DELETE FROM sessions` never clears it — it must be exported + re-inserted explicitly or a
+// backup→restore into a fresh DB loses the whole cache (it self-heals via re-lookup, but lossily).
+interface LidMappingRow {
+  lid: string;
+  phone: string | null;
+  sessionId: string | null;
+  updatedAt: string;
+}
+
+interface PluginInstanceRow {
+  id: string;
+  pluginId: string;
+  instanceId: string;
+  sessionScope: string | null;
+  secret: string;
+  verifyToken: string | null;
+  config: string | Record<string, unknown> | null;
+  enabled: boolean | number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface ConversationMappingRow {
+  id: string;
+  sessionId: string;
+  chatId: string;
+  pluginId: string;
+  instanceId: string;
+  providerConversationId: string;
+  handoverState: string;
+  metadata: string | Record<string, unknown> | null;
+  updatedAt: string;
+}
+
+interface IngressEventRow {
+  id: string;
+  instanceId: string;
+  pluginId: string;
+  providerDeliveryId: string;
+  route: string;
+  payload: string | Record<string, unknown>;
+  sessionId: string | null;
+  createdAt: string;
+}
+
+interface WebhookDeliveryFailureRow {
+  id: string;
+  webhookId: string;
+  sessionId: string;
+  event: string;
+  url: string;
+  idempotencyKey: string | null;
+  deliveryId: string | null;
+  attempts: number;
+  lastStatusCode: number | null;
+  lastError: string;
+  createdAt: string;
+}
+
+interface IntegrationDeliveryFailureRow {
+  id: string;
+  direction: string;
+  pluginId: string;
+  instanceId: string;
+  sessionId: string | null;
+  deliveryId: string | null;
+  attempts: number;
+  lastError: string;
+  payload: string | Record<string, unknown> | null;
+  redriven: boolean | number;
+  createdAt: string;
+}
+
 interface MigrationTables {
   sessions: SessionRow[];
   webhooks: WebhookRow[];
@@ -167,6 +259,12 @@ interface MigrationTables {
   messageBatches: MessageBatchRow[];
   templates: TemplateRow[];
   baileysStoredMessages: BaileysStoredMessageRow[];
+  lidMappings: LidMappingRow[];
+  pluginInstances: PluginInstanceRow[];
+  conversationMappings: ConversationMappingRow[];
+  ingressEvents: IngressEventRow[];
+  webhookDeliveryFailures: WebhookDeliveryFailureRow[];
+  integrationDeliveryFailures: IntegrationDeliveryFailureRow[];
 }
 
 // Saved infrastructure config returned to the dashboard form for hydration. Secret
@@ -179,6 +277,7 @@ interface SavedConfigResponse {
     port: string;
     username: string;
     database: string;
+    schema: string;
     poolSize: number;
     sslEnabled: boolean;
     sslRejectUnauthorized: boolean;
@@ -214,16 +313,49 @@ export class InfraController {
     private readonly cacheService: CacheService,
     private readonly storageService: StorageService,
     private readonly shutdownService: ShutdownService,
+    @Optional()
+    @InjectQueue(QUEUE_NAMES.WEBHOOK)
+    private readonly webhookQueue?: Queue,
   ) {}
+
+  /** Bound the DB liveness probe so a hung connection can't stall the status read. */
+  private static readonly DB_PROBE_TIMEOUT_MS = 3000;
+
+  /**
+   * Active DB liveness probe: run `SELECT 1`, not just read `DataSource.isInitialized`. A backend
+   * (notably Postgres) that dies AFTER init keeps `isInitialized` true until an explicit `.destroy()`,
+   * so the old check reported the tile green while the DB was actually down. Bounded by a short
+   * timeout; any error or timeout resolves to `false`. Mirrors `/health/ready`'s authoritative probe.
+   */
+  private async probeDbConnected(ds: DataSource): Promise<boolean> {
+    if (!ds.isInitialized) return false;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        ds.query('SELECT 1'),
+        new Promise((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('db probe timeout')), InfraController.DB_PROBE_TIMEOUT_MS);
+        }),
+      ]);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
 
   @Get('status')
   @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get infrastructure status' })
   @ApiResponse({ status: 200, description: 'Infrastructure status' })
   async getStatus(): Promise<InfraStatus> {
-    // Check both database connections
-    const mainDbConnected = this.mainDataSource.isInitialized;
-    const dataDbConnected = this.dataDataSource.isInitialized;
+    // Active DB liveness probe (SELECT 1) on both connections in parallel — not just isInitialized,
+    // which stays true after a Postgres backend dies until an explicit .destroy() (see probeDbConnected).
+    const [mainDbConnected, dataDbConnected] = await Promise.all([
+      this.probeDbConnected(this.mainDataSource),
+      this.probeDbConnected(this.dataDataSource),
+    ]);
     const dbConnected = mainDbConnected && dataDbConnected;
     const dbType = this.configService.get<string>('dataDatabase.type', 'sqlite');
     const dbHost = this.configService.get<string>('dataDatabase.host', 'localhost');
@@ -237,9 +369,30 @@ export class InfraController {
     const redisConnected = await this.cacheService.isAvailable();
 
     const storageType = this.configService.get<'local' | 's3'>('storage.type', 'local');
-    const storagePath = this.configService.get<string>('storage.path', './uploads');
+    // Read the key StorageService actually uses (`storage.localPath`, default `./data/media`).
+    // The old `storage.path` key never existed, so status always reported the `./uploads` fallback.
+    const storagePath = this.configService.get<string>('storage.localPath', './data/media');
+    // In S3 mode the local path is unused; surface the bucket so the status panel shows the real
+    // backend. `path` is kept (additive) so the dashboard's local-mode rendering is unchanged.
+    const storageBucket = this.configService.get<string>('storage.s3.bucket');
 
     const engineType = this.configService.get<string>('engine.type', 'whatsapp-web.js');
+    // whatsapp-web.js only: surface the actual WhatsApp Web build (not the library version) so the
+    // dashboard shows which build is running. Trigger the auto-resolve so the panel is populated even
+    // before a session starts; the result is cached, so this is a one-time fetch. (#488)
+    let webVersion: string | null | undefined;
+    let webVersionSource: 'pinned' | 'auto' | 'native' | undefined;
+    if (engineType === 'whatsapp-web.js') {
+      // Kick the auto-resolve but DON'T await it — /infra/status is polled frequently and the registry
+      // fetch can take up to 5s on a firewalled host. Read whatever's cached now (null until the first
+      // success); a later poll reflects the resolved build. (#488 review)
+      if (getEffectiveWebVersionInfo().source === 'auto') {
+        void resolveCurrentWebVersion().catch(() => undefined);
+      }
+      const info = getEffectiveWebVersionInfo();
+      webVersion = info.version;
+      webVersionSource = info.source;
+    }
     // configuration.ts nests these under engine.puppeteer.{headless,args}; the old flat
     // engine.headless / engine.browserArgs keys never existed, so status always reported defaults.
     const engineHeadless = this.configService.get<boolean>('engine.puppeteer.headless', true) ?? true;
@@ -247,17 +400,82 @@ export class InfraController {
     const browserArgs =
       this.configService.get<string[]>('engine.puppeteer.args')?.join(' ') || '--no-sandbox --disable-gpu';
 
+    // Built-in detection: prefer the actually-running bundled container as truth (so a stopped/missing
+    // container, or a host-pinned external host, reads as NOT built-in), and require the app to be
+    // pointed at the bundled service. Fall back to the saved *_BUILTIN intent when Docker is
+    // unreachable (bare-npm / socket-less) so the toggles don't spuriously flip off. (#488)
+    const s3Endpoint = this.configService.get<string>('storage.s3.endpoint');
+    const running = this.dockerService.isDockerAvailable()
+      ? await this.dockerService.getRunningBuiltinServices()
+      : null;
+    const savedBuiltin = this.readSavedBuiltinFlags();
+    const dbBuiltIn = running ? running.database && dbHost === 'postgres' : savedBuiltin.database;
+    const redisBuiltIn = running ? running.cache && redisHost === 'redis' : savedBuiltin.cache;
+    const storageBuiltIn = running ? running.storage && s3Endpoint === 'http://minio:9000' : savedBuiltin.storage;
+    // Re-probe (throttled) so a MinIO/S3 that came up after boot is reflected, not latched unreachable.
+    const s3Available = storageType === 's3' ? await this.storageService.refreshS3Availability() : undefined;
+
+    // Live webhook-queue depth (the only real queue). pending = waiting + active + delayed. Degrades to
+    // zeros when the queue is disabled or Redis is unreachable, so the panel never errors the status read.
+    let webhooks = { pending: 0, completed: 0, failed: 0 };
+    if (queueEnabled && this.webhookQueue) {
+      try {
+        const counts = await this.webhookQueue.getJobCounts('wait', 'active', 'delayed', 'completed', 'failed');
+        webhooks = {
+          pending: (counts.wait ?? 0) + (counts.active ?? 0) + (counts.delayed ?? 0),
+          completed: counts.completed ?? 0,
+          failed: counts.failed ?? 0,
+        };
+      } catch (error) {
+        this.logger.warn('Failed to read webhook queue job counts', { error: String(error) });
+      }
+    }
+
     return {
-      database: { connected: dbConnected, type: dbType, host: dbHost },
-      redis: { enabled: redisEnabled, connected: redisConnected, host: redisHost, port: redisPort },
+      database: { connected: dbConnected, type: dbType, host: dbHost, builtIn: dbBuiltIn },
+      redis: {
+        enabled: redisEnabled,
+        connected: redisConnected,
+        host: redisHost,
+        port: redisPort,
+        builtIn: redisBuiltIn,
+      },
       queue: {
         enabled: queueEnabled,
-        messages: { pending: 0, completed: 0, failed: 0 },
-        webhooks: { pending: 0, completed: 0, failed: 0 },
+        webhooks,
       },
-      storage: { type: storageType, path: storagePath },
-      engine: { type: engineType, headless: engineHeadless, sessionDataPath, browserArgs },
+      storage: {
+        type: storageType,
+        path: storagePath,
+        ...(storageType === 's3' && storageBucket ? { bucket: storageBucket } : {}),
+        builtIn: storageBuiltIn,
+        ...(storageType === 's3' ? { s3Available } : {}),
+      },
+      engine: {
+        type: engineType,
+        headless: engineHeadless,
+        sessionDataPath,
+        browserArgs,
+        ...(engineType === 'whatsapp-web.js' ? { webVersion, webVersionSource } : {}),
+      },
     };
+  }
+
+  /** Saved built-in intent flags from data/.env.generated — the fallback when Docker isn't reachable. */
+  private readSavedBuiltinFlags(): { database: boolean; cache: boolean; storage: boolean } {
+    try {
+      const envPath = path.resolve(process.cwd(), 'data', '.env.generated');
+      const saved: Record<string, string> = fs.existsSync(envPath)
+        ? dotenv.parse(fs.readFileSync(envPath, 'utf8'))
+        : {};
+      return {
+        database: saved.POSTGRES_BUILTIN === 'true',
+        cache: saved.REDIS_BUILTIN === 'true',
+        storage: saved.MINIO_BUILTIN === 'true',
+      };
+    } catch {
+      return { database: false, cache: false, storage: false };
+    }
   }
 
   @Get('engines')
@@ -295,6 +513,7 @@ export class InfraController {
         port: saved.DATABASE_PORT || '',
         username: saved.DATABASE_USERNAME || '',
         database: saved.DATABASE_NAME || '',
+        schema: saved.POSTGRES_SCHEMA || 'public',
         poolSize: Number(saved.DATABASE_POOL_SIZE) || 10,
         sslEnabled: saved.DATABASE_SSL === 'true',
         sslRejectUnauthorized: saved.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false',
@@ -366,6 +585,10 @@ export class InfraController {
             updates.DATABASE_USERNAME = 'openwa';
             updates.DATABASE_PASSWORD = 'openwa';
             updates.DATABASE_NAME = 'openwa';
+            // Built-in Postgres is initialized with the default 'public' schema (see
+            // scripts/postgres-init-schema.sh). Pin it so a later switch from a custom-schema
+            // external DB to built-in doesn't carry a stale POSTGRES_SCHEMA forward.
+            updates.POSTGRES_SCHEMA = 'public';
             profiles.push('postgres');
           } else {
             // External PostgreSQL
@@ -374,6 +597,7 @@ export class InfraController {
             updates.DATABASE_USERNAME = config.database.username || 'postgres';
             setSecret('DATABASE_PASSWORD', config.database.password);
             updates.DATABASE_NAME = config.database.database || 'openwa';
+            updates.POSTGRES_SCHEMA = config.database.schema || 'public';
           }
           updates.DATABASE_POOL_SIZE = String(config.database.poolSize || 10);
           updates.DATABASE_SSL = config.database.sslEnabled ? 'true' : 'false';
@@ -394,6 +618,7 @@ export class InfraController {
             'DATABASE_POOL_SIZE',
             'DATABASE_SSL',
             'DATABASE_SSL_REJECT_UNAUTHORIZED',
+            'POSTGRES_SCHEMA',
           ]) {
             staleKeys.add(k);
           }
@@ -469,7 +694,11 @@ export class InfraController {
         }
         updates.PUPPETEER_HEADLESS = config.engine.headless !== false ? 'true' : 'false';
         updates.SESSION_DATA_PATH = config.engine.sessionDataPath || './data/sessions';
-        updates.PUPPETEER_ARGS = config.engine.browserArgs || '--no-sandbox --disable-gpu';
+        // Must match configuration.ts's PUPPETEER_ARGS default (4 flags). Once compose blank-forwards
+        // PUPPETEER_ARGS, this saved value wins at runtime — a 2-flag default here would silently drop
+        // --disable-dev-shm-usage (the Docker /dev/shm tab-crash guard) after any Infrastructure save.
+        updates.PUPPETEER_ARGS =
+          config.engine.browserArgs || '--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu';
       }
 
       // .env.generated is one KEY=value per line, loaded on the next boot. A value carrying a
@@ -509,10 +738,19 @@ export class InfraController {
       return {
         message: `Configuration saved successfully.${profileMsg} Server restart required to apply changes.`,
         saved: true,
-        envPath,
+        // Return a cwd-relative path so the response doesn't disclose the absolute host filesystem layout.
+        envPath: path.relative(process.cwd(), envPath),
         profiles,
       };
     } catch (error) {
+      // A validation rejection (unknown engine type, or a newline-injected value) is a BadRequestException
+      // and MUST surface as its real 4xx status, not be masked as an HTTP 200 {saved:false} — a client
+      // branching on HTTP status alone would otherwise treat rejected input as success. Re-throw any
+      // HttpException so the Nest layer maps it. A non-HTTP failure (e.g. a writeSecretFile disk/permission
+      // error) stays a {saved:false} 200, preserving the dashboard's body.saved handling for I/O faults.
+      if (error instanceof HttpException) {
+        throw error;
+      }
       return {
         message: `Failed to save configuration: ${error instanceof Error ? error.message : 'Unknown error'}`,
         saved: false,
@@ -544,12 +782,28 @@ export class InfraController {
 
     // If profiles are specified, orchestrate Docker containers
     if (this.dockerService.isDockerAvailable()) {
+      // Remove only the profiles the Save flow explicitly asked to remove, and never one we're about to
+      // (re)start. We deliberately do NOT infer teardown from the saved *_BUILTIN flag: the default
+      // data/.env.generated carries POSTGRES_BUILTIN=false, so a bare compose-profile restart would
+      // otherwise tear down the very backend the app is running on. (Known minor limitation: switching
+      // away from a built-in backend and then reloading the page before restarting can leave the old
+      // container running until the next explicit change.)
+      // Only ever tear down OpenWA-managed services. An arbitrary profile name (or the empty string)
+      // would otherwise reach removeService and, via container-name matching, could stop an unrelated
+      // container — so constrain teardown to the managed allowlist and drop anything else.
+      const requested = profilesToRemove.filter(p => !profiles.includes(p));
+      const toRemove = requested.filter(p => MANAGED_DOCKER_PROFILES.includes(p));
+      const ignored = requested.filter(p => !MANAGED_DOCKER_PROFILES.includes(p));
+      if (ignored.length > 0) {
+        this.logger.warn('Ignoring non-managed profiles in profilesToRemove', { ignored });
+      }
+
       // First, remove containers for disabled services
-      if (profilesToRemove.length > 0) {
-        this.logger.log('Removing disabled profiles...');
+      if (toRemove.length > 0) {
+        this.logger.log('Removing disabled profiles...', { toRemove });
         removalResult = { removed: [], errors: [] };
 
-        for (const profile of profilesToRemove) {
+        for (const profile of toRemove) {
           try {
             const success = await this.dockerService.removeService(profile);
             if (success) {
@@ -639,6 +893,12 @@ export class InfraController {
       messageBatches: number;
       templates: number;
       baileysStoredMessages: number;
+      lidMappings: number;
+      pluginInstances: number;
+      conversationMappings: number;
+      ingressEvents: number;
+      webhookDeliveryFailures: number;
+      integrationDeliveryFailures: number;
     };
   }> {
     // Get all entities from Data DB
@@ -650,6 +910,12 @@ export class InfraController {
     let messageBatches: MessageBatchRow[] = [];
     let templates: TemplateRow[] = [];
     let baileysStoredMessages: BaileysStoredMessageRow[] = [];
+    let lidMappings: LidMappingRow[] = [];
+    let pluginInstances: PluginInstanceRow[] = [];
+    let conversationMappings: ConversationMappingRow[] = [];
+    let ingressEvents: IngressEventRow[] = [];
+    let webhookDeliveryFailures: WebhookDeliveryFailureRow[] = [];
+    let integrationDeliveryFailures: IntegrationDeliveryFailureRow[] = [];
 
     try {
       messages = await this.dataDataSource.query<MessageRow[]>('SELECT * FROM messages');
@@ -677,6 +943,46 @@ export class InfraController {
       this.logger.debug('Baileys stored messages table not available for export', { error: String(error) });
     }
 
+    try {
+      lidMappings = await this.dataDataSource.query<LidMappingRow[]>('SELECT * FROM lid_mappings');
+    } catch (error) {
+      this.logger.debug('Lid mappings table not available for export', { error: String(error) });
+    }
+
+    // Integration Fabric + both DLQs were added after the original migration set; tolerate a genuinely
+    // absent table (older DB) like the tables above rather than 500-ing the whole export.
+    try {
+      pluginInstances = await this.dataDataSource.query<PluginInstanceRow[]>('SELECT * FROM plugin_instances');
+    } catch (error) {
+      this.logger.debug('plugin_instances table not available for export', { error: String(error) });
+    }
+    try {
+      conversationMappings = await this.dataDataSource.query<ConversationMappingRow[]>(
+        'SELECT * FROM conversation_mappings',
+      );
+    } catch (error) {
+      this.logger.debug('conversation_mappings table not available for export', { error: String(error) });
+    }
+    try {
+      ingressEvents = await this.dataDataSource.query<IngressEventRow[]>('SELECT * FROM ingress_events');
+    } catch (error) {
+      this.logger.debug('ingress_events table not available for export', { error: String(error) });
+    }
+    try {
+      webhookDeliveryFailures = await this.dataDataSource.query<WebhookDeliveryFailureRow[]>(
+        'SELECT * FROM webhook_delivery_failures',
+      );
+    } catch (error) {
+      this.logger.debug('webhook_delivery_failures table not available for export', { error: String(error) });
+    }
+    try {
+      integrationDeliveryFailures = await this.dataDataSource.query<IntegrationDeliveryFailureRow[]>(
+        'SELECT * FROM integration_delivery_failures',
+      );
+    } catch (error) {
+      this.logger.debug('integration_delivery_failures table not available for export', { error: String(error) });
+    }
+
     return {
       exportedAt: new Date().toISOString(),
       dataDbType: this.configService.get<string>('dataDatabase.type', 'sqlite'),
@@ -687,6 +993,12 @@ export class InfraController {
         messageBatches,
         templates,
         baileysStoredMessages,
+        lidMappings,
+        pluginInstances,
+        conversationMappings,
+        ingressEvents,
+        webhookDeliveryFailures,
+        integrationDeliveryFailures,
       },
       counts: {
         sessions: sessions.length,
@@ -695,6 +1007,12 @@ export class InfraController {
         messageBatches: messageBatches.length,
         templates: templates.length,
         baileysStoredMessages: baileysStoredMessages.length,
+        lidMappings: lidMappings.length,
+        pluginInstances: pluginInstances.length,
+        conversationMappings: conversationMappings.length,
+        ingressEvents: ingressEvents.length,
+        webhookDeliveryFailures: webhookDeliveryFailures.length,
+        integrationDeliveryFailures: integrationDeliveryFailures.length,
       },
     };
   }
@@ -734,6 +1052,12 @@ export class InfraController {
       messageBatches: number;
       templates: number;
       baileysStoredMessages: number;
+      lidMappings: number;
+      pluginInstances: number;
+      conversationMappings: number;
+      ingressEvents: number;
+      webhookDeliveryFailures: number;
+      integrationDeliveryFailures: number;
     };
     warnings: string[];
   }> {
@@ -746,18 +1070,46 @@ export class InfraController {
       // Clear existing data (in correct order due to foreign keys). templates and
       // baileys_stored_messages FK sessions ON DELETE CASCADE, so the sessions DELETE would clear
       // them too; clearing them explicitly first keeps the order correct on engines where the
-      // cascade is not enforced, and is a no-op when the table doesn't exist.
+      // cascade is not enforced. Tolerate a genuinely-absent table (isMissingTableError) but let any
+      // OTHER failure (lock, I/O, aborted tx) propagate to the transaction rollback below — a blind
+      // `.catch(() => {})` here could otherwise silently commit a MERGED (not replaced) restore on
+      // SQLite, violating the endpoint's "replaces existing data" contract.
+      const clearTable = async (table: string): Promise<void> => {
+        try {
+          await queryRunner.query(`DELETE FROM ${table}`);
+        } catch (err) {
+          if (!isMissingTableError(err)) throw err;
+          this.logger.debug('Skipped clearing a table that does not exist during import', { table });
+        }
+      };
       await queryRunner.query('DELETE FROM webhooks');
-      await queryRunner.query('DELETE FROM messages').catch(() => {});
-      await queryRunner.query('DELETE FROM message_batches').catch(() => {});
-      await queryRunner.query('DELETE FROM templates').catch(() => {});
-      await queryRunner.query('DELETE FROM baileys_stored_messages').catch(() => {});
+      await clearTable('messages');
+      await clearTable('message_batches');
+      await clearTable('templates');
+      await clearTable('baileys_stored_messages');
+      // lid_mappings is not a FK to sessions, so the sessions DELETE below won't clear it; clear it
+      // explicitly so a restore replaces the cache rather than colliding on existing lid PKs.
+      await clearTable('lid_mappings');
+      // Integration Fabric + both DLQs: none carry an FK constraint to sessions (sessionId is provenance),
+      // so clearing them here before the sessions DELETE keeps the replace-semantics complete.
+      await clearTable('plugin_instances');
+      await clearTable('conversation_mappings');
+      await clearTable('ingress_events');
+      await clearTable('webhook_delivery_failures');
+      await clearTable('integration_delivery_failures');
       await queryRunner.query('DELETE FROM sessions');
 
       // Import sessions first
       let sessionsCount = 0;
       if (data.tables.sessions?.length) {
         for (const session of data.tables.sessions) {
+          // A session name becomes the engine auth-directory key, so an unvalidated imported name (this
+          // path bypasses CreateSessionDto) could traverse the filesystem. Skip + warn instead of
+          // throwing, so one bad row doesn't 500 the whole restore.
+          if (!isSafeSessionName(session.name)) {
+            warnings.push(`Skipped session ${session.id}: unsafe name ${JSON.stringify(session.name)}`);
+            continue;
+          }
           try {
             await queryRunner.query(
               `INSERT INTO sessions (id, name, status, phone, "pushName", config, "proxyUrl", "proxyType", "connectedAt", "lastActiveAt", "createdAt", "updatedAt") 
@@ -939,6 +1291,165 @@ export class InfraController {
         }
       }
 
+      // Import lid mappings (optional; not a FK, restored as a standalone cache table)
+      let lidMappingsCount = 0;
+      if (data.tables.lidMappings?.length) {
+        for (const lm of data.tables.lidMappings) {
+          try {
+            await queryRunner.query(
+              `INSERT INTO lid_mappings (lid, phone, "sessionId", "updatedAt") VALUES ($1, $2, $3, $4)`,
+              [lm.lid, lm.phone ?? null, lm.sessionId ?? null, lm.updatedAt],
+            );
+            lidMappingsCount++;
+          } catch (err) {
+            warnings.push(`Failed to import lid mapping ${lm.lid}: ${err}`);
+          }
+        }
+      }
+
+      // Import plugin instances (Integration Fabric config + ingress HMAC secret)
+      let pluginInstancesCount = 0;
+      if (data.tables.pluginInstances?.length) {
+        for (const pi of data.tables.pluginInstances) {
+          try {
+            await queryRunner.query(
+              `INSERT INTO plugin_instances (id, "pluginId", "instanceId", "sessionScope", secret, "verifyToken", config, enabled, "createdAt", "updatedAt")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+              [
+                pi.id,
+                pi.pluginId,
+                pi.instanceId,
+                pi.sessionScope,
+                pi.secret,
+                pi.verifyToken,
+                pi.config == null ? null : typeof pi.config === 'string' ? pi.config : JSON.stringify(pi.config),
+                pi.enabled,
+                pi.createdAt,
+                pi.updatedAt,
+              ],
+            );
+            pluginInstancesCount++;
+          } catch (err) {
+            warnings.push(`Failed to import plugin instance ${pi.id}: ${err}`);
+          }
+        }
+      }
+
+      // Import conversation mappings (handover state; sessionId is non-FK provenance)
+      let conversationMappingsCount = 0;
+      if (data.tables.conversationMappings?.length) {
+        for (const cm of data.tables.conversationMappings) {
+          try {
+            await queryRunner.query(
+              `INSERT INTO conversation_mappings (id, "sessionId", "chatId", "pluginId", "instanceId", "providerConversationId", "handoverState", metadata, "updatedAt")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+              [
+                cm.id,
+                cm.sessionId,
+                cm.chatId,
+                cm.pluginId,
+                cm.instanceId,
+                cm.providerConversationId,
+                cm.handoverState,
+                cm.metadata == null
+                  ? null
+                  : typeof cm.metadata === 'string'
+                    ? cm.metadata
+                    : JSON.stringify(cm.metadata),
+                cm.updatedAt,
+              ],
+            );
+            conversationMappingsCount++;
+          } catch (err) {
+            warnings.push(`Failed to import conversation mapping ${cm.id}: ${err}`);
+          }
+        }
+      }
+
+      // Import ingress events (durable inbound dedup oracle; payload is JSON)
+      let ingressEventsCount = 0;
+      if (data.tables.ingressEvents?.length) {
+        for (const ie of data.tables.ingressEvents) {
+          try {
+            await queryRunner.query(
+              `INSERT INTO ingress_events (id, "instanceId", "pluginId", "providerDeliveryId", route, payload, "sessionId", "createdAt")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+              [
+                ie.id,
+                ie.instanceId,
+                ie.pluginId,
+                ie.providerDeliveryId,
+                ie.route,
+                typeof ie.payload === 'string' ? ie.payload : JSON.stringify(ie.payload ?? {}),
+                ie.sessionId,
+                ie.createdAt,
+              ],
+            );
+            ingressEventsCount++;
+          } catch (err) {
+            warnings.push(`Failed to import ingress event ${ie.id}: ${err}`);
+          }
+        }
+      }
+
+      // Import webhook delivery failures (webhook DLQ)
+      let webhookDeliveryFailuresCount = 0;
+      if (data.tables.webhookDeliveryFailures?.length) {
+        for (const wf of data.tables.webhookDeliveryFailures) {
+          try {
+            await queryRunner.query(
+              `INSERT INTO webhook_delivery_failures (id, "webhookId", "sessionId", event, url, "idempotencyKey", "deliveryId", attempts, "lastStatusCode", "lastError", "createdAt")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+              [
+                wf.id,
+                wf.webhookId,
+                wf.sessionId,
+                wf.event,
+                wf.url,
+                wf.idempotencyKey,
+                wf.deliveryId,
+                wf.attempts,
+                wf.lastStatusCode,
+                wf.lastError,
+                wf.createdAt,
+              ],
+            );
+            webhookDeliveryFailuresCount++;
+          } catch (err) {
+            warnings.push(`Failed to import webhook delivery failure ${wf.id}: ${err}`);
+          }
+        }
+      }
+
+      // Import integration delivery failures (inbound + outbound DLQ)
+      let integrationDeliveryFailuresCount = 0;
+      if (data.tables.integrationDeliveryFailures?.length) {
+        for (const df of data.tables.integrationDeliveryFailures) {
+          try {
+            await queryRunner.query(
+              `INSERT INTO integration_delivery_failures (id, direction, "pluginId", "instanceId", "sessionId", "deliveryId", attempts, "lastError", payload, redriven, "createdAt")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+              [
+                df.id,
+                df.direction,
+                df.pluginId,
+                df.instanceId,
+                df.sessionId,
+                df.deliveryId,
+                df.attempts,
+                df.lastError,
+                df.payload == null ? null : typeof df.payload === 'string' ? df.payload : JSON.stringify(df.payload),
+                df.redriven,
+                df.createdAt,
+              ],
+            );
+            integrationDeliveryFailuresCount++;
+          } catch (err) {
+            warnings.push(`Failed to import integration delivery failure ${df.id}: ${err}`);
+          }
+        }
+      }
+
       const counts = {
         sessions: sessionsCount,
         webhooks: webhooksCount,
@@ -946,6 +1457,12 @@ export class InfraController {
         messageBatches: messageBatchesCount,
         templates: templatesCount,
         baileysStoredMessages: baileysStoredMessagesCount,
+        lidMappings: lidMappingsCount,
+        pluginInstances: pluginInstancesCount,
+        conversationMappings: conversationMappingsCount,
+        ingressEvents: ingressEventsCount,
+        webhookDeliveryFailures: webhookDeliveryFailuresCount,
+        integrationDeliveryFailures: integrationDeliveryFailuresCount,
       };
 
       // "Replace all data" must be all-or-nothing: the import already DELETEd every row, so if any
@@ -955,6 +1472,18 @@ export class InfraController {
       if (warnings.length > 0) {
         await queryRunner.rollbackTransaction();
         return { imported: false, counts, warnings };
+      }
+
+      // A wrong/empty/garbage backup file restores zero rows but the DELETE already ran — committing
+      // would silently WIPE the database and report success. Refuse it and roll back instead. (#488 review)
+      const totalRestored = Object.values(counts).reduce((sum, n) => sum + n, 0);
+      if (totalRestored === 0) {
+        await queryRunner.rollbackTransaction();
+        return {
+          imported: false,
+          counts,
+          warnings: ['Backup contained no rows to restore; refused to replace existing data. Check the file.'],
+        };
       }
 
       await queryRunner.commitTransaction();
@@ -1026,7 +1555,10 @@ export class InfraController {
 
     return {
       message: 'Storage export completed',
-      download: exportPath,
+      // cwd-relative rather than an absolute host path: doesn't leak the filesystem layout, and the
+      // import round-trip still works because importStorage's existsSync/createReadStream resolve a
+      // relative filePath against the same cwd this was made relative to.
+      download: path.relative(process.cwd(), exportPath),
     };
   }
 
@@ -1036,7 +1568,7 @@ export class InfraController {
   @ApiBody({ description: 'Path to tar.gz file to import' })
   @ApiResponse({ status: 200, description: 'Import result' })
   async importStorage(
-    @Body() body: { filePath: string },
+    @Body() body: ImportStorageDto,
   ): Promise<{ imported: boolean; count: number; storageType: string }> {
     const { filePath } = body;
 

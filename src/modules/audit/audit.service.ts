@@ -4,6 +4,10 @@ import { Repository, Between, LessThan } from 'typeorm';
 import { AuditLog, AuditAction, AuditSeverity } from './entities/audit-log.entity';
 import { ApiKey } from '../auth/entities/api-key.entity';
 import { createLogger } from '../../common/services/logger.service';
+import { getRequestId } from '../../common/services/request-context';
+
+/** Upper bound on a single audit-log page, so a large `limit` can't load the whole table at once. */
+export const MAX_AUDIT_PAGE_SIZE = 200;
 
 interface AuditContext {
   apiKey?: ApiKey;
@@ -74,6 +78,11 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
     context: AuditContext = {},
     severity: AuditSeverity = AuditSeverity.INFO,
   ): Promise<AuditLog | null> {
+    // Stamp the active request id into metadata so an audit row traces back to the same request as
+    // the log lines. Absent outside a request scope (so no metadata blob is created for worker/cron).
+    const requestId = getRequestId();
+    const metadata =
+      context.metadata || requestId ? { ...(context.metadata ?? {}), ...(requestId ? { requestId } : {}) } : null;
     const auditLog = this.auditRepository.create({
       action,
       severity,
@@ -86,7 +95,7 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
       method: context.method || null,
       path: context.path || null,
       statusCode: context.statusCode || null,
-      metadata: context.metadata || null,
+      metadata,
       errorMessage: context.errorMessage || null,
     });
 
@@ -131,11 +140,17 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
       where.createdAt = Between(options.startDate, options.endDate);
     }
 
+    // Clamp the page size so an arbitrarily large `limit` can't load the whole table into one response.
+    const requested = options.limit && options.limit > 0 ? options.limit : 50;
+    const take = Math.min(requested, MAX_AUDIT_PAGE_SIZE);
+
     const [data, total] = await this.auditRepository.findAndCount({
       where,
       order: { createdAt: 'DESC' },
-      take: options.limit || 50,
-      skip: options.offset || 0,
+      take,
+      // Clamp to a non-negative skip: a negative offset (e.g. from an unvalidated `?offset=-5`) would
+      // otherwise reach the query driver verbatim.
+      skip: options.offset && options.offset > 0 ? options.offset : 0,
     });
 
     return { data, total };

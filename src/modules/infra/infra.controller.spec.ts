@@ -26,7 +26,7 @@ jest.mock('fs', () => {
   };
 });
 
-import { DataSource } from 'typeorm';
+import { DataSource, QueryFailedError } from 'typeorm';
 import { InfraController } from './infra.controller';
 import { REQUIRED_ROLE_KEY } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
@@ -36,6 +36,12 @@ import { Message, MessageDirection, MessageStatus } from '../message/entities/me
 import { MessageBatch, BatchStatus } from '../message/entities/message-batch.entity';
 import { Template } from '../template/entities/template.entity';
 import { BaileysStoredMessage } from '../../engine/adapters/baileys-stored-message.entity';
+import { LidMapping } from '../../engine/identity/lid-mapping.entity';
+import { PluginInstance } from '../integration/entities/plugin-instance.entity';
+import { ConversationMapping } from '../integration/entities/conversation-mapping.entity';
+import { IngressEvent } from '../integration/entities/ingress-event.entity';
+import { WebhookDeliveryFailure } from '../webhook/entities/webhook-delivery-failure.entity';
+import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
 
 describe('InfraController access control (Vuln 2)', () => {
   const reflector = new Reflector();
@@ -59,7 +65,9 @@ describe('InfraController access control (Vuln 2)', () => {
   ] as const;
 
   it.each(adminOnly)('%s requires the ADMIN role', method => {
-    const handler = InfraController.prototype[method as keyof InfraController] as object;
+    const handler = InfraController.prototype[method as keyof InfraController] as unknown as (
+      ...args: unknown[]
+    ) => unknown;
     const role = reflector.get<ApiKeyRole | undefined>(REQUIRED_ROLE_KEY, handler);
     expect(role).toBe(ApiKeyRole.ADMIN);
   });
@@ -87,6 +95,81 @@ describe('InfraController.importStorage filePath validation (Vuln 3)', () => {
       BadRequestException,
     );
     expect(storage.importFromStream).not.toHaveBeenCalled();
+  });
+});
+
+describe('InfraController.getStatus DB health (active SELECT 1 probe, not just isInitialized)', () => {
+  const build = (query: jest.Mock) => {
+    // engine.type=baileys skips the wa-web-version registry fetch (no network in unit tests).
+    const config = { get: (k: string, def?: unknown) => (k === 'engine.type' ? 'baileys' : def) };
+    const ds = { isInitialized: true, query };
+    const cache = { isAvailable: jest.fn().mockResolvedValue(false), refreshS3Availability: jest.fn() };
+    return new InfraController(
+      config as never,
+      ds as never,
+      ds as never,
+      { create: jest.fn() } as never,
+      { isDockerAvailable: () => false, getRunningBuiltinServices: jest.fn() } as never,
+      cache as never,
+      { refreshS3Availability: jest.fn() } as never,
+      {} as never,
+      undefined as never,
+    );
+  };
+
+  it('reports connected:true when SELECT 1 succeeds', async () => {
+    const status = await build(jest.fn().mockResolvedValue([{ '1': 1 }])).getStatus();
+    expect(status.database.connected).toBe(true);
+  });
+
+  it('reports connected:false when the DB is initialized but SELECT 1 fails (backend died post-init)', async () => {
+    const status = await build(jest.fn().mockRejectedValue(new Error('ECONNRESET'))).getStatus();
+    expect(status.database.connected).toBe(false);
+  });
+});
+
+describe('InfraController.getStatus queue job counts', () => {
+  function buildStatusController(opts: { queueEnabled: boolean; queue?: { getJobCounts: jest.Mock } }) {
+    const configService = {
+      get: (key: string, def?: unknown) => (key === 'queue.enabled' ? opts.queueEnabled : def),
+    };
+    const dataSource = { isInitialized: true, query: jest.fn().mockResolvedValue([{ '1': 1 }]) } as unknown;
+    const engineFactory = { create: jest.fn() };
+    const dockerService = { isDockerAvailable: () => false, getRunningBuiltinServices: jest.fn() };
+    const cacheService = { isAvailable: jest.fn().mockResolvedValue(false), refreshS3Availability: jest.fn() };
+    const storageService = { refreshS3Availability: jest.fn() };
+    const shutdownService = {};
+    return new InfraController(
+      configService as never,
+      dataSource as never,
+      dataSource as never,
+      engineFactory as never,
+      dockerService as never,
+      cacheService as never,
+      storageService as never,
+      shutdownService as never,
+      opts.queue as never,
+    );
+  }
+
+  it('reports live webhook job counts when the queue is enabled (pending = wait+active+delayed)', async () => {
+    const getJobCounts = jest.fn().mockResolvedValue({ wait: 2, active: 1, delayed: 3, completed: 10, failed: 1 });
+    const controller = buildStatusController({ queueEnabled: true, queue: { getJobCounts } });
+
+    const status = await controller.getStatus();
+
+    expect(getJobCounts).toHaveBeenCalledWith('wait', 'active', 'delayed', 'completed', 'failed');
+    expect(status.queue).toEqual({ enabled: true, webhooks: { pending: 6, completed: 10, failed: 1 } });
+  });
+
+  it('reports zeros (and does not touch the queue) when the queue is disabled', async () => {
+    const getJobCounts = jest.fn();
+    const controller = buildStatusController({ queueEnabled: false, queue: { getJobCounts } });
+
+    const status = await controller.getStatus();
+
+    expect(getJobCounts).not.toHaveBeenCalled();
+    expect(status.queue).toEqual({ enabled: false, webhooks: { pending: 0, completed: 0, failed: 0 } });
   });
 });
 
@@ -123,6 +206,61 @@ describe('InfraController.saveConfig SSL reject-unauthorized', () => {
   it('omits DATABASE_SSL_REJECT_UNAUTHORIZED when SSL is disabled', () => {
     const env = writtenEnv({ database: { type: 'postgres', sslEnabled: false } });
     expect(env).not.toContain('DATABASE_SSL_REJECT_UNAUTHORIZED');
+  });
+});
+
+describe('InfraController PostgreSQL schema (POSTGRES_SCHEMA)', () => {
+  const newController = () =>
+    new InfraController(
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+  function written(config: unknown, existing?: string): string {
+    (fs.existsSync as jest.Mock).mockReturnValue(existing !== undefined);
+    (fs.readFileSync as jest.Mock).mockReturnValue(existing ?? '');
+    (fs.writeFileSync as jest.Mock).mockClear();
+    newController().saveConfig(config as never);
+    const content = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
+    return content;
+  }
+
+  it('writes POSTGRES_SCHEMA for external Postgres', () => {
+    const env = written({ database: { type: 'postgres', builtIn: false, host: 'db', schema: 'openwa' } });
+    expect(env).toContain('POSTGRES_SCHEMA=openwa');
+  });
+
+  it('defaults POSTGRES_SCHEMA to public for external Postgres when no schema is provided', () => {
+    const env = written({ database: { type: 'postgres', builtIn: false, host: 'db' } });
+    expect(env).toContain('POSTGRES_SCHEMA=public');
+  });
+
+  it('pins POSTGRES_SCHEMA=public for the built-in Postgres container', () => {
+    const env = written({ database: { type: 'postgres', builtIn: true } });
+    expect(env).toContain('POSTGRES_SCHEMA=public');
+  });
+
+  it('does not write POSTGRES_SCHEMA for sqlite', () => {
+    const env = written({ database: { type: 'sqlite' } });
+    expect(env).not.toContain('POSTGRES_SCHEMA=');
+  });
+
+  it('getConfig surfaces the saved POSTGRES_SCHEMA, defaulting to public', () => {
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    (fs.readFileSync as jest.Mock).mockReturnValue('DATABASE_TYPE=postgres\nPOSTGRES_SCHEMA=openwa\n');
+    expect(newController().getConfig().database.schema).toBe('openwa');
+    (fs.readFileSync as jest.Mock).mockReturnValue('DATABASE_TYPE=postgres\n');
+    expect(newController().getConfig().database.schema).toBe('public');
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
   });
 });
 
@@ -194,6 +332,14 @@ describe('InfraController.saveConfig env-name correctness and merge (#226)', () 
     expect(env).not.toContain('S3_SECRET_KEY=');
   });
 
+  it('defaults PUPPETEER_ARGS to the full Docker sandbox flag set when browserArgs is empty', () => {
+    // Once compose blank-forwards PUPPETEER_ARGS this saved value wins at runtime, so the default must
+    // keep --disable-dev-shm-usage (the Docker /dev/shm tab-crash guard) — NOT the old 2-flag set.
+    const env = written({ engine: { headless: true, sessionDataPath: './data/sessions', browserArgs: '' } });
+    expect(env).toContain('PUPPETEER_ARGS=--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu');
+    expect(env).not.toContain('PUPPETEER_ARGS=--no-sandbox --disable-gpu');
+  });
+
   it('writes STORAGE_LOCAL_PATH (the name the backend reads) for local storage', () => {
     const env = written({ storage: { type: 'local', localPath: './data/media' } });
     expect(env).toContain('STORAGE_LOCAL_PATH=./data/media');
@@ -212,13 +358,15 @@ describe('InfraController.saveConfig env-name correctness and merge (#226)', () 
     expect(env).toContain('DATABASE_HOST=db');
   });
 
-  it('drops stale postgres keys when switching to sqlite', () => {
-    const existing = 'DATABASE_TYPE=postgres\nDATABASE_HOST=oldhost\nDATABASE_PASSWORD=secret\nDATABASE_PORT=5432\n';
+  it('drops stale postgres keys (including POSTGRES_SCHEMA) when switching to sqlite', () => {
+    const existing =
+      'DATABASE_TYPE=postgres\nDATABASE_HOST=oldhost\nDATABASE_PASSWORD=secret\nDATABASE_PORT=5432\nPOSTGRES_SCHEMA=openwa\n';
     const env = written({ database: { type: 'sqlite' } }, existing);
     expect(env).toContain('DATABASE_TYPE=sqlite');
     expect(env).not.toContain('DATABASE_HOST=');
     expect(env).not.toContain('DATABASE_PASSWORD=');
     expect(env).not.toContain('DATABASE_PORT=');
+    expect(env).not.toContain('POSTGRES_SCHEMA=');
   });
 
   it('drops stale S3 keys when switching storage to local', () => {
@@ -256,9 +404,9 @@ describe('InfraController.saveConfig rejects values that would inject extra env 
     (fs.existsSync as jest.Mock).mockReturnValue(false);
     (fs.writeFileSync as jest.Mock).mockClear();
 
-    const result = newController().saveConfig({ engine: { browserArgs: malicious } });
-
-    expect(result.saved).toBe(false);
+    // A newline-injected value is rejected outright with a 4xx (BadRequestException), not masked as a
+    // {saved:false} 200 — and nothing is written.
+    expect(() => newController().saveConfig({ engine: { browserArgs: malicious } })).toThrow(BadRequestException);
     expect(fs.writeFileSync as jest.Mock).not.toHaveBeenCalled();
   });
 
@@ -313,9 +461,8 @@ describe('InfraController.saveConfig engine selection (persist ENGINE_TYPE — I
 
   it('rejects an unknown engine type and writes nothing', () => {
     (fs.writeFileSync as jest.Mock).mockClear();
-    const res = newController().saveConfig({ engine: { type: 'bogus' } });
-    expect(res.saved).toBe(false);
-    expect(res.message).toMatch(/unknown engine/i);
+    // Rejected as a 4xx (BadRequestException naming the bad engine), not a {saved:false} 200.
+    expect(() => newController().saveConfig({ engine: { type: 'bogus' } })).toThrow(/unknown engine/i);
     expect(fs.writeFileSync as jest.Mock).not.toHaveBeenCalled();
   });
 });
@@ -333,7 +480,17 @@ describe('InfraController.importData round-trips export-data (no silent message/
     ds = new DataSource({
       type: 'sqlite',
       database: ':memory:',
-      entities: [Session, Webhook, Message, MessageBatch],
+      entities: [
+        Session,
+        Webhook,
+        Message,
+        MessageBatch,
+        PluginInstance,
+        ConversationMapping,
+        IngressEvent,
+        WebhookDeliveryFailure,
+        IntegrationDeliveryFailure,
+      ],
       synchronize: true,
     });
     await ds.initialize();
@@ -420,6 +577,55 @@ describe('InfraController.importData round-trips export-data (no silent message/
     expect(b.status).toBe(BatchStatus.COMPLETED);
   });
 
+  it('round-trips plugin instances + integration delivery failures (Integration Fabric + DLQ)', async () => {
+    await seedSession('s1');
+    await ds.getRepository(PluginInstance).save(
+      ds.getRepository(PluginInstance).create({
+        id: 'chatwoot:acct1',
+        pluginId: 'chatwoot',
+        instanceId: 'acct1',
+        sessionScope: 's1',
+        secret: 'hmac-secret',
+        verifyToken: null,
+        config: { baseUrl: 'https://x' },
+        enabled: true,
+      }),
+    );
+    await ds.getRepository(IntegrationDeliveryFailure).save(
+      ds.getRepository(IntegrationDeliveryFailure).create({
+        direction: 'outbound',
+        pluginId: 'chatwoot',
+        instanceId: 'acct1',
+        sessionId: 's1',
+        deliveryId: 'd1',
+        attempts: 3,
+        lastError: 'boom',
+        payload: { foo: 'bar' },
+        redriven: false,
+      }),
+    );
+
+    const dump = await controller.exportData();
+    expect(dump.counts.pluginInstances).toBe(1);
+    expect(dump.counts.integrationDeliveryFailures).toBe(1);
+
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    expect(res.counts.pluginInstances).toBe(1);
+    expect(res.counts.integrationDeliveryFailures).toBe(1);
+
+    expect(await ds.getRepository(PluginInstance).count()).toBe(1);
+    expect(await ds.getRepository(IntegrationDeliveryFailure).count()).toBe(1);
+    const pi = await ds.getRepository(PluginInstance).findOneByOrFail({ id: 'chatwoot:acct1' });
+    expect(pi.secret).toBe('hmac-secret'); // ingress HMAC secret survives a SQLite→Postgres migration
+    expect(pi.config).toEqual({ baseUrl: 'https://x' });
+    const dlf = await ds.getRepository(IntegrationDeliveryFailure).findOneByOrFail({ deliveryId: 'd1' });
+    expect(dlf.lastError).toBe('boom');
+    expect(dlf.payload).toEqual({ foo: 'bar' });
+  });
+
   it('rolls back and reports imported:false when a row fails — existing data is preserved', async () => {
     // Pre-existing data that must survive a failed import.
     await seedSession('s1');
@@ -456,6 +662,91 @@ describe('InfraController.importData round-trips export-data (no silent message/
     expect((await ds.getRepository(Message).findOneByOrFail({ id: 'm1' })).body).toBe('keep me');
     expect(await ds.getRepository(Session).findOneBy({ id: 's2' })).toBeNull();
   });
+
+  it('refuses an empty/garbage backup — does not wipe existing data (#488 review must-fix)', async () => {
+    await seedSession('s1');
+    await ds.getRepository(Message).save(
+      ds.getRepository(Message).create({
+        id: 'm1',
+        sessionId: 's1',
+        chatId: 'c1',
+        from: 'a',
+        to: 'b',
+        body: 'keep me',
+        type: 'text',
+        direction: MessageDirection.INCOMING,
+        status: MessageStatus.DELIVERED,
+      }),
+    );
+
+    // A wrong/empty file (no rows to restore) must NOT commit the all-rows DELETE and report success.
+    const res = await controller.importData({ tables: {} });
+
+    expect(res.imported).toBe(false);
+    expect(res.warnings.length).toBeGreaterThan(0);
+    expect(await ds.getRepository(Session).count()).toBe(1);
+    expect(await ds.getRepository(Message).count()).toBe(1);
+  });
+
+  it('propagates a genuine clear-table failure (lock/IO) instead of committing a merged restore', async () => {
+    // Pre-existing data that must survive if a clear step fails.
+    await seedSession('s1');
+    await ds.getRepository(Message).save(
+      ds.getRepository(Message).create({
+        id: 'm1',
+        sessionId: 's1',
+        chatId: 'c1',
+        from: 'a',
+        to: 'b',
+        body: 'keep me',
+        type: 'text',
+        direction: MessageDirection.INCOMING,
+        status: MessageStatus.DELIVERED,
+      }),
+    );
+
+    expect(await ds.getRepository(Message).count()).toBe(1); // sanity: seeded
+
+    // Make ONLY `DELETE FROM messages` fail with a genuine (non-missing-table) error. Previously a
+    // blind `.catch(() => {})` swallowed this and let a disjoint-id backup COMMIT a merged (not
+    // replaced) restore on SQLite; scoping the swallow to missing-table means the failure must now
+    // SURFACE (reaching the existing rollback-and-rethrow catch). A Proxy over the runner the
+    // controller creates intercepts just that one statement — no spy on `query`, so TypeORM's own
+    // internal `this.query` transaction control (BEGIN/ROLLBACK) is untouched.
+    const lockErr = new QueryFailedError(
+      'DELETE FROM messages',
+      [],
+      Object.assign(new Error('SQLITE_BUSY: database is locked'), { code: 'SQLITE_BUSY' }),
+    );
+    let rolledBack = false;
+    const origCreate = ds.createQueryRunner.bind(ds);
+    jest.spyOn(ds, 'createQueryRunner').mockImplementation(() => {
+      const real = origCreate();
+      return new Proxy(real, {
+        get(target, prop) {
+          if (prop === 'query') {
+            return (sql: string, params?: unknown[]) =>
+              sql === 'DELETE FROM messages'
+                ? Promise.reject(lockErr)
+                : (target.query as (q: string, p?: unknown[]) => Promise<unknown>).call(target, sql, params);
+          }
+          if (prop === 'rollbackTransaction') {
+            return async () => {
+              rolledBack = true;
+              return target.rollbackTransaction.call(target);
+            };
+          }
+          const val = (target as unknown as Record<string, unknown>)[prop as string];
+          return typeof val === 'function' ? (val as (...a: unknown[]) => unknown).bind(target) : val;
+        },
+      });
+    });
+
+    await expect(controller.importData({ tables: { messages: [] } })).rejects.toThrow(/database is locked/);
+    expect(rolledBack).toBe(true);
+
+    jest.restoreAllMocks();
+  });
 });
 
 describe('InfraController.import/export preserves every data-DB table', () => {
@@ -469,7 +760,7 @@ describe('InfraController.import/export preserves every data-DB table', () => {
     ds = new DataSource({
       type: 'sqlite',
       database: ':memory:',
-      entities: [Session, Webhook, Message, MessageBatch, Template, BaileysStoredMessage],
+      entities: [Session, Webhook, Message, MessageBatch, Template, BaileysStoredMessage, LidMapping],
       synchronize: true,
     });
     await ds.initialize();
@@ -495,6 +786,28 @@ describe('InfraController.import/export preserves every data-DB table', () => {
         lastActiveAt: null,
       }),
     );
+
+  // lid_mappings is the persisted lid->phone cache; it is NOT a FK to sessions, so the sessions DELETE
+  // never touches it — but export omitted it, so a backup→restore into a fresh DB dropped it entirely.
+  it('restores lid_mappings instead of dropping them on a backup→restore', async () => {
+    await seedSession('s1');
+    const lidRepo = ds.getRepository(LidMapping);
+    await lidRepo.save(lidRepo.create({ lid: '111', phone: '628111', sessionId: 's1' }));
+    await lidRepo.save(lidRepo.create({ lid: '222', phone: null, sessionId: 's1' })); // negative cache
+
+    const dump = await controller.exportData();
+    expect((dump.tables as unknown as { lidMappings?: unknown[] }).lidMappings).toHaveLength(2);
+
+    // Simulate restoring into a fresh data DB (the documented backend-migration flow).
+    await lidRepo.clear();
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    expect(await lidRepo.count()).toBe(2);
+    expect((await lidRepo.findOneByOrFail({ lid: '111' })).phone).toBe('628111');
+    expect((await lidRepo.findOneByOrFail({ lid: '222' })).phone).toBeNull();
+  });
 
   // DELETE FROM sessions cascades to templates + baileys_stored_messages (both FK ON DELETE CASCADE),
   // so an import that never re-inserts them permanently wipes both on the documented backup flow.
@@ -589,7 +902,15 @@ describe('InfraController.getConfig (#226)', () => {
   });
 });
 
-describe('InfraController.getStatus engine (F7 — reads the real engine.puppeteer.* keys)', () => {
+describe('InfraController.getStatus engine (reads the real engine.puppeteer.* keys)', () => {
+  // Pin the WA-Web version so getStatus does not fire the wa-version registry fetch (no network in tests).
+  const savedWebVer = process.env.WWEBJS_WEB_VERSION;
+  beforeAll(() => (process.env.WWEBJS_WEB_VERSION = 'off'));
+  afterAll(() => {
+    if (savedWebVer === undefined) delete process.env.WWEBJS_WEB_VERSION;
+    else process.env.WWEBJS_WEB_VERSION = savedWebVer;
+  });
+
   it('reports the saved headless/browserArgs instead of stale defaults from non-existent flat keys', async () => {
     const map: Record<string, unknown> = {
       'engine.type': 'whatsapp-web.js',
@@ -599,22 +920,74 @@ describe('InfraController.getStatus engine (F7 — reads the real engine.puppete
     };
     const config = { get: (key: string, def?: unknown) => (key in map ? map[key] : def) };
     const cache = { isAvailable: () => Promise.resolve(false) };
-    const ds = { isInitialized: true };
+    const ds = { isInitialized: true, query: jest.fn().mockResolvedValue([{ '1': 1 }]) };
     const controller = new InfraController(
       config as never,
       ds as never,
       ds as never,
-      {} as never,
-      {} as never,
+      {} as never, // engineFactory
+      { isDockerAvailable: () => false } as never, // dockerService — no Docker in unit tests
       cache as never,
-      {} as never,
-      {} as never,
+      { isS3Available: () => false, refreshS3Availability: () => Promise.resolve(false) } as never, // storageService
+      {} as never, // shutdownService
     );
 
     const status = await controller.getStatus();
     expect(status.engine.headless).toBe(false);
     expect(status.engine.browserArgs).toBe('--foo --bar');
     expect(status.engine.sessionDataPath).toBe('./sess');
+  });
+});
+
+describe('InfraController.getStatus storage (reads the real storage.localPath key)', () => {
+  // Pin the WA-Web version so getStatus does not fire the wa-version registry fetch (no network in tests).
+  const savedWebVer = process.env.WWEBJS_WEB_VERSION;
+  beforeAll(() => (process.env.WWEBJS_WEB_VERSION = 'off'));
+  afterAll(() => {
+    if (savedWebVer === undefined) delete process.env.WWEBJS_WEB_VERSION;
+    else process.env.WWEBJS_WEB_VERSION = savedWebVer;
+  });
+
+  const buildController = (map: Record<string, unknown>) => {
+    const config = { get: (key: string, def?: unknown) => (key in map ? map[key] : def) };
+    const cache = { isAvailable: () => Promise.resolve(false) };
+    const ds = { isInitialized: true, query: jest.fn().mockResolvedValue([{ '1': 1 }]) };
+    return new InfraController(
+      config as never,
+      ds as never,
+      ds as never,
+      {} as never, // engineFactory
+      { isDockerAvailable: () => false } as never, // dockerService — no Docker in unit tests
+      cache as never,
+      { isS3Available: () => false, refreshS3Availability: () => Promise.resolve(false) } as never, // storageService
+      {} as never, // shutdownService
+    );
+  };
+
+  it('reports the configured storage.localPath, not the ./uploads fallback', async () => {
+    // The bug: status read the non-existent `storage.path` key, so it always reported the
+    // `./uploads` fallback instead of the real path StorageService uses (`storage.localPath`).
+    const status = await buildController({
+      'storage.type': 'local',
+      'storage.localPath': '/srv/openwa/media',
+    }).getStatus();
+    expect(status.storage.path).toBe('/srv/openwa/media');
+  });
+
+  it('falls back to ./data/media (matching StorageService) when storage.localPath is unset', async () => {
+    const status = await buildController({ 'storage.type': 'local' }).getStatus();
+    expect(status.storage.path).toBe('./data/media');
+  });
+
+  it('reports the bucket in S3 mode so the active backend is visible', async () => {
+    const status = await buildController({ 'storage.type': 's3', 'storage.s3.bucket': 'my-openwa-bucket' }).getStatus();
+    expect(status.storage.type).toBe('s3');
+    expect(status.storage.bucket).toBe('my-openwa-bucket');
+  });
+
+  it('omits bucket in local mode (no fabricated field)', async () => {
+    const status = await buildController({ 'storage.type': 'local' }).getStatus();
+    expect(status.storage.bucket).toBeUndefined();
   });
 });
 
@@ -668,11 +1041,46 @@ describe('InfraController.exportStorage keeps the export import-able and sweeps 
 
     const result = await controller.exportStorage();
 
-    // Import-able: under <data>/exports — the import handler only accepts paths inside data/.
-    expect(result.download.startsWith(path.join(cwd, 'data', 'exports'))).toBe(true);
-    expect(await exists(result.download)).toBe(true);
+    // download is cwd-relative (no absolute host path leak) and stays under data/exports so the import
+    // handler — which only accepts paths inside data/ — can still consume it.
+    expect(path.isAbsolute(result.download)).toBe(false);
+    expect(result.download.startsWith(path.join('data', 'exports'))).toBe(true);
+    // Resolve against the (mocked) cwd to check on-disk existence; fs itself uses the real cwd.
+    const abs = path.join(cwd, result.download);
+    expect(await exists(abs)).toBe(true);
 
-    await waitForGone(result.download);
-    expect(await exists(result.download)).toBe(false);
+    await waitForGone(abs);
+    expect(await exists(abs)).toBe(false);
+  });
+});
+
+describe('InfraController.requestRestart constrains teardown to managed profiles', () => {
+  const buildController = (dockerService: Record<string, unknown>) =>
+    new InfraController(
+      { get: () => undefined } as never,
+      { isInitialized: true } as never,
+      { isInitialized: true } as never,
+      {} as never, // engineFactory
+      dockerService as never,
+      { isAvailable: () => Promise.resolve(false) } as never, // cacheService
+      { isS3Available: () => false, refreshS3Availability: () => Promise.resolve(false) } as never, // storageService
+      { shutdown: jest.fn() } as never, // shutdownService
+    );
+
+  it('removes only allowlisted profiles, never an unknown or empty entry', async () => {
+    const removeService = jest.fn().mockResolvedValue(true);
+    const controller = buildController({
+      isDockerAvailable: () => true,
+      removeService,
+      orchestrateProfiles: jest.fn().mockResolvedValue({}),
+    });
+
+    // '' (matches any container by substring) and 'evil' must be dropped; only managed profiles act.
+    await controller.requestRestart({ profilesToRemove: ['', 'evil', 'postgres', 'redis'] });
+
+    const removed = removeService.mock.calls.map(call => String((call as unknown[])[0])).sort();
+    expect(removed).toEqual(['postgres', 'redis']);
+    expect(removed).not.toContain('');
+    expect(removed).not.toContain('evil');
   });
 });

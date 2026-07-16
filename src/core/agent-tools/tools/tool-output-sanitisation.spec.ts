@@ -213,3 +213,52 @@ describe('FIX 6: handleToolError sanitises non-HTTP errors', () => {
     expect(payload.message).toBe('Missing API key');
   });
 });
+
+// ---------------------------------------------------------------------------
+// FIX 7: BadRequestException with string-array detail must expose the array,
+//         not the generic 'Bad Request Exception' string
+// ---------------------------------------------------------------------------
+
+describe('FIX 7: handleToolError exposes structured BadRequestException detail', () => {
+  it('BadRequestException with string[] detail returns the array, not the generic string', () => {
+    const err = new BadRequestException(['sessionId: too small', 'limit: max 100']);
+    const result = handleToolError(err);
+    const content = (result.content[0] as { type: string; text: string }).text;
+    const payload = JSON.parse(content) as { success: boolean; name: string; message: unknown };
+
+    expect(payload.success).toBe(false);
+    expect(payload.message).not.toBe('Bad Request Exception');
+    expect(Array.isArray(payload.message)).toBe(true);
+    expect(payload.message).toContain('sessionId: too small');
+    expect(payload.message).toContain('limit: max 100');
+  });
+
+  it('BadRequestException with a plain string stays as that string', () => {
+    const err = new BadRequestException('Session x not found');
+    const result = handleToolError(err);
+    const content = (result.content[0] as { type: string; text: string }).text;
+    const payload = JSON.parse(content) as { message: unknown };
+    expect(payload.message).toBe('Session x not found');
+  });
+
+  it('NotFoundException with a plain string stays as that string', () => {
+    const err = new BadRequestException('Session x not found');
+    const result = handleToolError(err);
+    const content = (result.content[0] as { type: string; text: string }).text;
+    const payload = JSON.parse(content) as { message: unknown };
+    expect(payload.message).toBe('Session x not found');
+  });
+
+  it('plain Error still yields Internal error (no leakage)', () => {
+    const result = handleToolError(new Error('db secret leaked'));
+    const content = (result.content[0] as { type: string; text: string }).text;
+    const payload = JSON.parse(content) as { message: unknown };
+    expect(payload.message).toBe('Internal error');
+  });
+
+  it('result is marked isError=true', () => {
+    const err = new BadRequestException(['sessionId: too small']);
+    const result = handleToolError(err);
+    expect(result.isError).toBe(true);
+  });
+});

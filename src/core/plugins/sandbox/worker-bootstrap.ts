@@ -2,12 +2,20 @@ import { parentPort } from 'worker_threads';
 import { HostToWorkerMessage, WorkerToHostMessage } from './protocol';
 import { WorkerCapabilityClient, buildSandboxContext } from './worker-capability';
 import { WorkerHookRegistry, WorkerHookHandler, hookConfigStore } from './worker-hooks';
+import { WebhookRegistry, WebhookHandler } from './worker-webhooks';
+import { WorkerSearchRegistry, WorkerSearchHandler } from './worker-search-registry';
 
 /**
- * Worker entry for an untrusted plugin. Loads the plugin module and drives its lifecycle in response
- * to host messages. This is the only code that runs alongside untrusted plugin code, so it keeps no
- * host references — its sole channel out is `parentPort`, and every capability call round-trips to
- * the host (which validates permission + session scope) via the capability client.
+ * Worker entry for a plugin. Loads the plugin module and drives its lifecycle in response to host
+ * messages, exposing the `ctx.*` capability surface, which round-trips every call to the host (which
+ * validates permission + session scope) via the capability client.
+ *
+ * SECURITY MODEL — read before relying on the sandbox: a `worker_thread` shares the host OS process,
+ * filesystem, and network credentials. It provides crash / heap-OOM CONTAINMENT, NOT a security
+ * boundary. Plugin code can `require('fs' | 'net' | 'child_process')` and reach the host's files and
+ * sockets directly — `parentPort` is NOT the worker's only channel out, and the capability permission
+ * model gates only the `ctx.*` verbs, not raw Node access. Load only trusted plugin code, or run
+ * OpenWA under an OS-level sandbox (container / seccomp) when untrusted plugins must be supported.
  */
 
 interface LifecyclePlugin {
@@ -29,6 +37,8 @@ const errorMessage = (error: unknown): string => (error instanceof Error ? error
 
 const capClient = new WorkerCapabilityClient(send);
 const hookRegistry = new WorkerHookRegistry(send);
+const webhookRegistry = new WebhookRegistry(send);
+const searchRegistry = new WorkerSearchRegistry(send);
 
 // ctx.logger proxy: forwards to the host's per-plugin logger (the same one in-process plugins use).
 const logger = {
@@ -57,6 +67,14 @@ port.on('message', (message: HostToWorkerMessage) => {
     void hookRegistry.handleHook(message);
     return;
   }
+  if (message.kind === 'webhook') {
+    void webhookRegistry.handleWebhook(message);
+    return;
+  }
+  if (message.kind === 'search') {
+    void searchRegistry.handleSearch(message);
+    return;
+  }
   void handle(message);
 });
 
@@ -80,6 +98,8 @@ async function handle(message: HostToWorkerMessage): Promise<void> {
         ...buildSandboxContext(capClient),
         registerHook: (event: string, handler: WorkerHookHandler, priority?: number) =>
           hookRegistry.register(event, handler, priority),
+        registerWebhook: (route: string, handler: WebhookHandler) => webhookRegistry.register(route, handler),
+        registerSearchProvider: (handler: WorkerSearchHandler) => searchRegistry.register(handler),
       };
       send({ kind: 'ready' });
     } catch (error) {

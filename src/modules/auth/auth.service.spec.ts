@@ -3,7 +3,7 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { UnauthorizedException, NotFoundException } from '@nestjs/common';
 import { createHash, createHmac } from 'crypto';
-import { AuthService, resolveSeedApiKey } from './auth.service';
+import { AuthService, resolveSeedApiKey, bannerKeyLine } from './auth.service';
 import { ApiKey, ApiKeyRole } from './entities/api-key.entity';
 
 // Helpers
@@ -59,6 +59,25 @@ describe('resolveSeedApiKey (first-boot default admin key)', () => {
     process.env.API_MASTER_KEY = 'master-wins';
     process.env.ALLOW_DEV_API_KEY = 'true';
     expect(resolveSeedApiKey()).toBe('master-wins');
+  });
+});
+
+describe('bannerKeyLine (startup banner key masking)', () => {
+  const FULL = 'owa_k1_0123456789abcdef0123456789abcdef';
+
+  it('prints the full key only when it was just created', () => {
+    expect(bannerKeyLine(FULL, true)).toBe(FULL);
+  });
+
+  it('masks the key on subsequent boots — the full secret is never re-logged', () => {
+    const line = bannerKeyLine(FULL, false);
+    expect(line).not.toContain('0123456789abcdef'); // the secret tail must not appear
+    expect(line.startsWith('owa_k1_0')).toBe(true); // a short fingerprint is fine
+    expect(line).toMatch(/data\/\.api-key|dashboard/); // points the operator to the real source
+  });
+
+  it('passes a placeholder through unchanged', () => {
+    expect(bannerKeyLine('(check dashboard for keys)', false)).toBe('(check dashboard for keys)');
   });
 });
 
@@ -174,6 +193,48 @@ describe('AuthService', () => {
       expect(result.name).toBe('Updated');
       expect(result.role).toBe(ApiKeyRole.OPERATOR); // unchanged
     });
+
+    it('evicts active WebSocket sockets when allowedSessions narrows', async () => {
+      const evictApiKey = jest.fn();
+      jest
+        .spyOn((service as unknown as { moduleRef: { get: (...a: unknown[]) => unknown } }).moduleRef, 'get')
+        .mockReturnValue({ evictApiKey });
+      const key = createMockApiKey({ allowedSessions: ['sess-A', 'sess-B'] });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.save as jest.Mock).mockImplementation(k => Promise.resolve(k));
+
+      await service.update('uuid-1', { allowedSessions: ['sess-A'] });
+
+      expect(evictApiKey).toHaveBeenCalledWith('uuid-1', 'authorization_changed');
+    });
+
+    it('evicts active WebSocket sockets when the role changes', async () => {
+      const evictApiKey = jest.fn();
+      jest
+        .spyOn((service as unknown as { moduleRef: { get: (...a: unknown[]) => unknown } }).moduleRef, 'get')
+        .mockReturnValue({ evictApiKey });
+      const key = createMockApiKey({ role: ApiKeyRole.OPERATOR });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.save as jest.Mock).mockImplementation(k => Promise.resolve(k));
+
+      await service.update('uuid-1', { role: ApiKeyRole.ADMIN });
+
+      expect(evictApiKey).toHaveBeenCalledWith('uuid-1', 'authorization_changed');
+    });
+
+    it('does not evict on a benign (name-only) update', async () => {
+      const evictApiKey = jest.fn();
+      jest
+        .spyOn((service as unknown as { moduleRef: { get: (...a: unknown[]) => unknown } }).moduleRef, 'get')
+        .mockReturnValue({ evictApiKey });
+      const key = createMockApiKey({ name: 'original' });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.save as jest.Mock).mockImplementation(k => Promise.resolve(k));
+
+      await service.update('uuid-1', { name: 'renamed' });
+
+      expect(evictApiKey).not.toHaveBeenCalled();
+    });
   });
 
   // ── delete / revoke ───────────────────────────────────────────────
@@ -194,6 +255,22 @@ describe('AuthService', () => {
 
       await expect(service.delete('nonexistent')).rejects.toThrow(NotFoundException);
     });
+
+    it('evicts active WebSocket sockets authenticated with the deleted key', async () => {
+      const evictApiKey = jest.fn();
+      jest
+        .spyOn((service as unknown as { moduleRef: { get: (...a: unknown[]) => unknown } }).moduleRef, 'get')
+        .mockReturnValue({ evictApiKey });
+
+      const key = createMockApiKey();
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.remove as jest.Mock).mockResolvedValue(key);
+
+      await service.delete('uuid-1');
+
+      expect(repository.remove).toHaveBeenCalledWith(key);
+      expect(evictApiKey).toHaveBeenCalledWith('uuid-1', 'deleted');
+    });
   });
 
   describe('revoke', () => {
@@ -205,6 +282,38 @@ describe('AuthService', () => {
       const result = await service.revoke('uuid-1');
 
       expect(result.isActive).toBe(false);
+    });
+
+    it('evicts active WebSocket sockets authenticated with the revoked key', async () => {
+      const evictApiKey = jest.fn();
+      jest
+        .spyOn((service as unknown as { moduleRef: { get: (...a: unknown[]) => unknown } }).moduleRef, 'get')
+        .mockReturnValue({ evictApiKey });
+
+      const key = createMockApiKey({ isActive: true });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.save as jest.Mock).mockImplementation(k => Promise.resolve(k));
+
+      await service.revoke('uuid-1');
+
+      expect(key.isActive).toBe(false);
+      expect(evictApiKey).toHaveBeenCalledWith('uuid-1', 'revoked');
+    });
+
+    it('does not roll back the revoke if WebSocket eviction throws (best-effort)', async () => {
+      jest
+        .spyOn((service as unknown as { moduleRef: { get: (...a: unknown[]) => unknown } }).moduleRef, 'get')
+        .mockImplementation(() => {
+          throw new Error('gateway unavailable');
+        });
+
+      const key = createMockApiKey({ isActive: true });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.save as jest.Mock).mockImplementation(k => Promise.resolve(k));
+
+      const result = await service.revoke('uuid-1');
+
+      expect(result.isActive).toBe(false); // revoke still succeeded
     });
   });
 
@@ -303,6 +412,18 @@ describe('AuthService', () => {
       (repository.findOne as jest.Mock).mockResolvedValue(key);
 
       await expect(service.validateApiKey('ip-no-client')).rejects.toThrow('Client IP could not be determined');
+    });
+
+    it('rejects a malformed client IP instead of coercing it into an allowed range', async () => {
+      const key = createMockApiKey({
+        allowedIps: ['10.0.0.1/32'],
+        keyHash: hashKey('ip-malformed'),
+      });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+
+      // The previous lenient parser read '10.0.0.1abc' as 10.0.0.1 and let it through; the shared
+      // hardened matcher rejects a non-numeric octet, so the per-key whitelist holds.
+      await expect(service.validateApiKey('ip-malformed', '10.0.0.1abc')).rejects.toThrow('IP address not allowed');
     });
 
     it('should throw UnauthorizedException when session not in allowedSessions', async () => {
