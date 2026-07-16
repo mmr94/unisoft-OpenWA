@@ -1,4 +1,5 @@
-import { lazy, Suspense } from 'react';
+import { Suspense } from 'react';
+import { lazyWithRetry as lazy } from '../utils/lazyWithRetry';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { MessageSquare, Send, Webhook, Activity, ArrowUpRight, ArrowDownRight, Loader2 } from 'lucide-react';
@@ -84,7 +85,7 @@ export function Dashboard() {
   if (error) {
     return (
       <div className="dashboard" style={{ padding: '2rem' }}>
-        <div style={{ background: '#FEE2E2', padding: '1rem', borderRadius: '8px', color: '#DC2626' }}>
+        <div style={{ background: 'rgba(239, 68, 68, 0.12)', padding: '1rem', borderRadius: '8px', color: 'var(--error)' }}>
           {t('dashboard.errorPrefix', { message: error })}
         </div>
       </div>
@@ -106,7 +107,6 @@ export function Dashboard() {
       <div className="stats-grid">
         {statsCards.map(({ label, value, icon: Icon, trend, trendUp }) => (
           <div key={label} className="stat-card">
-            <Icon className="stat-watermark" />
             <div className="stat-header">
               <span className="stat-label">{label}</span>
               <Icon size={20} className="stat-icon" />

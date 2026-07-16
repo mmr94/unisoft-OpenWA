@@ -29,6 +29,10 @@ interface S3Config {
 const DEFAULT_IMPORT_MAX_BYTES = 200 * 1024 * 1024;
 /** Max number of entries an import archive may contain. Bounds an entry-count DoS. */
 const DEFAULT_IMPORT_MAX_ENTRIES = 100_000;
+/** Max number of local files a single traversal enumerates. Bounds a count DoS on a huge media dir. */
+const DEFAULT_LIST_MAX_FILES = 100_000;
+/** Max directory depth a local traversal descends. Prevents a pathological tree from running unbounded. */
+const LOCAL_TRAVERSAL_MAX_DEPTH = 20;
 
 function positiveIntFromEnv(name: string, fallback: number): number {
   const parsed = Number.parseInt(process.env[name] ?? '', 10);
@@ -59,15 +63,19 @@ export class StorageService {
       const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY || process.env.S3_SECRET_KEY || s3Config.secretAccessKey;
       const region = process.env.S3_REGION || s3Config.region || 'us-east-1';
 
-      if (endpoint && accessKeyId && secretAccessKey) {
+      // Standard AWS S3 needs only credentials + region — the SDK derives the regional endpoint, and
+      // an `endpoint` is only required for S3-compatible stores (MinIO, R2, …). Requiring it dropped
+      // valid AWS configs to a silent local fallback (#735). forcePathStyle is likewise a path-style
+      // concern (MinIO/etc.); AWS S3 uses virtual-hosted addressing — so tie both to the endpoint.
+      if (accessKeyId && secretAccessKey) {
         this.s3Client = new S3Client({
-          endpoint,
+          ...(endpoint ? { endpoint } : {}),
           region,
           credentials: {
             accessKeyId,
             secretAccessKey,
           },
-          forcePathStyle: true, // Required for MinIO
+          ...(endpoint ? { forcePathStyle: true } : {}), // Required for path-style stores (MinIO)
         });
         this.s3Bucket = process.env.S3_BUCKET || s3Config.bucket || 'openwa';
         void this.initializeS3Bucket();
@@ -113,6 +121,39 @@ export class StorageService {
   }
 
   isS3Available(): boolean {
+    return this.s3Available;
+  }
+
+  private lastS3Check = 0;
+  private s3CheckInFlight: Promise<void> | null = null;
+
+  /**
+   * Re-probe S3/MinIO reachability when it's currently marked unavailable — e.g. a bundled MinIO that
+   * came up AFTER the app booted (the init HeadBucket raced and latched false). Throttled (10s) and
+   * in-flight-deduped so the status endpoint can call it on every poll cheaply. Once available it
+   * stays available (no need to re-probe a healthy backend here).
+   */
+  async refreshS3Availability(): Promise<boolean> {
+    if (this.storageType !== 's3' || !this.s3Client || this.s3Available) return this.s3Available;
+    if (this.s3CheckInFlight) {
+      await this.s3CheckInFlight;
+      return this.s3Available;
+    }
+    const now = Date.now();
+    if (now - this.lastS3Check < 10_000) return this.s3Available;
+    this.lastS3Check = now;
+    this.s3CheckInFlight = (async () => {
+      try {
+        await this.s3Client!.send(new HeadBucketCommand({ Bucket: this.s3Bucket }));
+        this.s3Available = true;
+        this.logger.log(`S3 bucket '${this.s3Bucket}' is now reachable`);
+      } catch {
+        // still unreachable — leave s3Available false; a later poll retries after the throttle window
+      } finally {
+        this.s3CheckInFlight = null;
+      }
+    })();
+    await this.s3CheckInFlight;
     return this.s3Available;
   }
 
@@ -324,23 +365,38 @@ export class StorageService {
   // Local Storage Operations
   // ============================================================================
 
-  private listLocalFiles(dir = ''): string[] {
-    const fullPath = path.join(this.localPath, dir);
+  /**
+   * Enumerate local files under the storage root. Async + iterative (a work queue, not recursion)
+   * so a deep/wide media tree can't block the event loop or stack-overflow. Bounded by a max file
+   * count and a max directory depth; a tree exceeding either is truncated rather than enumerated in
+   * full (these are defense-in-depth caps — a healthy media store stays well under both).
+   */
+  private async listLocalFiles(): Promise<string[]> {
+    const maxFiles = positiveIntFromEnv('STORAGE_LIST_MAX_FILES', DEFAULT_LIST_MAX_FILES);
     const files: string[] = [];
+    // Iterative BFS: a queue of [relativeDir, depth] avoids unbounded call-stack growth.
+    const queue: Array<{ dir: string; depth: number }> = [{ dir: '', depth: 0 }];
 
-    if (!fs.existsSync(fullPath)) {
-      return files;
-    }
+    while (queue.length > 0) {
+      const { dir, depth } = queue.shift()!;
+      if (depth >= LOCAL_TRAVERSAL_MAX_DEPTH) continue;
 
-    const entries = fs.readdirSync(fullPath, { withFileTypes: true });
+      const fullPath = path.join(this.localPath, dir);
+      let entries: fs.Dirent[];
+      try {
+        entries = await fs.promises.readdir(fullPath, { withFileTypes: true });
+      } catch {
+        continue; // dir vanished or unreadable — skip rather than abort the whole traversal
+      }
 
-    for (const entry of entries) {
-      const relativePath = dir ? path.join(dir, entry.name) : entry.name;
-
-      if (entry.isDirectory()) {
-        files.push(...this.listLocalFiles(relativePath));
-      } else if (entry.isFile()) {
-        files.push(relativePath);
+      for (const entry of entries) {
+        const relativePath = dir ? path.join(dir, entry.name) : entry.name;
+        if (entry.isDirectory()) {
+          queue.push({ dir: relativePath, depth: depth + 1 });
+        } else if (entry.isFile()) {
+          files.push(relativePath);
+          if (files.length >= maxFiles) return files; // cap reached — stop early
+        }
       }
     }
 

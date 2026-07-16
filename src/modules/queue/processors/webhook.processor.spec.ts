@@ -3,6 +3,7 @@ import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { WebhookProcessor } from './webhook.processor';
 import { Webhook } from '../../webhook/entities/webhook.entity';
+import { WebhookDeliveryFailure } from '../../webhook/entities/webhook-delivery-failure.entity';
 import { HookManager } from '../../../core/hooks';
 import { WebhookJobData } from '../../webhook/webhook.service';
 import { fetch as undiciFetch } from 'undici';
@@ -21,6 +22,7 @@ jest.mock('undici', () => {
 describe('WebhookProcessor', () => {
   let processor: WebhookProcessor;
   let repo: { update: jest.Mock };
+  let failureRepo: { insert: jest.Mock };
   let hookManager: { execute: jest.Mock };
   let configService: { get: jest.Mock };
   let mockFetch: jest.Mock;
@@ -42,7 +44,6 @@ describe('WebhookProcessor', () => {
           deliveryId: 'd',
           data: {},
         },
-        signature: '',
         headers: { 'Content-Type': 'application/json' },
         attempt: 1,
         maxRetries: 3,
@@ -52,10 +53,12 @@ describe('WebhookProcessor', () => {
 
   beforeEach(() => {
     repo = { update: jest.fn().mockResolvedValue({ affected: 1 }) };
+    failureRepo = { insert: jest.fn().mockResolvedValue({}) };
     hookManager = { execute: jest.fn().mockResolvedValue({ continue: true, data: {} }) };
     configService = { get: jest.fn((key: string, def?: unknown) => (key === 'webhook.timeout' ? 25000 : def)) };
     processor = new WebhookProcessor(
       repo as unknown as Repository<Webhook>,
+      failureRepo as unknown as Repository<WebhookDeliveryFailure>,
       hookManager as unknown as HookManager,
       configService as unknown as ConfigService,
     );
@@ -118,6 +121,33 @@ describe('WebhookProcessor', () => {
     expect(hookManager.execute).toHaveBeenCalledWith('webhook:error', expect.anything(), expect.anything());
   });
 
+  it('persists a durable delivery-failure record on the final attempt (with parsed HTTP status)', async () => {
+    mockFetch.mockResolvedValue({ ok: false, status: 503, statusText: 'Service Unavailable' });
+
+    await expect(
+      processor.process(makeJob({ maxRetries: 3, webhookId: 'wh-x', url: 'https://8.8.8.8/h' }, 2)),
+    ).rejects.toThrow();
+
+    expect(failureRepo.insert).toHaveBeenCalledTimes(1);
+    expect(failureRepo.insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        webhookId: 'wh-x',
+        url: 'https://8.8.8.8/h',
+        sessionId: 'sess-1',
+        attempts: 3,
+        lastStatusCode: 503,
+        lastError: 'HTTP 503: Service Unavailable',
+      }),
+    );
+  });
+
+  it('does NOT persist a delivery-failure record before the final attempt', async () => {
+    mockFetch.mockResolvedValue({ ok: false, status: 500, statusText: 'Server Error' });
+
+    await expect(processor.process(makeJob({ maxRetries: 3 }, 0))).rejects.toThrow();
+    expect(failureRepo.insert).not.toHaveBeenCalled();
+  });
+
   it('refuses to follow a redirect when SSRF protection is on', async () => {
     process.env.WEBHOOK_SSRF_PROTECT = 'true';
     mockFetch.mockResolvedValue({ ok: false, status: 0, type: 'opaqueredirect' });
@@ -125,5 +155,27 @@ describe('WebhookProcessor', () => {
     await expect(processor.process(makeJob({ maxRetries: 1 }, 0))).rejects.toThrow();
     expect(mockFetch).toHaveBeenCalledWith('https://8.8.8.8/hook', expect.objectContaining({ redirect: 'manual' }));
     expect(repo.update).not.toHaveBeenCalled(); // never treated as delivered
+  });
+
+  // A literal link-local IP triggers the SSRF guard synchronously before any fetch/DNS, so this is
+  // fully offline. The webhook:error hook payload and the durable DLQ row must both carry the generic
+  // message — the resolved internal IP is a recon oracle. The server-side logger.error keeps full detail.
+  it('redacts the resolved internal IP from the webhook:error payload and DLQ row on an SSRF block', async () => {
+    process.env.WEBHOOK_SSRF_PROTECT = 'true';
+    // final attempt (attemptsMade=0, maxRetries=1 → 1 >= 1) so the hook + DLQ fire
+    await expect(processor.process(makeJob({ url: 'https://169.254.169.254/h', maxRetries: 1 }, 0))).rejects.toThrow();
+
+    expect(mockFetch).not.toHaveBeenCalled(); // blocked before any network
+
+    const hookCalls = hookManager.execute.mock.calls as unknown as Array<[string, { error: string }, unknown]>;
+    const errorHookCall = hookCalls.find(c => c[0] === 'webhook:error');
+    expect(errorHookCall).toBeDefined();
+    expect(errorHookCall![1].error).toBe('Destination address is not allowed');
+    expect(errorHookCall![1].error).not.toMatch(/169\.254\.169\.254/);
+
+    expect(failureRepo.insert).toHaveBeenCalledTimes(1);
+    const inserted = (failureRepo.insert.mock.calls[0] as unknown[])[0] as { lastError: string };
+    expect(inserted.lastError).toBe('Destination address is not allowed');
+    expect(inserted.lastError).not.toMatch(/169\.254\.169\.254/);
   });
 });

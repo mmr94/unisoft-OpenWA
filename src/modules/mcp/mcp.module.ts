@@ -2,14 +2,13 @@ import { type DynamicModule, Module, type MiddlewareConsumer, type NestModule } 
 import { HttpAdapterHost } from '@nestjs/core';
 import { ToolRegistryService } from '../../core/agent-tools/tool-registry.service';
 import { AuthService } from '../auth/auth.service';
-import { KeyRateLimiter } from './mcp-rate-limit';
+import { AuditService } from '../audit/audit.service';
+import { KeyRateLimiter, readRateLimitConfig, readIpRateLimitConfig } from './mcp-rate-limit';
 import { mountMcpServer } from './mcp.server';
 
 export interface McpModuleOptions {
   basePath?: string;
   serverInfo?: { name: string; version: string };
-  rateLimitMax?: number;
-  rateLimitWindowMs?: number;
 }
 
 // Module-level options store: set by forRoot(), read by configure().
@@ -22,6 +21,8 @@ export class McpModule implements NestModule {
     private readonly registry: ToolRegistryService,
     private readonly authService: AuthService,
     private readonly httpAdapterHost: HttpAdapterHost,
+    // AuditModule is @Global(), so AuditService is injectable here without an explicit import.
+    private readonly auditService: AuditService,
   ) {}
 
   static forRoot(options: McpModuleOptions = {}): DynamicModule {
@@ -40,8 +41,19 @@ export class McpModule implements NestModule {
     if (!httpAdapter) {
       throw new Error('McpModule: HttpAdapterHost.httpAdapter is not available.');
     }
-    const { rateLimitMax, rateLimitWindowMs, basePath, serverInfo } = _moduleOptions;
-    const rateLimiter = new KeyRateLimiter(rateLimitMax, rateLimitWindowMs);
-    mountMcpServer(httpAdapter, this.registry, this.authService, rateLimiter, { basePath, serverInfo });
+    const { basePath, serverInfo } = _moduleOptions;
+    const { max, windowMs } = readRateLimitConfig();
+    const rateLimiter = new KeyRateLimiter(max, windowMs);
+    const ipCfg = readIpRateLimitConfig();
+    const ipRateLimiter = new KeyRateLimiter(ipCfg.max, ipCfg.windowMs);
+    mountMcpServer(
+      httpAdapter,
+      this.registry,
+      this.authService,
+      rateLimiter,
+      ipRateLimiter,
+      { basePath, serverInfo },
+      this.auditService,
+    );
   }
 }

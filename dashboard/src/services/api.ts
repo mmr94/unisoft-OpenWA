@@ -1,6 +1,8 @@
 // API Service Layer for OpenWA Dashboard
 // Centralized API client with TypeScript types
 
+import { warnIfInsecureHttpUrl } from '../utils/urlSecurity';
+
 // Resolve the API base URL. By default this is the same-origin relative path '/api',
 // correct when the dashboard and API are served from the same origin (the default
 // single-container setup). For a split-origin deployment (dashboard hosted separately
@@ -10,7 +12,11 @@
 // same-origin '/api' and a split deployment failed with "Invalid API Key" (#91).
 // Exported so direct fetches (e.g. auth/validate in Login.tsx / App.tsx) honor VITE_API_URL
 // too — otherwise split-origin deployments break. Empty VITE_API_URL → '/api'.
-export const API_BASE_URL = `${(import.meta.env.VITE_API_URL ?? '').replace(/\/+$/, '')}/api`;
+const API_ORIGIN = (import.meta.env.VITE_API_URL ?? '').replace(/\/+$/, '');
+export const API_BASE_URL = `${API_ORIGIN}/api`;
+// Warn (not refuse — would break dev + TLS-terminating-proxy) when the API origin is an
+// insecure http:// URL pointing at a non-localhost host (API keys sent in cleartext).
+if (API_ORIGIN) warnIfInsecureHttpUrl(API_ORIGIN, 'VITE_API_URL');
 
 // =============================================================================
 // Types
@@ -140,7 +146,10 @@ export const MESSAGE_TYPES = [
   'sticker',
   'location',
   'contact',
+  'poll',
+  'call',
   'revoked',
+  'masked',
   'unknown',
 ] as const;
 export type MessageType = (typeof MESSAGE_TYPES)[number];
@@ -163,9 +172,10 @@ export interface ChatMessage {
   timestamp?: number;
   createdAt: string;
   metadata?: {
-    media?: { mimetype: string; filename?: string; data?: string };
+    media?: { mimetype: string; filename?: string; data?: string; omitted?: boolean; sizeBytes?: number };
     quotedMessage?: { id: string; body: string };
     reactions?: Record<string, string>;
+    call?: { video: boolean; missed: boolean };
   };
 }
 
@@ -204,15 +214,23 @@ export interface HealthStatus {
 }
 
 export interface InfraStatus {
-  database: { connected: boolean; type: string; host: string };
-  redis: { connected: boolean; host: string; port: number };
+  // `builtIn` = OpenWA's own bundled container is actually running and backing this service (live),
+  // not just the saved intent — falls back to the saved flag when Docker is unavailable. (#488)
+  database: { connected: boolean; type: string; host: string; builtIn: boolean };
+  redis: { enabled: boolean; connected: boolean; host: string; port: number; builtIn: boolean };
   queue: {
     enabled: boolean;
-    messages: { pending: number; completed: number; failed: number };
     webhooks: { pending: number; completed: number; failed: number };
   };
-  storage: { type: 'local' | 's3'; path?: string; bucket?: string };
-  engine: { type: string; headless: boolean };
+  storage: { type: 'local' | 's3'; path?: string; bucket?: string; builtIn: boolean; s3Available?: boolean };
+  engine: {
+    type: string;
+    headless: boolean;
+    // whatsapp-web.js only: the actual WhatsApp Web build in use (distinct from the library version)
+    // and how it was chosen. (#488)
+    webVersion?: string | null;
+    webVersionSource?: 'pinned' | 'auto' | 'native';
+  };
 }
 
 // Saved infrastructure config (from data/.env.generated) used to hydrate the form.
@@ -225,6 +243,7 @@ export interface SavedConfig {
     port: string;
     username: string;
     database: string;
+    schema: string;
     poolSize: number;
     sslEnabled: boolean;
     sslRejectUnauthorized: boolean;
@@ -253,6 +272,7 @@ export interface SaveConfigPayload {
     username?: string;
     password?: string;
     database?: string;
+    schema?: string;
     poolSize?: number;
     sslEnabled?: boolean;
     sslRejectUnauthorized?: boolean;
@@ -289,6 +309,47 @@ export interface Settings {
   general: { apiBaseUrl: string; sessionTimeout: number; autoReconnect: boolean; debugMode: boolean };
   api: { rateLimit: number; rateLimitWindow: number; enableDocs: boolean };
   notifications: { emailEnabled: boolean; notificationEmail: string; webhookAlerts: boolean };
+}
+
+// Global message search (mirrors the backend GET /search contract from #664).
+// `timestamp` is epoch-seconds (the messages column is seconds, not ms); `dateFrom`/`dateTo`
+// are epoch-ms on the wire — see `dateFrom`/`dateTo` JSDoc below.
+export interface SearchParams {
+  q: string;
+  sessionId?: string;
+  chatId?: string;
+  direction?: string;
+  type?: string;
+  from?: string;
+  /** Epoch-ms lower bound (inclusive) — the backend binds against messages.timestamp (/1000). */
+  dateFrom?: number;
+  /** Epoch-ms upper bound (inclusive). */
+  dateTo?: number;
+  limit?: number;
+  offset?: number;
+}
+
+export interface SearchHit {
+  messageId: string;
+  waMessageId: string;
+  sessionId: string;
+  chatId: string;
+  body: string;
+  /** Provider-generated excerpt with `<mark>` highlight markers — render as text, never as HTML. */
+  snippet: string;
+  /** Epoch-seconds (mirrors the persisted messages.timestamp column). */
+  timestamp: number;
+  type: string;
+  direction: string;
+  from: string;
+  score?: number;
+}
+
+export interface SearchResults {
+  hits: SearchHit[];
+  total: number;
+  tookMs: number;
+  provider: string;
 }
 
 // =============================================================================
@@ -328,7 +389,11 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     // rather than statusText: the status code is what the toast connection-lost de-dup matches on,
     // and statusText is empty over HTTP/2 anyway.
     const error = await response.json().catch(() => ({}));
-    throw new Error(error.message || `HTTP ${response.status}`);
+    // Carry the HTTP status on the Error (message unchanged, so the toast de-dup still matches) so
+    // callers can tell apart a permission 403 from a real server 5xx instead of guessing from text.
+    const err = new Error(error.message || `HTTP ${response.status}`) as Error & { status?: number };
+    err.status = response.status;
+    throw err;
   }
 
   if (response.status === 204) {
@@ -378,6 +443,11 @@ export const sessionApi = {
   stop: (id: string) => request<Session>(`/sessions/${id}/stop`, { method: 'POST' }),
   forceKill: (id: string) => request<Session>(`/sessions/${id}/force-kill`, { method: 'POST' }),
   getQR: (id: string) => request<{ qrCode: string; status: string }>(`/sessions/${id}/qr`),
+  requestPairingCode: (id: string, phoneNumber: string) =>
+    request<{ pairingCode: string; status: string }>(`/sessions/${id}/pairing-code`, {
+      method: 'POST',
+      body: JSON.stringify({ phoneNumber }),
+    }),
   getStats: () => request<SessionStats>('/sessions/stats/overview'),
   getGroups: (id: string) =>
     request<{ id: string; name: string; linkedParentJID?: string | null }[]>(`/sessions/${id}/groups`),
@@ -580,6 +650,20 @@ export const messageApi = {
 };
 
 // =============================================================================
+// Search API
+// =============================================================================
+
+export const searchApi = {
+  search: (params: SearchParams) => {
+    const query = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== '') query.set(key, String(value));
+    });
+    return request<SearchResults>(`/search?${query.toString()}`);
+  },
+};
+
+// =============================================================================
 // Health & Infrastructure API
 // =============================================================================
 
@@ -613,6 +697,17 @@ export const infraApi = {
       body: JSON.stringify({ profiles: profiles || [], profilesToRemove: profilesToRemove || [] }),
     }),
   healthCheck: () => request<{ status: string; timestamp: string }>('/infra/health'),
+  // Data migration: export all Data-DB tables (call while still on the OLD database, before switching),
+  // then import after the switch + restart. Used by the DB-switch migration guard so data isn't lost.
+  exportData: () =>
+    request<{ exportedAt: string; dataDbType: string; tables: Record<string, unknown[]>; counts: Record<string, number> }>(
+      '/infra/export-data',
+    ),
+  importData: (tables: Record<string, unknown[]>) =>
+    request<{ imported: boolean; counts?: Record<string, number>; message?: string; warnings?: string[] }>('/infra/import-data', {
+      method: 'POST',
+      body: JSON.stringify({ tables }),
+    }),
 };
 
 // =============================================================================
@@ -673,6 +768,8 @@ export interface Plugin {
   config: Record<string, unknown>;
   builtIn: boolean;
   provides: string[];
+  /** Whether this plugin can host provisioned ingress instances (drives the Instances tab). */
+  ingressCapable: boolean;
   /** Declared config fields, when the plugin exposes a schema (drives the dashboard config form). */
   configSchema?: PluginConfigSchema;
   /** When set, the plugin ships a sandboxed-iframe config editor (preferred over configSchema). */
@@ -767,6 +864,64 @@ export const pluginsApi = {
 };
 
 // =============================================================================
+// Plugin instances API (Integration Fabric provisioning; mirrors src/modules/integration)
+// =============================================================================
+
+export interface IngressUrl {
+  route: string;
+  url: string;
+}
+
+export interface InstanceView {
+  id: string;
+  pluginId: string;
+  instanceId: string;
+  sessionScope: string | null;
+  secret: string; // '***' on reads; plaintext once on create/regenerate
+  verifyToken: string | null;
+  config: Record<string, unknown> | null;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  ingressUrls: IngressUrl[];
+}
+
+export type MintedInstance = InstanceView; // same shape; `secret` carries the plaintext once
+
+export interface CreateInstanceInput {
+  instanceId: string;
+  sessionScope?: string;
+  verifyToken?: string;
+  config?: Record<string, unknown>;
+}
+
+export interface UpdateInstanceInput {
+  enabled?: boolean;
+  sessionScope?: string;
+  config?: Record<string, unknown>;
+}
+
+export const pluginInstancesApi = {
+  list: (pluginId: string) => request<InstanceView[]>(`/integration/plugins/${pluginId}/instances`),
+  create: (pluginId: string, body: CreateInstanceInput) =>
+    request<MintedInstance>(`/integration/plugins/${pluginId}/instances`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  regenerateSecret: (pluginId: string, instanceId: string) =>
+    request<MintedInstance>(`/integration/plugins/${pluginId}/instances/${instanceId}/regenerate-secret`, {
+      method: 'POST',
+    }),
+  update: (pluginId: string, instanceId: string, body: UpdateInstanceInput) =>
+    request<InstanceView>(`/integration/plugins/${pluginId}/instances/${instanceId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+  remove: (pluginId: string, instanceId: string) =>
+    request<void>(`/integration/plugins/${pluginId}/instances/${instanceId}`, { method: 'DELETE' }),
+};
+
+// =============================================================================
 // Statistics API (mirrors src/modules/stats)
 // =============================================================================
 
@@ -787,7 +942,7 @@ export interface MessageStats {
   timeSeries: MessageTimeSeriesPoint[];
   byType: Record<string, number>;
   bySession: Array<{ sessionId: string; name: string; sent: number; received: number }>;
-  topChats: Array<{ chatId: string; messageCount: number }>;
+  topChats: Array<{ chatId: string; chatName?: string | null; messageCount: number }>;
 }
 
 export const statsApi = {

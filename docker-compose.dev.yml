@@ -1,4 +1,4 @@
-# OpenWA - Local smoke / quick-start compose (L22)
+# OpenWA - Local smoke / quick-start compose
 #
 # This builds and runs the PRODUCTION image (same Dockerfile) against a local SQLite DB
 # with a bind-mounted ./data — it is a single-container local smoke test, NOT a
@@ -15,7 +15,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: openwa-api
-    # Container hardening (finding H7) — same posture as production (same Dockerfile/entrypoint).
+    # Container hardening — same posture as production (same Dockerfile/entrypoint).
     security_opt:
       - 'no-new-privileges:true'
     cap_drop:
@@ -29,7 +29,10 @@ services:
     read_only: true
     tmpfs:
       - /tmp
-    pids_limit: 512
+    # Per-container PID ceiling (cgroup pids.max). 2048 fits several whatsapp-web.js sessions, which
+    # each run a multi-process Chromium; Baileys (no Chromium) uses far fewer. A fork-bomb guard, not
+    # an allocation — raising it is free for light containers. Do NOT use -1 (drops the guard). #636
+    pids_limit: ${OPENWA_PIDS_LIMIT:-2048}
     mem_limit: ${OPENWA_MEM_LIMIT:-2g}
     ports:
       # Bind to localhost by default; set BIND_HOST=0.0.0.0 in .env to reach it from another host.
@@ -49,7 +52,7 @@ services:
       - XDG_CACHE_HOME=/tmp/.cache
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - DATABASE_TYPE=${DATABASE_TYPE:-sqlite}
-      - DATABASE_NAME=${DATABASE_NAME:-/app/data/openwa.sqlite}
+      - DATABASE_NAME=${DATABASE_NAME:-}
       - DATABASE_SYNCHRONIZE=${DATABASE_SYNCHRONIZE:-true}
       # Engine. Forwarded empty by default so the dashboard (Infrastructure > Engine) selects the
       # active engine via data/.env.generated (default whatsapp-web.js); main.ts treats a blank

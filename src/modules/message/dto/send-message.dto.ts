@@ -1,5 +1,18 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsString, IsNotEmpty, IsOptional, MaxLength, IsUrl, ValidateIf } from 'class-validator';
+import {
+  IsString,
+  IsNotEmpty,
+  IsOptional,
+  MaxLength,
+  IsUrl,
+  ValidateIf,
+  IsArray,
+  ArrayMaxSize,
+  IsBoolean,
+} from 'class-validator';
+
+const MENTIONS_DESCRIPTION =
+  'WIDs to @mention (e.g. ["62811@c.us"]). The text/caption must also contain the @<number> token.';
 
 export class SendTextMessageDto {
   @ApiProperty({
@@ -19,6 +32,14 @@ export class SendTextMessageDto {
   @IsNotEmpty()
   @MaxLength(4096)
   text: string;
+
+  @ApiPropertyOptional({ description: MENTIONS_DESCRIPTION, example: ['628123456789@c.us'], type: [String] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1024)
+  @IsString({ each: true })
+  @MaxLength(64, { each: true })
+  mentions?: string[];
 }
 
 export class SendMediaMessageDto {
@@ -73,12 +94,44 @@ export class SendMediaMessageDto {
   @IsString()
   @MaxLength(1024)
   caption?: string;
+
+  @ApiPropertyOptional({ description: MENTIONS_DESCRIPTION, example: ['628123456789@c.us'], type: [String] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1024)
+  @IsString({ each: true })
+  @MaxLength(64, { each: true })
+  mentions?: string[];
+}
+
+export class SendAudioMessageDto extends SendMediaMessageDto {
+  @ApiPropertyOptional({
+    description:
+      'Send as a WhatsApp voice note (PTT — mic bubble + waveform). Provide audio/ogg; codecs=opus ' +
+      'bytes for reliable playback; when the mimetype is omitted it defaults to that for voice notes. ' +
+      'Expects a JSON boolean. Default false = plain audio file. Only valid on send-audio.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  ptt?: boolean;
 }
 
 export class MessageResponseDto {
-  @ApiProperty({ example: 'true_628123456789@c.us_3EB0123456789' })
+  @ApiProperty({
+    description:
+      'The message id, assigned when the gateway accepts the message for sending. A 201 here means the ' +
+      'message was handed to the WhatsApp client — it does NOT confirm delivery. WhatsApp does not reject ' +
+      'an unregistered recipient synchronously, so a message to a number that is not on WhatsApp still ' +
+      'returns 201 with a valid messageId but never delivers. To confirm a number is on WhatsApp before ' +
+      'sending, use GET /api/sessions/{sessionId}/contacts/check/{number}; track real delivery via the ' +
+      'message `status` field (sent → delivered → read).',
+    example: 'true_628123456789@c.us_3EB0123456789',
+  })
   messageId: string;
 
-  @ApiProperty({ example: 1706868000 })
+  @ApiProperty({
+    description: 'Unix timestamp (seconds) at which the gateway accepted the message for sending.',
+    example: 1706868000,
+  })
   timestamp: number;
 }

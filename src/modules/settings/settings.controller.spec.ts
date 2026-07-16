@@ -18,17 +18,47 @@ describe('SettingsController', () => {
     expect(settings).toHaveProperty('notifications');
   });
 
+  it('reports enableDocs from the real ENABLE_SWAGGER gate, not a hardcoded true', () => {
+    const prev = process.env.ENABLE_SWAGGER;
+    try {
+      process.env.ENABLE_SWAGGER = 'false';
+      expect(new SettingsController(configStub).get().api.enableDocs).toBe(false);
+      process.env.ENABLE_SWAGGER = 'true';
+      expect(new SettingsController(configStub).get().api.enableDocs).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.ENABLE_SWAGGER;
+      else process.env.ENABLE_SWAGGER = prev;
+    }
+  });
+
+  it('reports apiBaseUrl from BASE_URL when the operator configured one', () => {
+    const prev = process.env.BASE_URL;
+    try {
+      process.env.BASE_URL = 'https://wa.example.com';
+      expect(new SettingsController(configStub).get().general.apiBaseUrl).toBe('https://wa.example.com');
+    } finally {
+      if (prev === undefined) delete process.env.BASE_URL;
+      else process.env.BASE_URL = prev;
+    }
+  });
+
   // The previous PUT mutated an in-memory field and returned 200 'updated' while persisting
   // nothing and applying nothing to the runtime — a false success. Settings are env-derived and
   // read-only at runtime, so the write path must say so (501) rather than fake success.
   it('PUT /settings is read-only and throws 501 instead of a false-success 200', () => {
     const controller = new SettingsController(configStub);
-    expect(() => controller.update({})).toThrow(NotImplementedException);
+    expect(() => controller.update()).toThrow(NotImplementedException);
   });
 
   it('PUT /settings still requires the ADMIN role', () => {
-    const proto = SettingsController.prototype as unknown as Record<string, object>;
+    const proto = SettingsController.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
     const role = new Reflector().get<ApiKeyRole | undefined>(REQUIRED_ROLE_KEY, proto.update);
+    expect(role).toBe(ApiKeyRole.ADMIN);
+  });
+
+  it('GET /settings requires the ADMIN role (env-derived config is not for low-privilege keys)', () => {
+    const proto = SettingsController.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const role = new Reflector().get<ApiKeyRole | undefined>(REQUIRED_ROLE_KEY, proto.get);
     expect(role).toBe(ApiKeyRole.ADMIN);
   });
 });

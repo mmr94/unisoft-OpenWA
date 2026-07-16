@@ -7,6 +7,7 @@ import { MessageStatus } from './entities/message.entity';
 import { SendBulkMessageDto } from './dto/bulk-message.dto';
 import { SessionService } from '../session/session.service';
 import { MessageService } from './message.service';
+import { HookManager } from '../../core/hooks';
 import { SsrfBlockedError } from '../../common/security/ssrf-guard';
 
 /** Regression lock for the terminal-status decision (cancel-clobber + stopOnError overwrite bugs). */
@@ -49,6 +50,14 @@ describe('BulkMessageService.onApplicationBootstrap', () => {
         { provide: getRepositoryToken(MessageBatch, 'data'), useValue: repo },
         { provide: SessionService, useValue: { getEngine: jest.fn() } },
         { provide: MessageService, useValue: { saveOutgoingMessage: jest.fn() } },
+        {
+          provide: HookManager,
+          useValue: {
+            execute: jest
+              .fn()
+              .mockImplementation((_e: string, d: unknown) => Promise.resolve({ continue: true, data: d })),
+          },
+        },
       ],
     }).compile();
     service = module.get<BulkMessageService>(BulkMessageService);
@@ -92,8 +101,19 @@ describe('BulkMessageService.processBatch', () => {
   let service: BulkMessageService;
   let repo: { findOne: jest.Mock; save: jest.Mock };
   let messageService: { saveOutgoingMessage: jest.Mock };
-  let engine: { sendTextMessage: jest.Mock };
-  let sessionService: { getEngine: jest.Mock; ensureEngineReady: jest.Mock; markActivity: jest.Mock; findOne: jest.Mock };
+  let engine: {
+    sendTextMessage: jest.Mock;
+    sendImageMessage?: jest.Mock;
+    sendVideoMessage?: jest.Mock;
+    sendAudioMessage?: jest.Mock;
+  };
+  let sessionService: {
+    getEngine: jest.Mock;
+    ensureEngineReady: jest.Mock;
+    markActivity: jest.Mock;
+    findOne: jest.Mock;
+  };
+  let hookManager: { execute: jest.Mock };
 
   const makeBatch = (messageCount: number): MessageBatch =>
     ({
@@ -121,6 +141,9 @@ describe('BulkMessageService.processBatch', () => {
       findOne: jest.fn().mockResolvedValue({ phone: '628' }),
     };
     messageService = { saveOutgoingMessage: jest.fn().mockResolvedValue(undefined) };
+    hookManager = {
+      execute: jest.fn().mockImplementation((_e: string, data: unknown) => Promise.resolve({ continue: true, data })),
+    };
     repo = { findOne: jest.fn(), save: jest.fn().mockImplementation(b => Promise.resolve(b)) };
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -128,6 +151,7 @@ describe('BulkMessageService.processBatch', () => {
         { provide: getRepositoryToken(MessageBatch, 'data'), useValue: repo },
         { provide: SessionService, useValue: sessionService },
         { provide: MessageService, useValue: messageService },
+        { provide: HookManager, useValue: hookManager },
       ],
     }).compile();
     service = module.get<BulkMessageService>(BulkMessageService);
@@ -135,6 +159,42 @@ describe('BulkMessageService.processBatch', () => {
 
   const runProcessBatch = (): Promise<void> =>
     (service as unknown as { processBatch: (id: string) => Promise<void> }).processBatch('b1');
+
+  const inFlightMarkers = (): Map<string, boolean> =>
+    (service as unknown as { processingBatches: Map<string, boolean> }).processingBatches;
+
+  it('rejects a new batch (before persisting) when the concurrent in-flight cap is reached', async () => {
+    const prev = process.env.BULK_MAX_CONCURRENT_BATCHES;
+    process.env.BULK_MAX_CONCURRENT_BATCHES = '2';
+    try {
+      repo.findOne.mockResolvedValue(null); // batchId not taken
+      (service as unknown as { inFlightBatches: number }).inFlightBatches = 2; // at cap
+      const dto = { messages: [{ chatId: 'c@c.us', type: 'text', content: { text: 'hi' } }] };
+      await expect(service.createBatch('s1', dto as never)).rejects.toThrow(/too many bulk batches/i);
+      expect(repo.save).not.toHaveBeenCalled(); // rejected before a PENDING row is written
+    } finally {
+      if (prev === undefined) delete process.env.BULK_MAX_CONCURRENT_BATCHES;
+      else process.env.BULK_MAX_CONCURRENT_BATCHES = prev;
+    }
+  });
+
+  it('releases the in-flight marker when the engine is missing (no processingBatches leak)', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(1));
+    sessionService.getEngine.mockReturnValue(undefined); // engine-not-found → early-return path
+
+    await runProcessBatch();
+
+    expect(inFlightMarkers().has('b1')).toBe(false);
+  });
+
+  it('releases the in-flight marker when processing throws (no processingBatches leak)', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(1));
+    repo.save.mockRejectedValueOnce(new Error('db down')); // the first save (→ PROCESSING) throws
+
+    await runProcessBatch().catch(() => undefined);
+
+    expect(inFlightMarkers().has('b1')).toBe(false);
+  });
 
   it('persists every sent message so it appears in chat history / stats', async () => {
     repo.findOne.mockResolvedValue(makeBatch(1));
@@ -150,6 +210,120 @@ describe('BulkMessageService.processBatch', () => {
         status: MessageStatus.SENT,
       }),
     );
+  });
+
+  it('runs the message:sending gate for each bulk message (bulk no longer bypasses moderation)', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(1));
+
+    await runProcessBatch();
+
+    expect(hookManager.execute).toHaveBeenCalledWith(
+      'message:sending',
+      expect.objectContaining({ type: 'text', sessionId: 's1' }),
+      expect.objectContaining({ source: 'BulkMessageService' }),
+    );
+    expect(engine.sendTextMessage).toHaveBeenCalledWith('c0@c.us', 'hi');
+  });
+
+  it('fails just the plugin-blocked message (continue:false) without calling the engine for it', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(1));
+    hookManager.execute.mockResolvedValueOnce({ continue: false, data: {} }); // block message 0
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).not.toHaveBeenCalled();
+  });
+
+  it('fires message:failed when a bulk send fails (bulk failures were previously invisible to plugins)', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(1));
+    engine.sendTextMessage.mockRejectedValueOnce(new Error('boom'));
+
+    await runProcessBatch();
+
+    expect(hookManager.execute).toHaveBeenCalledWith(
+      'message:failed',
+      expect.objectContaining({ type: 'text', error: 'boom' }),
+      expect.objectContaining({ source: 'BulkMessageService' }),
+    );
+  });
+
+  it('does NOT fire message:failed when the gate blocks a bulk item (a block is a moderation decision, not a delivery failure)', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(1));
+    hookManager.execute.mockResolvedValueOnce({ continue: false, data: {} }); // block message 0
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).not.toHaveBeenCalled();
+    // A moderation block must not be reported as a delivery failure — matches single send, where a
+    // block is a 400 with no message:failed.
+    expect(hookManager.execute).not.toHaveBeenCalledWith('message:failed', expect.anything(), expect.anything());
+  });
+
+  it('sends a bulk audio item with ptt as a voice note and persists type "voice"', async () => {
+    engine.sendAudioMessage = jest.fn().mockResolvedValue({ id: 'wa2', timestamp: 222 });
+    const batch = {
+      id: 'b1',
+      batchId: 'bx',
+      sessionId: 's1',
+      status: BatchStatus.PENDING,
+      currentIndex: 0,
+      messages: [{ chatId: 'c0@c.us', type: 'audio', content: { audio: { url: 'https://x/v', ptt: true } } }],
+      options: { delayBetweenMessages: 0, randomizeDelay: false, stopOnError: false },
+      progress: { total: 1, sent: 0, failed: 0, pending: 1, cancelled: 0 },
+      results: [],
+    } as unknown as MessageBatch;
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    expect(engine.sendAudioMessage).toHaveBeenCalledWith(
+      'c0@c.us',
+      expect.objectContaining({ ptt: true, mimetype: 'audio/ogg; codecs=opus' }),
+    );
+    expect(messageService.saveOutgoingMessage).toHaveBeenCalledWith('s1', expect.objectContaining({ type: 'voice' }));
+  });
+
+  it('strips base64 media payloads from the stored batch once it completes (footprint)', async () => {
+    const batch = makeBatch(1);
+    batch.messages = [
+      {
+        chatId: 'c0@c.us',
+        type: 'image',
+        content: { image: { base64: 'QkFTRTY0SU1BR0U=', mimetype: 'image/png', filename: 'p.png' } },
+      },
+    ];
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    // A completed batch is terminal (never resumed), so the persisted message_batches.messages must not
+    // retain the (often multi-MB) base64 — only the descriptive fields are kept.
+    const savedBatch = (repo.save.mock.calls as [MessageBatch][]).at(-1)![0];
+    const img = (savedBatch.messages[0].content as { image?: { base64?: unknown; mimetype?: string } }).image;
+    expect(img?.base64).toBeUndefined();
+    expect(img?.mimetype).toBe('image/png');
+  });
+
+  it('persists the media filename from the chosen media type (image), not just from document', async () => {
+    engine.sendImageMessage = jest.fn().mockResolvedValue({ id: 'waimg', timestamp: 222 });
+    const batch = makeBatch(1);
+    batch.messages = [
+      {
+        chatId: 'c0@c.us',
+        type: 'image',
+        content: { image: { base64: 'QkFTRTY0SU1BR0U=', mimetype: 'image/png', filename: 'p.png' } },
+      },
+    ];
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    const imageSave = (
+      messageService.saveOutgoingMessage.mock.calls as Array<
+        [string, { type: string; metadata?: { media?: { filename?: string } } }]
+      >
+    ).find(([, payload]) => payload.type === 'image');
+    expect(imageSave?.[1].metadata?.media?.filename).toBe('p.png');
   });
 
   it('stops sending when the batch is cancelled in the DB by another instance/restart', async () => {
@@ -200,12 +374,13 @@ describe('BulkMessageService.processBatch', () => {
 
 describe('BulkMessageService.createBatch base64 media cap', () => {
   let service: BulkMessageService;
-  let repo: { findOne: jest.Mock; save: jest.Mock };
+  let repo: { findOne: jest.Mock; save: jest.Mock; create: jest.Mock };
 
   beforeEach(async () => {
     repo = {
       findOne: jest.fn().mockResolvedValue(undefined),
       save: jest.fn().mockImplementation(b => Promise.resolve(b)),
+      create: jest.fn().mockImplementation((b: MessageBatch) => b),
     };
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -220,6 +395,14 @@ describe('BulkMessageService.createBatch base64 media cap', () => {
           },
         },
         { provide: MessageService, useValue: { saveOutgoingMessage: jest.fn() } },
+        {
+          provide: HookManager,
+          useValue: {
+            execute: jest
+              .fn()
+              .mockImplementation((_e: string, d: unknown) => Promise.resolve({ continue: true, data: d })),
+          },
+        },
       ],
     }).compile();
     service = module.get<BulkMessageService>(BulkMessageService);
@@ -243,5 +426,25 @@ describe('BulkMessageService.createBatch base64 media cap', () => {
     } finally {
       delete process.env.MEDIA_DOWNLOAD_MAX_BYTES;
     }
+  });
+
+  it('scopes the batchId uniqueness check to the session (no cross-session collision/oracle)', async () => {
+    // Simulate a DB where batchId 'dup' exists only under session 's1'.
+    repo.findOne.mockImplementation((opts: { where: { batchId?: string; sessionId?: string } }) => {
+      const w = opts.where;
+      const existsForS1 = w.batchId === 'dup' && (w.sessionId === undefined || w.sessionId === 's1');
+      return Promise.resolve(existsForS1 ? { id: 'b1', batchId: 'dup', sessionId: 's1' } : undefined);
+    });
+
+    // A different session reusing the same batchId must succeed — the check is (batchId, sessionId)-scoped,
+    // so it neither collides with another tenant's namespace nor leaks that the id is in use elsewhere.
+    await expect(
+      service.createBatch('s2', {
+        messages: [{ chatId: 'c0@c.us', type: 'text', content: { text: { body: 'hi' } } }],
+        batchId: 'dup',
+      } as unknown as SendBulkMessageDto),
+    ).resolves.toBeDefined();
+
+    expect(repo.findOne).toHaveBeenCalledWith({ where: { batchId: 'dup', sessionId: 's2' } });
   });
 });

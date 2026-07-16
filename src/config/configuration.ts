@@ -1,11 +1,39 @@
+import { computeFeatureFlags } from './feature-flags';
+
 export default () => ({
   port: parseInt(process.env.PORT || '2785', 10),
+
+  // HTTP server timeouts (Node http.Server). Pinned explicitly so they are operator-tunable and
+  // observable at boot rather than left at Node's implicit defaults. requestTimeout defaults to
+  // Node's 300s; keepAliveTimeout to 5s; headersTimeout to 65s (a second above keepAlive — Node
+  // requires headers > keepAlive, and main.ts normalizes it anyway). Set any to 0 at your own risk;
+  // env.validation rejects 0 so a bound is never silently disabled.
+  http: {
+    requestTimeoutMs: parseInt(process.env.REQUEST_TIMEOUT_MS || '300000', 10),
+    headersTimeoutMs: parseInt(process.env.HEADERS_TIMEOUT_MS || '65000', 10),
+    keepAliveTimeoutMs: parseInt(process.env.KEEPALIVE_TIMEOUT_MS || '5000', 10),
+  },
+
+  // Global message search. Opt-out via SEARCH_ENABLED=false. Provider defaults to 'auto' (the
+  // built-in DB full-text provider — Postgres tsvector/GIN, SQLite FTS5); 'none' disables the
+  // /search route + module at runtime while keeping the config namespace loaded.
+  search: {
+    enabled: process.env.SEARCH_ENABLED !== 'false',
+    provider: process.env.SEARCH_PROVIDER || 'auto',
+    limitMax: Number(process.env.SEARCH_LIMIT_MAX) || 100,
+  },
+
+  // Runtime feature flags. Single source of truth: src/config/feature-flags.ts. Exposed here so the
+  // full set is discoverable via ConfigService (`features.*`) instead of scattered process.env reads.
+  features: computeFeatureFlags(),
 
   // Redis configuration
   redis: {
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT || '6379', 10),
+    username: process.env.REDIS_USERNAME,
     password: process.env.REDIS_PASSWORD,
+    connectTimeoutMs: parseInt(process.env.REDIS_CONNECT_TIMEOUT_MS || '5000', 10),
   },
 
   // Queue configuration
@@ -43,6 +71,12 @@ export default () => ({
     // DATABASE_NAME env as the migration CLI (data-source.ts) so the runtime factory and
     // migrations never target different databases. Distinct sqlite-vs-pg defaults.
     name: process.env.DATABASE_NAME || 'openwa',
+    // PostgreSQL schema (used when type is postgres). Default 'public' preserves the historical
+    // behavior; set POSTGRES_SCHEMA to place OpenWA's tables + the TypeORM migration ledger in a
+    // dedicated schema (e.g. a managed-Postgres project schema, or to isolate OpenWA from other
+    // apps sharing the database). The schema must already exist — a missing one fails fast at
+    // migration time rather than silently falling back to public. SQLite ignores this.
+    schema: process.env.POSTGRES_SCHEMA || 'public',
     // PostgreSQL/MySQL connection (used when type is postgres/mysql)
     host: process.env.DATABASE_HOST || 'localhost',
     port: parseInt(process.env.DATABASE_PORT || '5432', 10),
@@ -52,6 +86,11 @@ export default () => ({
     logging: process.env.DATABASE_LOGGING === 'true',
     // Connection pooling (PostgreSQL)
     poolSize: parseInt(process.env.DATABASE_POOL_SIZE || '10', 10),
+    // Pool/query timeouts (PostgreSQL). statement_timeout is server-side per query; idle/connection
+    // are pool-side. Set any to 0 to disable. Applied to the runtime connection only (see app.module).
+    statementTimeoutMs: parseInt(process.env.DATABASE_STATEMENT_TIMEOUT_MS || '30000', 10),
+    idleTimeoutMs: parseInt(process.env.DATABASE_IDLE_TIMEOUT_MS || '30000', 10),
+    connectionTimeoutMs: parseInt(process.env.DATABASE_CONNECTION_TIMEOUT_MS || '10000', 10),
     // SSL configuration
     ssl: process.env.DATABASE_SSL === 'true',
     sslRejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false',
@@ -65,7 +104,11 @@ export default () => ({
       // Accept either delimiter: .env/compose use commas, the dashboard Infrastructure form
       // persists space-separated. Splitting on both keeps each flag a discrete argv token —
       // a single glued token like "--no-sandbox --disable-gpu" silently neuters --no-sandbox.
-      args: (process.env.PUPPETEER_ARGS || '--no-sandbox,--disable-setuid-sandbox').split(/[\s,]+/).filter(Boolean),
+      args: (
+        process.env.PUPPETEER_ARGS || '--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu'
+      )
+        .split(/[\s,]+/)
+        .filter(Boolean),
       // Optional path to a system Chromium/Chrome binary. When unset, whatsapp-web.js
       // uses Puppeteer's bundled Chromium. Required on hosts where the bundled binary
       // is missing or incompatible (Alpine, ARM, custom base images).
@@ -93,11 +136,20 @@ export default () => ({
     wakeTimeoutMs: parseInt(process.env.SESSION_WAKE_TIMEOUT_MS || '45000', 10),
   },
 
+  sessions: {
+    // 0 = unlimited/backwards-compatible. Set to a positive integer to cap concurrently running or
+    // initializing WhatsApp engines, which protects memory/Chromium-constrained deployments.
+    maxConcurrent: parseInt(process.env.MAX_CONCURRENT_SESSIONS || '0', 10),
+  },
+
   // Webhook configuration
   webhook: {
     timeout: parseInt(process.env.WEBHOOK_TIMEOUT || '10000', 10),
     maxRetries: parseInt(process.env.WEBHOOK_MAX_RETRIES || '3', 10),
     retryDelay: parseInt(process.env.WEBHOOK_RETRY_DELAY || '5000', 10),
+    // Cap on how many matching webhooks are delivered CONCURRENTLY for one event. Without it, an event
+    // matching N webhooks opens N outbound sockets at once (no per-event bound). Default 16.
+    dispatchConcurrency: parseInt(process.env.WEBHOOK_DISPATCH_CONCURRENCY || '16', 10),
   },
 
   // API configuration

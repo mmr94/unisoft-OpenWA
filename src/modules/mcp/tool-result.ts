@@ -45,7 +45,12 @@ export function jsonToolResult(data: object, isError = false): CallToolResult {
 export function handleToolError(error: unknown): CallToolResult {
   if (error instanceof HttpException) {
     logger.error(error.message, error.stack);
-    return jsonToolResult({ success: false, name: error.name, message: error.message }, true);
+    const res = error.getResponse();
+    const message =
+      typeof res === 'object' && res !== null && 'message' in res
+        ? (res as Record<string, unknown>)['message']
+        : error.message;
+    return jsonToolResult({ success: false, name: error.name, message }, true);
   }
   if (error instanceof Error) {
     logger.error(error.message, error.stack);

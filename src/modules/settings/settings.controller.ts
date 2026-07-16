@@ -3,6 +3,7 @@ import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { RequireRole } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
+import { isSwaggerEnabled } from '../../config/bootstrap-security';
 
 interface Settings {
   general: {
@@ -34,15 +35,22 @@ export class SettingsController {
 
     this.settings = {
       general: {
-        apiBaseUrl: `http://localhost:${port}`,
+        // The real advertised base URL (BASE_URL — the same value the startup banner and ingress URLs
+        // use), not a hardcoded localhost guess that ignores the operator's configured host.
+        apiBaseUrl: process.env.BASE_URL || `http://localhost:${port}`,
         sessionTimeout: Math.floor(this.configService.get<number>('webhook.timeout', 300000) / 60000),
-        autoReconnect: this.configService.get<boolean>('engine.autoReconnect', false),
+        // The engine auto-reconnects on a transient disconnect by default (there is no global off
+        // switch; reconnection is bounded per-session by RECONNECT_MAX_ATTEMPTS). Reporting a hardcoded
+        // `false` for a non-existent `engine.autoReconnect` key was actively misleading.
+        autoReconnect: true,
         debugMode: this.configService.get<boolean>('database.logging', false),
       },
       api: {
         rateLimit: this.configService.get<number>('api.rateLimit.mediumLimit', 100),
         rateLimitWindow: this.configService.get<number>('api.rateLimit.mediumTtl', 60000),
-        enableDocs: true, // Swagger docs always enabled
+        // Reflect the REAL ENABLE_SWAGGER gate (off by default in production), not a hardcoded `true`
+        // — otherwise the panel reports docs enabled in production where they are actually disabled.
+        enableDocs: isSwaggerEnabled(process.env.ENABLE_SWAGGER, process.env.NODE_ENV),
       },
       notifications: {
         emailEnabled: false,
@@ -53,9 +61,13 @@ export class SettingsController {
   }
 
   @Get()
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get application settings' })
   @ApiResponse({ status: 200, description: 'Current settings' })
   get(): Settings {
+    // Settings expose environment-derived configuration (debug flag, reconnect policy, rate-limit
+    // thresholds, base URL). Gate the read at ADMIN, matching the PUT below and the rest of the
+    // admin-config surface — a VIEWER or session-scoped key has no business reading server config.
     return this.settings;
   }
 

@@ -152,7 +152,8 @@ export function Webhooks() {
         sessionId: newWebhook.sessionId,
         url: newWebhook.url,
         events: newWebhook.events,
-        filters: newWebhook.filters,
+        // Don't persist message-filters when no message events are selected (the filter UI is hidden).
+        filters: supportsFilters(newWebhook.events) ? newWebhook.filters : null,
       });
       setShowCreateModal(false);
       setNewWebhook({ url: '', events: ['message.received'], sessionId: '', filters: null });
@@ -228,7 +229,8 @@ export function Webhooks() {
           url: editWebhook.url,
           events: editWebhook.events,
           active: editWebhook.active,
-          filters: editWebhook.filters ?? null,
+          // Clear message-filters if the edit removed all message events (the filter UI is hidden then).
+          filters: supportsFilters(editWebhook.events) ? (editWebhook.filters ?? null) : null,
         },
       });
       setShowEditModal(false);
@@ -335,16 +337,20 @@ export function Webhooks() {
               />
               <label>{t('webhooks.events')}</label>
               <div className="event-tags">
-                {availableEventNames.map(name => (
-                  <button
-                    key={name}
-                    type="button"
-                    className={`event-tag ${newWebhook.events.includes(name) ? 'selected' : ''}`}
-                    onClick={() => toggleNewEvent(name)}
-                  >
-                    {name}
-                  </button>
-                ))}
+                {availableEventNames.map(name => {
+                  const isSelected = newWebhook.events.includes(name);
+                  return (
+                    <button
+                      key={name}
+                      type="button"
+                      className={`event-tag ${isSelected ? 'selected' : ''}`}
+                      onClick={() => toggleNewEvent(name)}
+                    >
+                      {isSelected && <Check size={12} className="tag-check-icon" />}
+                      {name}
+                    </button>
+                  );
+                })}
               </div>
               {supportsFilters(newWebhook.events) && (
                 <FilterBuilder
@@ -384,16 +390,20 @@ export function Webhooks() {
               />
               <label>{t('webhooks.events')}</label>
               <div className="event-tags">
-                {availableEventNames.map(name => (
-                  <button
-                    key={name}
-                    type="button"
-                    className={`event-tag ${editWebhook.events.includes(name) ? 'selected' : ''}`}
-                    onClick={() => toggleEditEvent(name)}
-                  >
-                    {name}
-                  </button>
-                ))}
+                {availableEventNames.map(name => {
+                  const isSelected = editWebhook.events.includes(name);
+                  return (
+                    <button
+                      key={name}
+                      type="button"
+                      className={`event-tag ${isSelected ? 'selected' : ''}`}
+                      onClick={() => toggleEditEvent(name)}
+                    >
+                      {isSelected && <Check size={12} className="tag-check-icon" />}
+                      {name}
+                    </button>
+                  );
+                })}
               </div>
               {supportsFilters(editWebhook.events) && (
                 <FilterBuilder
