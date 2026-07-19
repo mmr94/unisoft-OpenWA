@@ -373,7 +373,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
       }
 
       if (statusCode === (this.lib?.DisconnectReason.connectionReplaced ?? 440)) {
-        // Another live instance took over this account (whatsmeow StreamReplaced). Reconnecting
+        // Another live instance took over this account. Reconnecting
         // would fight it — two instances endlessly replacing each other — so this is terminal:
         // the operator stops the other instance, then starts this session again (onError = terminal
         // + evict in the session service). Auth state is NOT cleared: the link itself is still valid.
@@ -384,8 +384,21 @@ export class BaileysAdapter implements IWhatsAppEngine {
         return;
       }
 
+      if (statusCode === (this.lib?.DisconnectReason.forbidden ?? 403)) {
+        // The account itself was rejected by WhatsApp (banned/blocked — an authorization-level
+        // refusal that must not be retried). Retrying forever is pointless and risks worsening
+        // the account's standing, so this is terminal like 440. Auth state is NOT cleared (unlike
+        // 401): this is an account-level refusal, not dead credentials — the operator keeps the auth
+        // files for inspection and can retry manually once the account issue is resolved.
+        this.setStatus(EngineStatus.FAILED);
+        this.callbacks.onError?.(
+          'Account rejected by WhatsApp (403) — the number is likely banned or blocked; reconnecting will not help',
+        );
+        return;
+      }
+
       // Every other close (408/411/428/500/503/515/undefined) is transient: reconnect with capped
-      // backoff and NO attempt ceiling (whatsmeow/evolution-api style) — a long network outage must
+      // backoff and NO attempt ceiling — a long network outage must
       // not kill the session. The counter resets on 'open' and via the stability window below.
       // Do NOT fire onDisconnected here; this is a transient drop, not a terminal disconnect.
       // connect() calls setStatus(INITIALIZING) which fires onStateChanged — that is the correct signal.
@@ -411,8 +424,8 @@ export class BaileysAdapter implements IWhatsAppEngine {
   /**
    * Schedule the next reconnect attempt with capped exponential backoff (1 s doubling up to a 60 s
    * cap, plus up to 1 s jitter). Deliberately NO attempt ceiling: transient drops retry forever —
-   * only loggedOut (401) and connectionReplaced (440) are terminal. A connect() failure inside the
-   * attempt is just a failed attempt: warn and schedule the next one.
+   * only loggedOut (401), forbidden (403), and connectionReplaced (440) are terminal. A connect()
+   * failure inside the attempt is just a failed attempt: warn and schedule the next one.
    */
   private scheduleReconnect(): void {
     if (this.intentionalClose || this.reconnectTimer) {
