@@ -31,11 +31,13 @@ flowchart LR
 ```
 
 The styling foundation is **plain CSS** — there is no Tailwind, no shadcn/ui, and no CSS-in-JS.
-Each page and shared component ships its own stylesheet colocated beside the source
+Every page — and most shared components — ships its own stylesheet colocated beside the source
 (`Sessions.tsx` + `Sessions.css`, `Layout.tsx` + `Layout.css`, ...), imported directly by the
-component. Icons come from `lucide-react`; charts from `recharts`; i18n from `react-i18next`.
-Client state is **TanStack Query** for server data (see `src/hooks/queries.ts`) plus a couple of
-small React Context providers (`useRole`, `useTheme`) — there is no Zustand store.
+component (see §17.4 for the handful that carry no stylesheet of their own). Icons come from
+`lucide-react`; charts from `recharts`; i18n from `react-i18next`.
+Client state is **TanStack Query** for server data (see `src/hooks/queries.ts`) plus two small React
+Context providers (`RoleProvider`, `ToastProvider`); theme mode is a provider-less `useTheme` hook
+backed by `localStorage` — there is no Zustand store.
 
 ### Design Principles
 
@@ -83,7 +85,8 @@ a non-admin hitting the path falls through to the `*` redirect.
 ```
 /                  → Dashboard (overview + charts)
 /sessions          → Sessions (create / start / stop / QR / delete)
-/chats             → Chats (chat list + message thread, live via WebSocket)
+/chats             → Chats (Chats / Channels / Status tabs; chat list + message thread live via
+                     WebSocket; read-only channel feed on whatsapp-web.js)
 /webhooks          → Webhooks (per-session webhook endpoints)
 /templates         → Message Templates
 /message-tester    → Message Tester (ad-hoc send-* + check-number)
@@ -95,8 +98,8 @@ a non-admin hitting the path falls through to the `*` redirect.
 ```
 
 > There is **no Settings page** and no `/sessions/:id`, `/sessions/:id/chat`, or `/webhooks/:id`
-> route. Theme (light/dark/system) and color-palette selection live in a popover menu in the sidebar
-> footer (`Layout.tsx`), persisted client-side by the `useTheme` hook.
+> route. Theme (light/dark/system) is a one-click toggle in the sidebar footer (`Layout.tsx`),
+> persisted client-side by the `useTheme` hook.
 
 ## 17.3 Wireframes
 
@@ -192,8 +195,14 @@ a non-admin hitting the path falls through to the `*` redirect.
 │  │  │         │  Status: 🟢 Connected                          │    │
 │  │  └─────────┘  Platform: Android                             │    │
 │  │                                                              │    │
-│  │  [Restart Session] [Logout] [Delete]                        │    │
+│  │  [Restart Session] [Unlink Device] [Delete]                  │    │
 │  └─────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  Unlink Device asks WhatsApp to remove this companion device from   │
+│  the account's Linked Devices (POST /sessions/:id/logout), then     │
+│  stops the session — reconnecting requires a fresh QR scan or       │
+│  pairing code. Delete only clears the local data; it does NOT       │
+│  unlink.                                                            │
 │                                                                      │
 │  ┌─────────────────────┬─────────────────────┐                      │
 │  │  📊 Statistics      │  ⚙️ Configuration    │                      │
@@ -343,24 +352,36 @@ a non-admin hitting the path falls through to the `*` redirect.
 
 ## 17.4 Component Library
 
-> **No component framework is installed.** shadcn/ui is *not* adopted — there is no `npx shadcn`
+> **No component framework is installed.** shadcn/ui is _not_ adopted — there is no `npx shadcn`
 > init, no `components/ui/` directory, no `cn()` utility, and no `@/components` import alias. The
 > wireframes above are design intent; the implementation is hand-written.
 
 ### Bespoke components
 
 The UI is built from a small set of project-specific components under `dashboard/src/components/`,
-each with a colocated CSS file. There is no design-system package to pull from.
+most with a colocated CSS file. Five ship none: `ErrorBoundary` styles inline via `style={{...}}`,
+`GithubIcon` carries no styling beyond `fill="currentColor"`, `Modal` reuses the global `.modal-*`
+rules from `index.css`, and the `chats/` pair take their classes from the page stylesheet
+(`pages/Chats.css`) plus the `yet-another-react-lightbox` vendor CSS. There is no design-system
+package to pull from.
 
-| Component | File | Responsibility |
-| --- | --- | --- |
-| `Layout` | `components/Layout.tsx` | App shell: collapsible sidebar nav, mobile drawer, language menu, theme/palette popover, logout, live version badge |
-| `ToastProvider` / `useToast` | `components/Toast.tsx` | Context-based toast notifications (success/error/warning/info) with de-dup keys |
-| `PageHeader` | `components/PageHeader.tsx` | Shared page title / subtitle / badge / actions header |
-| `DashboardCharts` | `components/DashboardCharts.tsx` | `recharts`-based message-volume / activity charts on the Dashboard |
-| `FilterBuilder` | `components/FilterBuilder.tsx` | Visual condition builder for webhook event filters |
-| `ErrorBoundary` | `components/ErrorBoundary.tsx` | Top-level React error boundary wrapping the whole app |
-| `GithubIcon` | `components/GithubIcon.tsx` | Inline brand SVG |
+| Component                    | File                             | Responsibility                                                                                                        |
+| ---------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `Layout`                     | `components/Layout.tsx`          | App shell: collapsible sidebar nav, mobile drawer, language menu, light/dark theme toggle, logout, live version badge |
+| `ToastProvider` / `useToast` | `components/Toast.tsx`           | Context-based toast notifications (success/error/warning/info) with de-dup keys                                       |
+| `PageHeader`                 | `components/PageHeader.tsx`      | Shared page title / subtitle / badge / actions header                                                                 |
+| `Modal`                      | `components/Modal.tsx`           | Accessible dialog (`role="dialog"`, Escape/overlay close, focus trap + restore); uses the global `.modal-*` styles    |
+| `CustomSelect`               | `components/CustomSelect.tsx`    | Keyboard-navigable select replacement (type-ahead, arrow keys) used by Sessions / Logs / Login                        |
+| `DashboardCharts`            | `components/DashboardCharts.tsx` | `recharts`-based message-volume / activity charts on the Dashboard                                                    |
+| `FilterBuilder`              | `components/FilterBuilder.tsx`   | Visual condition builder for webhook event filters                                                                    |
+| `GlobalSearch`               | `components/GlobalSearch.tsx`    | Debounced message-search box in the Chats header, with all-sessions / current-session scope                           |
+| `PluginInstances`            | `components/PluginInstances.tsx` | Per-plugin instance list: create / edit / delete and secret regeneration                                              |
+| `ErrorBoundary`              | `components/ErrorBoundary.tsx`   | Top-level React error boundary wrapping the whole app                                                                 |
+| `GithubIcon`                 | `components/GithubIcon.tsx`      | Inline brand SVG                                                                                                      |
+
+Chat-specific pieces live one level down in `components/chats/`: `MessageBody` (WhatsApp text
+formatting + link detection) and `MediaLightbox` (the media viewer, built on
+`yet-another-react-lightbox`).
 
 Pages live under `dashboard/src/pages/`, each as a `*.tsx` + `*.css` pair (e.g. `Sessions.tsx` +
 `Sessions.css`). Pages are lazy-loaded in `App.tsx` via `React.lazy` + `Suspense`.
@@ -400,9 +421,11 @@ library — those visuals are composed directly with `div`s and the page's own C
 ## 17.5 State Management
 
 There is **no Zustand store** (and no global client-state library). Server data is owned by
-**TanStack Query** (`@tanstack/react-query`); the only other shared state is two small React Context
-providers — `useRole` (the authenticated key's role) and `useTheme` (mode + palette, persisted to
-`localStorage`).
+**TanStack Query** (`@tanstack/react-query`); the only other shared state lives in the two React
+Context providers in the app — `RoleProvider` (the authenticated key's role, read through the
+`useRole` hook) and `ToastProvider` (transient notifications). Theme mode is deliberately _not_ a
+context: `useTheme` is a plain hook that persists to `localStorage` and writes one attribute on
+`<html>` (see §17.7).
 
 ### API client — raw payloads, no `{ data }` envelope
 
@@ -436,10 +459,9 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
 }
 
 export const sessionApi = {
-  list: () => request<Session[]>('/sessions'),          // bare array
+  list: () => request<Session[]>('/sessions'), // bare array
   get: (id: string) => request<Session>(`/sessions/${id}`),
-  create: (name: string) =>
-    request<Session>('/sessions', { method: 'POST', body: JSON.stringify({ name }) }),
+  create: (name: string) => request<Session>('/sessions', { method: 'POST', body: JSON.stringify({ name }) }),
   delete: (id: string) => request<void>(`/sessions/${id}`, { method: 'DELETE' }),
   // QR returns a raw { qrCode, status } object — not { qr, expiresAt }, and there is no expiry timer.
   getQR: (id: string) => request<{ qrCode: string; status: string }>(`/sessions/${id}/qr`),
@@ -492,7 +514,7 @@ Real-time updates use **socket.io** (`socket.io-client`), not a raw browser `Web
   `${VITE_WS_URL || window.location.origin}/events` — same-origin by default; `VITE_WS_URL` only
   overrides it for split-origin deployments.
 - **API key via the socket.io `auth` payload (and an `X-API-Key` header for proxies), deliberately
-  *not* in the query string** — a key in the handshake URL would leak into access logs / `Referer`.
+  _not_ in the query string** — a key in the handshake URL would leak into access logs / `Referer`.
 - **Reconnection is socket.io's built-in mechanism** — `reconnectionAttempts: 5`,
   `reconnectionDelay: 1000` — not a hand-rolled `setTimeout(connect, 3000)`. When all attempts are
   exhausted the manager fires `reconnect_failed`; the hook surfaces that as `connectionFailed` so the
@@ -510,7 +532,7 @@ import { io, Socket } from 'socket.io-client';
 const SOCKET_URL = import.meta.env.VITE_WS_URL || window.location.origin;
 
 interface ServerEventEnvelope {
-  type: string;        // 'event'
+  type: string; // 'event'
   timestamp: string;
   payload?: { event: string; sessionId: string; data: Record<string, unknown> };
 }
@@ -529,11 +551,14 @@ export function useWebSocket(events: WebSocketEvents = {}) {
       reconnection: true,
       reconnectionAttempts: 5,
       reconnectionDelay: 1000,
-      auth: { apiKey },                       // key in the handshake auth, NOT the URL
-      extraHeaders: { 'X-API-Key': apiKey },  // header copy for proxies
+      auth: { apiKey }, // key in the handshake auth, NOT the URL
+      extraHeaders: { 'X-API-Key': apiKey }, // header copy for proxies
     });
 
-    socketRef.current.on('connect', () => { setIsConnected(true); setConnectionFailed(false); });
+    socketRef.current.on('connect', () => {
+      setIsConnected(true);
+      setConnectionFailed(false);
+    });
     socketRef.current.on('disconnect', () => setIsConnected(false));
     socketRef.current.io.on('reconnect_failed', () => setConnectionFailed(true));
   }, []);
@@ -559,7 +584,9 @@ export function useWebSocket(events: WebSocketEvents = {}) {
       }
     };
     socket?.on('message', handle);
-    return () => { socket?.off('message', handle); };
+    return () => {
+      socket?.off('message', handle);
+    };
   }, [connect, events]);
 
   return { isConnected, connectionFailed, reconnect, subscribe, unsubscribe };
@@ -569,26 +596,23 @@ export function useWebSocket(events: WebSocketEvents = {}) {
 ## 17.7 Theme Configuration
 
 Theming is **not** shadcn HSL design tokens. It is a plain `useTheme` hook (`src/hooks/useTheme.ts`)
-that toggles two attributes on `<html>` and lets the CSS do the rest. The values are persisted to
-`localStorage` under `openwa_theme` and `openwa_palette`:
+that toggles one attribute on `<html>` and lets the CSS do the rest. The value is persisted to
+`localStorage` under `openwa_theme`:
 
 - **Mode** — `light | dark | system`. `system` removes `data-theme` so a `prefers-color-scheme`
   media query in the global CSS takes over; otherwise `data-theme="light|dark"` is set explicitly.
-- **Palette** — one of seven accent palettes (`openwa`, `blue`, `graphite`, `indigo`, `amber`,
-  `rose`, `teal`), applied as `data-palette="…"`. Each palette is a set of CSS custom properties
-  scoped to that attribute selector.
 
-The mode/palette pickers render in the sidebar footer popover (`Layout.tsx`); there is no
-`ThemeProvider` context wrapper — it's a hook consumed directly where needed.
+The sidebar footer button toggles light ↔ dark directly (resolving `system` first); there is no
+picker popover and no `ThemeProvider` context wrapper — it's a hook consumed directly where needed.
+An earlier accent-palette picker (seven palettes via `data-palette`) was removed for
+maintainability; the legacy `openwa_palette` storage key and the attribute are cleaned up on load.
 
 ```typescript
 // src/hooks/useTheme.ts (abridged)
 export type Theme = 'light' | 'dark' | 'system';
-export type ThemePalette = 'openwa' | 'blue' | 'graphite' | 'indigo' | 'amber' | 'rose' | 'teal';
 
 export function useTheme() {
   const [theme, setTheme] = useState<Theme>(/* localStorage 'openwa_theme' ?? 'system' */);
-  const [palette, setPalette] = useState<ThemePalette>(/* localStorage 'openwa_palette' ?? 'openwa' */);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -597,39 +621,37 @@ export function useTheme() {
     localStorage.setItem('openwa_theme', theme);
   }, [theme]);
 
-  useEffect(() => {
-    document.documentElement.setAttribute('data-palette', palette);
-    localStorage.setItem('openwa_palette', palette);
-  }, [palette]);
-
-  return { theme, setTheme, palette, setPalette, /* resolvedTheme, paletteOptions, ... */ };
+  return { theme, setTheme /* toggleTheme, resolvedTheme */ };
 }
 ```
 
-The actual colors live in the global CSS as variables keyed off `[data-theme]` / `[data-palette]` —
-e.g. `:root { --color-accent: #25d366; } [data-palette='blue'] { --color-accent: #2563eb; }` — so
-switching mode or palette is a single attribute write with no re-render of the tree.
+The actual colors live in the global CSS as variables keyed off `[data-theme]` —
+e.g. `:root { --color-accent: #25d366; } [data-theme='dark'] { --color-accent: #25d366; }` — so
+switching mode is a single attribute write with no re-render of the tree.
 
 ## 17.8 Build & Deployment
 
 ### Vite Configuration
 
 The dev server listens on **2886** and proxies `/api` to the API on `2785`. The WebSocket proxy is
-on **`/socket.io`** (socket.io's transport path) with `ws: true` — *not* `/ws`. There is no `@`
+on **`/socket.io`** (socket.io's transport path) with `ws: true` — _not_ `/ws`. There is no `@`
 import alias and no custom `manualChunks`/Radix vendor split; code-splitting is handled by the
 per-page `React.lazy` imports in `App.tsx`. The build-time version (`__APP_VERSION__`) is injected
-from `package.json` via `define`.
+via `define` from the **root** `package.json` — the file a release bumps — resolved relative to the
+config file rather than `process.cwd()`, because the dashboard is normally built from inside
+`dashboard/`, where a cwd-relative read picks up the release-untouched `dashboard/package.json`
+instead. `APP_VERSION` in the environment still overrides it.
 
 ```typescript
 // vite.config.ts
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-const { version: pkgVersion } = JSON.parse(
-  readFileSync(resolve(process.cwd(), 'package.json'), 'utf-8'),
-) as { version: string };
+// Root package.json, resolved from this file — NOT process.cwd().
+const { version: pkgVersion } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8')) as {
+  version: string;
+};
 
 export default defineConfig({
   plugins: [react()],

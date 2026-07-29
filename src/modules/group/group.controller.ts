@@ -1,7 +1,14 @@
 import { Controller, Get, Post, Put, Delete, Param, Body, HttpCode, HttpStatus } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiBody } from '@nestjs/swagger';
 import { GroupService } from './group.service';
-import { CreateGroupDto, ParticipantsDto, GroupSubjectDto, GroupDescriptionDto } from './dto/group.dto';
+import {
+  CreateGroupDto,
+  ParticipantsDto,
+  GroupSubjectDto,
+  GroupDescriptionDto,
+  JoinGroupDto,
+  GroupSettingsDto,
+} from './dto/group.dto';
 import { RequireRole } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
 
@@ -24,6 +31,49 @@ export class GroupController {
     return this.groupService.getGroupInfo(sessionId, groupId);
   }
 
+  @Post('join')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Join a group via invite code' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiBody({ type: JoinGroupDto })
+  @ApiResponse({ status: 200, description: 'Joined the group' })
+  @ApiResponse({ status: 400, description: 'Invalid or expired invite code, or session is not started' })
+  async join(@Param('sessionId') sessionId: string, @Body() dto: JoinGroupDto) {
+    const groupId = await this.groupService.joinGroupViaInviteCode(sessionId, dto.inviteCode);
+    return { success: true, groupId };
+  }
+
+  @Get(':groupId/settings')
+  @ApiOperation({ summary: 'Get group settings (announce / locked / ephemeral timer)' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'groupId', description: 'Group ID' })
+  @ApiResponse({ status: 200, description: 'Group settings' })
+  @ApiResponse({ status: 404, description: 'Group not found' })
+  async getSettings(@Param('sessionId') sessionId: string, @Param('groupId') groupId: string) {
+    return this.groupService.getGroupSettings(sessionId, groupId);
+  }
+
+  @Put(':groupId/settings')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({ summary: 'Update group settings (announce / locked / ephemeral timer)' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'groupId', description: 'Group ID' })
+  @ApiBody({ type: GroupSettingsDto })
+  @ApiResponse({ status: 200, description: 'Group settings updated' })
+  @ApiResponse({ status: 400, description: 'No setting provided, or a value is not a boolean' })
+  @ApiResponse({ status: 403, description: 'The engine refused the change (the account is not a group admin)' })
+  @ApiResponse({ status: 404, description: 'Group not found' })
+  @ApiResponse({ status: 501, description: 'The active engine does not support a requested setting' })
+  async updateSettings(
+    @Param('sessionId') sessionId: string,
+    @Param('groupId') groupId: string,
+    @Body() dto: GroupSettingsDto,
+  ) {
+    await this.groupService.updateGroupSettings(sessionId, groupId, dto);
+    return { success: true, message: 'Group settings updated' };
+  }
+
   @Post()
   @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Create a new group' })
@@ -40,15 +90,19 @@ export class GroupController {
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID' })
   @ApiBody({ type: ParticipantsDto })
-  @ApiResponse({ status: 200, description: 'Participants added' })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Participants processed — `results` carries the per-participant outcome (a partial refusal does not fail the batch; a total refusal is an error)',
+  })
   @HttpCode(HttpStatus.OK)
   async addParticipants(
     @Param('sessionId') sessionId: string,
     @Param('groupId') groupId: string,
     @Body() dto: ParticipantsDto,
   ) {
-    await this.groupService.addParticipants(sessionId, groupId, dto.participants);
-    return { success: true, message: 'Participants added' };
+    const results = await this.groupService.addParticipants(sessionId, groupId, dto.participants);
+    return { success: true, message: 'Participants added', results };
   }
 
   @Delete(':groupId/participants')
@@ -57,14 +111,18 @@ export class GroupController {
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID' })
   @ApiBody({ type: ParticipantsDto })
-  @ApiResponse({ status: 200, description: 'Participants removed' })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Participants processed — `results` carries the per-participant outcome (a partial refusal does not fail the batch; a total refusal is an error)',
+  })
   async removeParticipants(
     @Param('sessionId') sessionId: string,
     @Param('groupId') groupId: string,
     @Body() dto: ParticipantsDto,
   ) {
-    await this.groupService.removeParticipants(sessionId, groupId, dto.participants);
-    return { success: true, message: 'Participants removed' };
+    const results = await this.groupService.removeParticipants(sessionId, groupId, dto.participants);
+    return { success: true, message: 'Participants removed', results };
   }
 
   @Post(':groupId/participants/promote')
@@ -73,15 +131,19 @@ export class GroupController {
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID' })
   @ApiBody({ type: ParticipantsDto })
-  @ApiResponse({ status: 200, description: 'Participants promoted' })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Participants processed — `results` carries the per-participant outcome (a partial refusal does not fail the batch; a total refusal is an error)',
+  })
   @HttpCode(HttpStatus.OK)
   async promoteParticipants(
     @Param('sessionId') sessionId: string,
     @Param('groupId') groupId: string,
     @Body() dto: ParticipantsDto,
   ) {
-    await this.groupService.promoteParticipants(sessionId, groupId, dto.participants);
-    return { success: true, message: 'Participants promoted to admin' };
+    const results = await this.groupService.promoteParticipants(sessionId, groupId, dto.participants);
+    return { success: true, message: 'Participants promoted to admin', results };
   }
 
   @Post(':groupId/participants/demote')
@@ -90,15 +152,19 @@ export class GroupController {
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID' })
   @ApiBody({ type: ParticipantsDto })
-  @ApiResponse({ status: 200, description: 'Participants demoted' })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Participants processed — `results` carries the per-participant outcome (a partial refusal does not fail the batch; a total refusal is an error)',
+  })
   @HttpCode(HttpStatus.OK)
   async demoteParticipants(
     @Param('sessionId') sessionId: string,
     @Param('groupId') groupId: string,
     @Body() dto: ParticipantsDto,
   ) {
-    await this.groupService.demoteParticipants(sessionId, groupId, dto.participants);
-    return { success: true, message: 'Participants demoted from admin' };
+    const results = await this.groupService.demoteParticipants(sessionId, groupId, dto.participants);
+    return { success: true, message: 'Participants demoted from admin', results };
   }
 
   @Put(':groupId/subject')

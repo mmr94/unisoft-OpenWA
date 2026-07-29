@@ -25,13 +25,24 @@ if (API_ORIGIN) warnIfInsecureHttpUrl(API_ORIGIN, 'VITE_API_URL');
 export interface Session {
   id: string;
   name: string;
-  status: 'created' | 'idle' | 'initializing' | 'connecting' | 'qr_ready' | 'ready' | 'disconnected' | 'failed';
+  status:
+    | 'created'
+    | 'idle'
+    | 'initializing'
+    | 'connecting'
+    | 'authenticating'
+    | 'qr_ready'
+    | 'ready'
+    | 'disconnected'
+    | 'action_required'
+    | 'failed';
   phone?: string;
   pushName?: string;
   lastActive?: string;
   createdAt: string;
   updatedAt: string;
-  /** Human-readable reason for the most recent terminal engine failure (set only when status is 'failed'). */
+  /** Human-readable reason carried while the status is 'failed' (terminal failure) or
+   * 'action_required' (operator must intervene, e.g. acknowledge an onboarding modal). */
   lastError?: string | null;
 }
 
@@ -123,11 +134,15 @@ export interface MessageResponse {
   timestamp: number;
 }
 
+// Mirrors the backend engine ChatKind (dashboard cannot import wa-id.ts).
+export type ChatKind = 'individual' | 'group' | 'channel' | 'status' | 'broadcast' | 'unknown';
+
 // Chat summary returned by GET /sessions/:id/chats (mirrors the backend ChatSummary).
 export interface Chat {
   id: string;
   name: string;
   isGroup: boolean;
+  kind: ChatKind;
   unreadCount: number;
   timestamp: number;
   lastMessage?: string;
@@ -163,6 +178,20 @@ export interface ChatMessage {
   id: string;
   waMessageId?: string;
   chatId: string;
+  /** Chat kind of the source conversation (present on live engine/WS payloads). */
+  kind?: ChatKind;
+  /**
+   * Human-readable name of the message's sender. For a group this is the participant who posted
+   * (their pushName/contact name); the chat view uses it to label who said what, like WhatsApp. Null
+   * on legacy rows or when the engine could not resolve a name.
+   */
+  chatName?: string;
+  /**
+   * Stable sender identity for a group message: the participant JID who actually posted (`from` is
+   * the group JID). Present on live/engine payloads and on rows persisted after the column was
+   * added; absent on 1:1 messages, outgoing echoes, and legacy rows.
+   */
+  author?: string;
   from: string;
   to: string;
   body: string;
@@ -191,6 +220,55 @@ export interface EngineHistoryMessage {
   timestamp: number;
   fromMe?: boolean;
   media?: { mimetype: string; filename?: string; data?: string };
+  /** Sender in a group: `from` is the group JID, so this participant WID is the real poster. */
+  author?: string;
+  /** Best-effort sender contact (sync cache); its name labels the poster in a group thread. */
+  contact?: { id?: string; name?: string; pushName?: string };
+}
+
+// Mirrors the backend engine Channel / ChannelMessage (GET /sessions/:id/channels[/:id/messages]).
+export interface Channel {
+  id: string;
+  name: string;
+  subscriberCount?: number;
+  inviteCode?: string;
+  verified?: boolean;
+}
+
+export interface ChannelMessage {
+  id: string;
+  body: string;
+  timestamp: number;
+  hasMedia: boolean;
+  mediaUrl?: string;
+}
+
+// Mirrors the backend engine Status / IWhatsAppEngine status methods (GET /sessions/:id/status).
+export interface StatusUpdate {
+  id: string;
+  contact: { id: string; name?: string; pushName?: string };
+  type: 'text' | 'image' | 'video';
+  caption?: string;
+  mediaUrl?: string;
+  backgroundColor?: string;
+  font?: number;
+  timestamp: string;
+  expiresAt: string;
+}
+
+export interface ContactStatusGroup {
+  contact: { id: string; name?: string; pushName?: string };
+  items: StatusUpdate[];
+  latest: string;
+}
+
+// Minimal contact type for the recipient picker; the backend GET /sessions/:id/contacts
+// returns a Contact array; fields beyond id are optional.
+export interface Contact {
+  id: string;
+  name?: string;
+  pushName?: string;
+  number?: string;
 }
 
 export interface SendMediaPayload {
@@ -199,6 +277,104 @@ export interface SendMediaPayload {
   mimetype?: string;
   filename?: string;
   caption?: string;
+}
+
+// Payloads below mirror the backend DTOs in src/modules/message/dto (raw bodies, no envelope).
+export interface SendLocationPayload {
+  chatId: string;
+  latitude: number;
+  longitude: number;
+  description?: string;
+  address?: string;
+}
+
+export interface SendContactPayload {
+  chatId: string;
+  contactName: string;
+  contactNumber: string;
+}
+
+export interface SendPollPayload {
+  chatId: string;
+  name: string;
+  options: string[];
+  allowMultipleAnswers?: boolean;
+}
+
+export interface ForwardMessagePayload {
+  fromChatId: string;
+  toChatId: string;
+  messageId: string;
+}
+
+// Media block of a single bulk message (BulkMediaDto — no caption; caption sits next to it).
+export interface BulkMediaPayload {
+  url?: string;
+  base64?: string;
+  mimetype?: string;
+  filename?: string;
+  ptt?: boolean;
+}
+
+export interface BulkMessageItem {
+  chatId: string;
+  type: 'text' | 'image' | 'video' | 'audio' | 'document';
+  content: {
+    text?: string;
+    image?: BulkMediaPayload;
+    video?: BulkMediaPayload;
+    audio?: BulkMediaPayload;
+    document?: BulkMediaPayload;
+    caption?: string;
+  };
+  variables?: Record<string, string>;
+}
+
+export interface SendBulkPayload {
+  batchId?: string;
+  messages: BulkMessageItem[];
+  options?: {
+    delayBetweenMessages?: number;
+    randomizeDelay?: boolean;
+    stopOnError?: boolean;
+  };
+}
+
+/** 202 response of POST send-bulk — the batch is processing asynchronously; poll getBatchStatus. */
+export interface BulkBatchResponse {
+  batchId: string;
+  status: string;
+  totalMessages: number;
+  estimatedCompletionTime?: string;
+  statusUrl: string;
+}
+
+export type BatchStatus = 'pending' | 'processing' | 'completed' | 'cancelled' | 'failed';
+
+export interface BatchProgress {
+  total: number;
+  sent: number;
+  failed: number;
+  pending: number;
+  cancelled: number;
+}
+
+export interface BatchMessageResult {
+  chatId: string;
+  status: 'pending' | 'sent' | 'failed' | 'cancelled';
+  messageId?: string;
+  error?: { code: string; message: string };
+  sentAt?: string;
+}
+
+/** GET batch/:batchId shape; the cancel endpoint returns the same minus results/timestamps. */
+export interface BatchStatusResponse {
+  batchId: string;
+  status: BatchStatus;
+  progress: BatchProgress;
+  results?: BatchMessageResult[];
+  startedAt?: string;
+  completedAt?: string;
 }
 
 export interface HealthStatus {
@@ -306,7 +482,7 @@ export interface SaveConfigPayload {
 }
 
 export interface Settings {
-  general: { apiBaseUrl: string; sessionTimeout: number; autoReconnect: boolean; debugMode: boolean };
+  general: { apiBaseUrl: string; autoReconnect: boolean; debugMode: boolean };
   api: { rateLimit: number; rateLimitWindow: number; enableDocs: boolean };
   notifications: { emailEnabled: boolean; notificationEmail: string; webhookAlerts: boolean };
 }
@@ -426,6 +602,39 @@ async function requestText(endpoint: string): Promise<string> {
   return response.text();
 }
 
+/** Like {@link request} but returns a Blob — e.g. for status media downloads. */
+async function requestBlob(endpoint: string): Promise<Blob> {
+  const url = `${API_BASE_URL}${endpoint}`;
+
+  // Get API key from sessionStorage for authentication
+  const apiKey = sessionStorage.getItem('openwa_api_key');
+
+  const headers: HeadersInit = {
+    ...(apiKey ? { 'X-API-Key': apiKey } : {}),
+  };
+
+  const response = await fetch(url, { headers });
+
+  if (response.status === 401) {
+    // The stored API key is invalid/expired/revoked — clear it and return to login
+    sessionStorage.removeItem('openwa_api_key');
+    if (typeof window !== 'undefined') {
+      window.location.assign('/');
+      // Halt this request's promise chain so callers neither throw nor receive an undefined payload.
+      return new Promise<Blob>(() => {});
+    }
+  }
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    const err = new Error(error.message || `HTTP ${response.status}`) as Error & { status?: number };
+    err.status = response.status;
+    throw err;
+  }
+
+  return response.blob();
+}
+
 // =============================================================================
 // Session API
 // =============================================================================
@@ -441,6 +650,7 @@ export const sessionApi = {
   delete: (id: string) => request<void>(`/sessions/${id}`, { method: 'DELETE' }),
   start: (id: string) => request<Session>(`/sessions/${id}/start`, { method: 'POST' }),
   stop: (id: string) => request<Session>(`/sessions/${id}/stop`, { method: 'POST' }),
+  logout: (id: string) => request<Session>(`/sessions/${id}/logout`, { method: 'POST' }),
   forceKill: (id: string) => request<Session>(`/sessions/${id}/force-kill`, { method: 'POST' }),
   getQR: (id: string) => request<{ qrCode: string; status: string }>(`/sessions/${id}/qr`),
   requestPairingCode: (id: string, phoneNumber: string) =>
@@ -476,6 +686,32 @@ export const sessionApi = {
         includeMedia ? '&includeMedia=true' : ''
       }`,
     ),
+  getSubscribedChannels: (id: string) => request<Channel[]>(`/sessions/${id}/channels`),
+  getChannelMessages: (id: string, channelId: string, limit = 50) =>
+    request<ChannelMessage[]>(`/sessions/${id}/channels/${encodeURIComponent(channelId)}/messages?limit=${limit}`),
+  getContactStatuses: (id: string) => request<{ statuses: StatusUpdate[] }>(`/sessions/${id}/status`),
+  getStatusMediaBlob: (id: string, statusId: string) =>
+    requestBlob(`/sessions/${id}/status/${encodeURIComponent(statusId)}/media`),
+  postTextStatus: (
+    id: string,
+    text: string,
+    recipients?: string[],
+    extra?: { backgroundColor?: string; font?: number },
+  ) =>
+    request(`/sessions/${id}/status/send-text`, {
+      method: 'POST',
+      body: JSON.stringify({ text, recipients, ...extra }),
+    }),
+  postImageStatus: (
+    id: string,
+    image: { url?: string; base64?: string; mimetype?: string },
+    recipients?: string[],
+    caption?: string,
+  ) =>
+    request(`/sessions/${id}/status/send-image`, {
+      method: 'POST',
+      body: JSON.stringify({ image, recipients, caption }),
+    }),
 };
 
 // =============================================================================
@@ -536,9 +772,36 @@ export interface CheckNumberResponse {
   whatsappId: string | null;
 }
 
+export interface ProfilePictureResponse {
+  /** Signed CDN URL for the contact/group picture, or null when hidden / unavailable. */
+  url: string | null;
+}
+
 export const contactApi = {
+  list: (sessionId: string) => request<Contact[]>(`/sessions/${sessionId}/contacts`),
   checkNumber: (sessionId: string, number: string) =>
     request<CheckNumberResponse>(`/sessions/${sessionId}/contacts/check/${encodeURIComponent(number)}`),
+  // Returns the contact/group profile picture URL. Both engines return null when the user hid their
+  // picture or has none. The URL is a signed WhatsApp CDN link that expires in a few hours, so the
+  // dashboard caches it for an hour (see useProfilePicture) and re-fetches on expiry.
+  profilePicture: (sessionId: string, contactId: string) =>
+    request<ProfilePictureResponse>(`/sessions/${sessionId}/contacts/${encodeURIComponent(contactId)}/profile-picture`),
+  // Best-effort resolution of a contact id (e.g. an @lid privacy id) to its phone number (MSISDN
+  // digits), or null when the engine can't map it. Cached a day by useResolvedPhone.
+  resolvePhone: (sessionId: string, contactId: string) =>
+    request<{ contactId: string; phone: string | null }>(
+      `/sessions/${sessionId}/contacts/${encodeURIComponent(contactId)}/phone`,
+    ),
+  // Batch-resolve profile picture URLs for a whole sidebar in ONE request — the per-chat burst of
+  // parallel single fetches exhausts the per-IP throttle (429s). Engine lookups run 3 at a time
+  // server-side; ids beyond the backend's 50-id cap are dropped client-side too.
+  profilePictures: (sessionId: string, contactIds: string[]) =>
+    request<{ pictures: Record<string, string | null> }>(
+      `/sessions/${sessionId}/contacts/profile-pictures?ids=${contactIds
+        .slice(0, 50)
+        .map(encodeURIComponent)
+        .join(',')}`,
+    ),
 };
 
 // =============================================================================
@@ -624,6 +887,44 @@ export const messageApi = {
       method: 'POST',
       body: JSON.stringify({ chatId, ...payload }),
     }),
+  sendLocation: (sessionId: string, data: SendLocationPayload) =>
+    request<MessageResponse>(`/sessions/${sessionId}/messages/send-location`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  sendContact: (sessionId: string, data: SendContactPayload) =>
+    request<MessageResponse>(`/sessions/${sessionId}/messages/send-contact`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  // Stickers take the same media body as the other send-* endpoints (base64 XOR url + mimetype).
+  sendSticker: (sessionId: string, chatId: string, payload: SendMediaPayload) =>
+    request<MessageResponse>(`/sessions/${sessionId}/messages/send-sticker`, {
+      method: 'POST',
+      body: JSON.stringify({ chatId, ...payload }),
+    }),
+  sendPoll: (sessionId: string, data: SendPollPayload) =>
+    request<MessageResponse>(`/sessions/${sessionId}/messages/send-poll`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  forward: (sessionId: string, data: ForwardMessagePayload) =>
+    request<MessageResponse>(`/sessions/${sessionId}/messages/forward`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  // Async batch: returns 202 immediately; poll getBatchStatus until a terminal status.
+  sendBulk: (sessionId: string, data: SendBulkPayload) =>
+    request<BulkBatchResponse>(`/sessions/${sessionId}/messages/send-bulk`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  getBatchStatus: (sessionId: string, batchId: string) =>
+    request<BatchStatusResponse>(`/sessions/${sessionId}/messages/batch/${encodeURIComponent(batchId)}`),
+  cancelBatch: (sessionId: string, batchId: string) =>
+    request<BatchStatusResponse>(`/sessions/${sessionId}/messages/batch/${encodeURIComponent(batchId)}/cancel`, {
+      method: 'POST',
+    }),
   reply: (sessionId: string, data: { chatId: string; quotedMessageId: string; text: string }) =>
     request<MessageResponse>(`/sessions/${sessionId}/messages/reply`, {
       method: 'POST',
@@ -700,26 +1001,31 @@ export const infraApi = {
   // Data migration: export all Data-DB tables (call while still on the OLD database, before switching),
   // then import after the switch + restart. Used by the DB-switch migration guard so data isn't lost.
   exportData: () =>
-    request<{ exportedAt: string; dataDbType: string; tables: Record<string, unknown[]>; counts: Record<string, number> }>(
-      '/infra/export-data',
-    ),
-  importData: (tables: Record<string, unknown[]>) =>
-    request<{ imported: boolean; counts?: Record<string, number>; message?: string; warnings?: string[] }>('/infra/import-data', {
+    request<{
+      exportedAt: string;
+      dataDbType: string;
+      tables: Record<string, unknown[]>;
+      counts: Record<string, number>;
+    }>('/infra/export-data'),
+  // 200 contract includes the orphan-engine reconciliation result (restartRequired / notices /
+  // stopped+failed ids). A 409 (live engines exist for sessions the backup would remove; the error
+  // message lists them) is retried by the caller with stopOrphans=true, which stops those engines
+  // inside the request. force is deliberately NOT exposed: it leaves the engines writing into the
+  // restored tables until a restart — the window stopOrphans exists to close.
+  importData: (tables: Record<string, unknown[]>, options?: { stopOrphans?: boolean }) =>
+    request<{
+      imported: boolean;
+      counts?: Record<string, number>;
+      message?: string;
+      warnings?: string[];
+      notices?: string[];
+      restartRequired?: boolean;
+      orphanedEngines?: string[];
+      stoppedOrphanEngines?: string[];
+      failedOrphanEngines?: string[];
+    }>('/infra/import-data', {
       method: 'POST',
-      body: JSON.stringify({ tables }),
-    }),
-};
-
-// =============================================================================
-// Settings API
-// =============================================================================
-
-export const settingsApi = {
-  get: () => request<Settings>('/settings'),
-  update: (settings: Partial<Settings>) =>
-    request<Settings>('/settings', {
-      method: 'PUT',
-      body: JSON.stringify(settings),
+      body: JSON.stringify({ tables, ...options }),
     }),
 };
 
@@ -749,7 +1055,10 @@ export interface PluginConfigSchema {
   properties: Record<string, PluginConfigField>;
 }
 
-export interface PluginI18nText { title?: string; description?: string }
+export interface PluginI18nText {
+  title?: string;
+  description?: string;
+}
 export interface PluginI18nLocale {
   name?: string;
   description?: string;
@@ -892,6 +1201,8 @@ export interface CreateInstanceInput {
   instanceId: string;
   sessionScope?: string;
   verifyToken?: string;
+  /** Provider-fixed webhook secret (e.g. Chatwoot's). Omit to auto-generate one (shown once). */
+  secret?: string;
   config?: Record<string, unknown>;
 }
 

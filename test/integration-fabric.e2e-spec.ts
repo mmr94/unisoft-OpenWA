@@ -2,19 +2,21 @@
 // AppModule boots; stub it so ts-jest (CommonJS) can load the module graph.
 jest.mock('archiver', () => ({ TarArchive: jest.fn() }));
 
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Test, TestingModule } from '@nestjs/testing';
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { INestApplication } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { json, urlencoded, Request } from 'express';
 import { AppModule } from './../src/app.module';
+import { applyGlobalValidation } from './../src/config/app-validation';
 import { PluginLoaderService } from './../src/core/plugins/plugin-loader.service';
 import { PluginInstance } from './../src/modules/integration/entities/plugin-instance.entity';
+import { IngressEvent } from './../src/modules/integration/entities/ingress-event.entity';
 import { IntegrationDeliveryFailure } from './../src/modules/integration/entities/integration-delivery-failure.entity';
 
 /**
@@ -69,8 +71,7 @@ describe('Integration Fabric ingress (e2e)', () => {
     }).compile();
 
     app = moduleFixture.createNestApplication();
-    app.setGlobalPrefix('api');
-    app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+    applyGlobalValidation(app);
     // Mirror main.ts's raw-body wiring: the ingress controller reads req.rawBody (stashed by this
     // verify callback) so the HMAC would be checked over the EXACT bytes the provider signed. Nest's
     // testing module does not install this on its own — it's manual bootstrap()-only wiring in main.ts.
@@ -81,7 +82,14 @@ describe('Integration Fabric ingress (e2e)', () => {
         },
       }),
     );
-    app.use(urlencoded({ extended: true }));
+    app.use(
+      urlencoded({
+        extended: true,
+        verify: (req: Request & { rawBody?: Buffer }, _res, buf) => {
+          req.rawBody = buf;
+        },
+      }),
+    );
     await app.init();
 
     instanceRepo = app.get(getRepositoryToken(PluginInstance, 'data'));
@@ -139,6 +147,20 @@ describe('Integration Fabric ingress (e2e)', () => {
     expect(dispatchWebhookForInstance).toHaveBeenCalledTimes(1);
   });
 
+  it('verifies form-urlencoded deliveries against their exact wire bytes', async () => {
+    const formRaw = 'event=message_created&account_id=42';
+    const formSignature = 'sha256=' + createHmac('sha256', secret).update(formRaw).digest('hex');
+    const res = await request(app.getHttpServer())
+      .post(INGRESS_PATH)
+      .set('X-Chatwoot-Signature', formSignature)
+      .set('X-Chatwoot-Delivery', 'delivery-form-1')
+      .set('Content-Type', 'application/x-www-form-urlencoded')
+      .send(formRaw);
+
+    expect(res.status).toBe(202);
+    expect(dispatchWebhookForInstance).toHaveBeenCalledTimes(1);
+  });
+
   it('rejects a tampered signature with 401 and never dispatches', async () => {
     const res = await request(app.getHttpServer())
       .post(INGRESS_PATH)
@@ -151,10 +173,32 @@ describe('Integration Fabric ingress (e2e)', () => {
     expect(dispatchWebhookForInstance).not.toHaveBeenCalled();
   });
 
+  it('marks the persisted event dispatched once a successful inline dispatch is recorded', async () => {
+    const eventRepo = app.get<Repository<IngressEvent>>(getRepositoryToken(IngressEvent, 'data'));
+    const res = await request(app.getHttpServer())
+      .post(INGRESS_PATH)
+      .set('X-Chatwoot-Signature', sig)
+      .set('X-Chatwoot-Delivery', 'delivery-marked-1')
+      .set('Content-Type', 'application/json')
+      .send(raw);
+
+    expect(res.status).toBe(202);
+    // The no-`response` route awaits enqueue before the ack, so the outcome is already recorded:
+    // a crash between persist and dispatch is the only way a fresh row stays 'pending'.
+    const row = await eventRepo.findOneByOrFail({ providerDeliveryId: 'delivery-marked-1' });
+    expect(row.dispatchState).toBe('dispatched');
+    expect(row.lastDispatchAt).not.toBeNull();
+    // With the outcome recorded, the dispatch tier owns the payload: the dedup row retires it to
+    // NULL and keeps only the slim content fingerprint for operator correlation.
+    expect(row.payload).toBeNull();
+    expect(row.payloadHash).toBe(createHash('sha256').update(raw).digest('hex'));
+  });
+
   it('persists a redrivable dead-letter row (still 202) when inline dispatch fails', async () => {
     const failureRepo = app.get<Repository<IntegrationDeliveryFailure>>(
       getRepositoryToken(IntegrationDeliveryFailure, 'data'),
     );
+    const eventRepo = app.get<Repository<IngressEvent>>(getRepositoryToken(IngressEvent, 'data'));
     // The plugin handler throws — the inline-dispatch fallback fails and is swallowed. Without a
     // dead-letter row the event would be stranded: handle() still 202s, and RedriveService only scans
     // this table (never ingress_events). The live-ingress wiring must therefore persist the failure here.
@@ -177,5 +221,14 @@ describe('Integration Fabric ingress (e2e)', () => {
       redriven: false,
       lastError: 'sandbox handler 5xx',
     });
+
+    // The event row itself stays 'pending' with the failure counted, so the reconciler retries the
+    // dispatch on its next sweep instead of waiting for a manual redrive alone. Its payload is KEPT
+    // — it is the reconciler's replay source (the DLQ row carries the copy redrive uses).
+    const event = await eventRepo.findOneByOrFail({ providerDeliveryId: 'delivery-dlq-1' });
+    expect(event.dispatchState).toBe('pending');
+    expect(event.dispatchAttempts).toBe(1);
+    expect(event.payload).not.toBeNull();
+    expect(event.payloadHash).toBe(createHash('sha256').update(raw).digest('hex'));
   });
 });

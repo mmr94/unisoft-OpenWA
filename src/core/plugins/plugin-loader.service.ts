@@ -1,4 +1,11 @@
-import { Injectable, OnModuleInit, OnModuleDestroy, Optional } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  OnApplicationBootstrap,
+  OnModuleInit,
+  OnModuleDestroy,
+  Optional,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ModuleRef } from '@nestjs/core';
 import { toNeutralJid, userPart } from '../../engine/identity/wa-id';
@@ -24,9 +31,12 @@ import {
   IPlugin,
   PluginType,
   PluginLogger,
+  PluginConfigSchema,
   validateIngressManifest,
   warnUnauthenticatedIngressRoutes,
+  warnUnsignedTimestampRoutes,
 } from './plugin.interfaces';
+import { validatePluginManifest } from './plugin-manifest';
 import { effectiveNetAllow, isNetHostAllowed, performPluginFetch } from './plugin-net';
 import { PluginStorageService } from './plugin-storage.service';
 import { isPluginActiveForSession, resolvePluginConfig } from './plugin-activation';
@@ -42,7 +52,10 @@ import { INGRESS_DISPATCH_TIMEOUT_MS } from '../../modules/integration/integrati
 import type { MessageService } from '../../modules/message/message.service';
 import type { SessionService } from '../../modules/session/session.service';
 import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
-import type { ConversationMappingService } from '../../modules/integration/conversation-mapping.service';
+import {
+  ConversationMappingConflict,
+  type ConversationMappingService,
+} from '../../modules/integration/conversation-mapping.service';
 import type { PluginInstanceService } from '../../modules/integration/plugin-instance.service';
 import type { IngressJobData } from '../../modules/queue/processors/ingress.processor';
 import type { SearchProviderRegistry } from '../../modules/search/search-provider.registry';
@@ -70,6 +83,31 @@ const SANDBOX_LIFECYCLE_TIMEOUT_MS = 30000;
 const SANDBOX_MAX_INFLIGHT_CAPS = 32;
 
 /**
+ * Host-side budget for ONE worker-initiated capability call. A plugin whose calls hang would otherwise
+ * hold all SANDBOX_MAX_INFLIGHT_CAPS slots forever (self-DoS). On timeout the worker gets an error and
+ * the slot frees; the late-settling host work is only WARN-logged (see PluginWorkerHost.withCapTimeout —
+ * a bound, not an atomicity guarantee). Default; plugins.capTimeoutMs (PLUGIN_CAP_TIMEOUT_MS) overrides.
+ */
+const SANDBOX_CAP_TIMEOUT_MS = 30000;
+
+/**
+ * Rate limit for the structured sandboxed-hook error log: at most one line per event per window so a
+ * hook that throws on every message can't flood the host log. Suppressed occurrences are counted and
+ * ride the next emitted line.
+ */
+const SANDBOX_HOOK_ERROR_LOG_INTERVAL_MS = 60000;
+
+/**
+ * Worker log-relay bounds (per sandboxed plugin): at most this many lines per window are relayed;
+ * excess is dropped, counted, and surfaced as one warn per window. Longer lines are truncated. The
+ * worker is not a security boundary — these are robustness bounds against a chatty/buggy plugin
+ * flooding the host log, not isolation.
+ */
+const SANDBOX_LOG_MAX_PER_WINDOW = 200;
+const SANDBOX_LOG_WINDOW_MS = 10000;
+const SANDBOX_LOG_MAX_MESSAGE_LENGTH = 8192;
+
+/**
  * Host process.env keys an untrusted plugin worker is allowed to see. Everything else — secrets like
  * API_MASTER_KEY, API_KEY_PEPPER, the DATABASE_/REDIS_ vars, DOCKER_HOST — is withheld. The worker is
  * a thread, so it needs no PATH to start and require() resolves via module paths, not env.
@@ -88,6 +126,19 @@ export function resolvePluginMainPath(pluginsDir: string, pluginId: string, main
     throw new Error(`Plugin ${pluginId} main path escapes the plugin directory`);
   }
   return mainPath;
+}
+
+/**
+ * Sibling directory names an in-place plugin update stages into / backs up to (see
+ * PluginsService.updatePackageInner). Dot-prefixed so the boot directory scan skips them, and placed
+ * inside the plugins dir so the swap renames stay on one filesystem (EXDEV-safe). The loader's
+ * boot-time reconciler (recoverInterruptedUpdates) keys off these exact names.
+ */
+export function pluginUpdateStagingDirName(pluginId: string): string {
+  return `.${pluginId}.new`;
+}
+export function pluginUpdateBackupDirName(pluginId: string): string {
+  return `.${pluginId}.bak`;
 }
 
 /**
@@ -132,14 +183,50 @@ export function dispatchConversationMedia(
   }
 }
 
+// Plugin ids whose bundled-extension code was permanently removed (v0.7 — superseded by the
+// marketplace chat-flow / group-translate; also reserved in plugin-installer). A leftover
+// directory without a manifest marks them as deleted on disk, so the stale registry entry (which
+// still reports them installed/enabled) is pruned on boot. Scoped to these known ids so a
+// temporarily-unreadable plugin dir (e.g. an unmounted volume) never loses its persisted config.
+const LEGACY_REMOVED_PLUGIN_IDS = new Set(['auto-reply', 'translation']);
+
+/**
+ * Fill config keys the schema declares a `default` for and that are absent (undefined) in the
+ * stored config. Seeding happens at LOAD time (fresh installs and every boot), so a plugin whose
+ * schema fields carry defaults never runs its lifecycle with them missing — the failure class of
+ * "enable throws: <field> is required/has no value" for defaulted fields. Explicit values — even
+ * null — are never overwritten, and object/array defaults are deep-cloned so the seeded runtime
+ * config and the persisted entry can't share a mutable reference. Required fields WITHOUT a
+ * declared default stay absent on purpose: those need real operator input, not an invented value.
+ */
+export function seedConfigDefaults(
+  schema: PluginConfigSchema | undefined,
+  config: Record<string, unknown>,
+): Record<string, unknown> {
+  const properties = schema?.properties;
+  if (!properties) return config;
+  let seeded: Record<string, unknown> | undefined;
+  for (const [key, field] of Object.entries(properties)) {
+    if (config[key] !== undefined || field === null || typeof field !== 'object') continue;
+    const value = field.default;
+    if (value === undefined) continue;
+    if (!seeded) seeded = { ...config };
+    seeded[key] = value !== null && typeof value === 'object' ? structuredClone(value) : value;
+  }
+  return seeded ?? config;
+}
+
 @Injectable()
-export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
+export class PluginLoaderService implements OnModuleInit, OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger = createLogger('PluginLoaderService');
   private readonly plugins = new Map<string, PluginInstance>();
   /** Plugin ids whose enable() is in flight — a synchronous lock so concurrent enables can't double-run. */
   private readonly enabling = new Set<string>();
   // Live worker host per enabled sandboxed (untrusted) plugin. Built-ins are not in here.
   private readonly sandboxHosts = new Map<string, PluginWorkerHost>();
+  // Last hook-handler error each sandboxed plugin's worker reported, surfaced via checkPluginHealth so a
+  // hook that keeps throwing is visible to the operator. Cleared on disable (fresh enable = fresh slate).
+  private readonly lastSandboxHookError = new Map<string, { event: string; error: string; at: Date }>();
   // Carries the firing event's sessionId across an in-process hook handler so ctx.config (a getter)
   // resolves the per-session slice. Per async call tree, so concurrent sessions don't cross over.
   private readonly hookSession = new AsyncLocalStorage<{ sessionId?: string }>();
@@ -177,6 +264,37 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Re-enable the plugins the operator had enabled (#856). `status` cannot carry that across a restart
+   * — it describes the runtime, and loading never runs a plugin — so the decision is read from the
+   * separately persisted `enabledByOperator`. Without this, every restart (an upgrade, a host reboot, a
+   * Docker restart policy) silently switched off every extension, and a relay simply stopped relaying.
+   *
+   * Runs at bootstrap rather than in onModuleInit so the rest of the app is wired before any plugin
+   * code executes. Built-ins are skipped: an engine is enabled by EngineFactory against the configured
+   * engine.type, and enabling a non-active engine here would be rejected anyway.
+   *
+   * Best-effort and sequential, like the shutdown teardown: a plugin that cannot come back is logged
+   * and left in ERROR, and never holds up the gateway.
+   */
+  async onApplicationBootstrap(): Promise<void> {
+    const restorable = this.getAllPlugins().filter(
+      p => !p.builtIn && this.pluginStorage.getPluginEntry(p.manifest.id)?.enabledByOperator === true,
+    );
+    for (const plugin of restorable) {
+      const pluginId = plugin.manifest.id;
+      try {
+        await this.enablePlugin(pluginId);
+      } catch (error) {
+        this.logger.error(
+          `Failed to restore plugin ${pluginId} on startup; it stays disabled until re-enabled`,
+          error instanceof Error ? error.message : String(error),
+          { pluginId, action: 'plugin_restore_failed' },
+        );
+      }
+    }
+  }
+
+  /**
    * Graceful shutdown (SIGTERM → app.close()): run onDisable for every enabled plugin so it can flush
    * buffers, close connections, and persist state. Previously onDisable only ran via the REST disable
    * and uninstall paths, so a normal restart/deploy/scale-down skipped it and stateful plugins lost
@@ -206,11 +324,16 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
   }
 
   private loadPluginsFromDirectory(dir: string): void {
+    // Reconcile any interrupted-update leftovers BEFORE scanning, so a crash mid-swap can't make a
+    // plugin silently vanish while its registry entry still claims it is installed.
+    this.recoverInterruptedUpdates(dir);
+
     const entries = fs.readdirSync(dir, { withFileTypes: true });
 
     for (const entry of entries) {
-      // Skip non-directories and dot-prefixed dirs (e.g. a crash-leftover `.<id>.bak` update backup),
-      // so a half-finished update can't be re-loaded as a duplicate-id plugin on the next boot.
+      // Skip non-directories and dot-prefixed dirs (e.g. a crash-leftover `.<id>.bak` update backup or
+      // `.<id>.new` staging tree), so a half-finished update can't be re-loaded as a duplicate-id
+      // plugin on the next boot. recoverInterruptedUpdates has already reconciled them by this point.
       if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
 
       const pluginPath = path.join(dir, entry.name);
@@ -221,6 +344,12 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
           pluginPath,
           action: 'manifest_missing',
         });
+        if (LEGACY_REMOVED_PLUGIN_IDS.has(entry.name)) {
+          this.pluginStorage.deletePluginEntry(entry.name);
+          this.logger.log(`Pruned stale registry entry for removed built-in plugin: ${entry.name}`, {
+            action: 'registry_ghost_pruned',
+          });
+        }
         continue;
       }
 
@@ -232,6 +361,67 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
           error instanceof Error ? error.message : String(error),
           { pluginPath, action: 'plugin_load_failed' },
         );
+        // The runtime just dropped this plugin, but a registry entry from a previous successful
+        // load still claims it installed/enabled — reconcile the persisted state to ERROR so the
+        // mismatch surfaces instead of silently persisting. The entry itself (operator config,
+        // enabledByOperator) is preserved: fix the manifest/main and the next boot loads and
+        // re-enables it (ensureRegistryEntry resets the status on a successful load). No-op when
+        // no entry exists (a hand-placed dir that never loaded).
+        this.pluginStorage.setPluginStatus(entry.name, PluginStatus.ERROR);
+      }
+    }
+  }
+
+  /**
+   * Crash recovery for in-place updates (see PluginsService.updatePackageInner). An update stages the
+   * new tree at `.<id>.new`, then swaps with two renames (live → `.<id>.bak`, staging → live). Both
+   * siblings are dot-prefixed, so the scan above skips them — but without reconciliation a crash
+   * BETWEEN the renames loses the live dir and the plugin silently vanishes from the runtime while
+   * its registry entry still claims it is installed. Reconcile before scanning:
+   *  - live dir missing + `.<id>.bak` present → the swap was interrupted: restore the backup as the
+   *    live dir (the previous version comes back; the update never touched the registry entry or the
+   *    operator's config, so nothing else needs repairing).
+   *  - live dir present + `.<id>.bak` present → the swap completed but the process died before the
+   *    backup cleanup: drop the backup.
+   *  - `.<id>.new` present → staging from an interrupted/failed update; the live install (if any)
+   *    was never swapped: drop it.
+   * Best-effort: a reconciliation failure is logged and left for the next boot rather than aborting
+   * plugin loading entirely.
+   */
+  private recoverInterruptedUpdates(dir: string): void {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const match = /^\.(.+)\.(?:bak|new)$/.exec(entry.name);
+      if (!match) continue;
+      const pluginId = match[1];
+      const leftover = path.join(dir, entry.name);
+      const liveDir = path.join(dir, pluginId);
+      try {
+        if (entry.name === pluginUpdateStagingDirName(pluginId)) {
+          fs.rmSync(leftover, { recursive: true, force: true });
+          this.logger.warn(`Dropped stale update staging for plugin ${pluginId}`, {
+            pluginId,
+            action: 'plugin_update_staging_pruned',
+          });
+        } else if (!fs.existsSync(liveDir)) {
+          fs.renameSync(leftover, liveDir);
+          this.logger.warn(
+            `Restored plugin ${pluginId} from its update backup — a previous update was interrupted mid-swap`,
+            { pluginId, action: 'plugin_update_backup_restored' },
+          );
+        } else {
+          fs.rmSync(leftover, { recursive: true, force: true });
+          this.logger.warn(`Dropped stale update backup for plugin ${pluginId}`, {
+            pluginId,
+            action: 'plugin_update_backup_pruned',
+          });
+        }
+      } catch (error) {
+        this.logger.error(
+          `Failed to reconcile the interrupted-update leftover ${entry.name}`,
+          error instanceof Error ? error.message : String(error),
+          { pluginId, action: 'plugin_update_recovery_failed' },
+        );
       }
     }
   }
@@ -239,21 +429,39 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
   loadPlugin(pluginPath: string): PluginInstance {
     const manifestPath = path.join(pluginPath, 'manifest.json');
     const manifestContent = fs.readFileSync(manifestPath, 'utf-8');
-    const manifest = JSON.parse(manifestContent) as PluginManifest;
+    const manifest = JSON.parse(manifestContent) as unknown;
 
-    // Validate manifest
-    if (!manifest.id || !manifest.name || !manifest.version || !manifest.type || !manifest.main) {
-      throw new Error(`Invalid manifest: missing required fields`);
+    // Boot-time validation is the SAME validation install runs (parsePluginPackage): a hand-placed
+    // or crash-leftover directory must satisfy the install contract too — plain-object shape,
+    // required string fields, id format + reserved ids, extension-only type, and a `main` that
+    // cannot escape the plugin dir. Otherwise a manifest the installer would have rejected loads
+    // anyway and only fails (or worse, runs unexpected code) at enable time.
+    validatePluginManifest(manifest);
+
+    // Anchor `main` inside THIS on-disk directory: the lexical check above is forward-slash only,
+    // so a platform-separator escape (e.g. Windows-style `..\x`) would slip past it — resolve and
+    // re-check containment here. Parity with install's in-archive check: the entry must exist as a
+    // file, or the plugin loads "successfully" and only blows up when someone enables it.
+    const mainPath = resolvePluginMainPath(path.dirname(pluginPath), path.basename(pluginPath), manifest.main);
+    if (!fs.existsSync(mainPath) || !fs.statSync(mainPath).isFile()) {
+      throw new Error(`Plugin ${manifest.id}: main file not found in the plugin directory: ${manifest.main}`);
     }
+
     // Reject a malformed ingress declaration (SDK-major mismatch, missing webhook:ingress permission,
     // duplicate/empty routes, non-positive toleranceSec) at load time instead of letting it silently
-    // load and become provisionable. No-op for plugins that declare no ingress.
-    validateIngressManifest(manifest);
+    // load and become provisionable. No-op for plugins that declare no ingress. A route declaring
+    // signature.scheme 'none' is rejected unless the operator opted in via ALLOW_UNSIGNED_INGRESS=true.
+    validateIngressManifest(manifest, this.configService.get<boolean>('ingress.allowUnsigned', false));
 
     // Surface a loud warning for any ingress route that skips signature verification — a scheme:'none'
-    // route is a fully-unauthenticated public endpoint that can trigger WhatsApp sends. Additive (a
-    // warning, not a refusal) so a legit scheme:'none' deployment still boots.
+    // route is a fully-unauthenticated public endpoint that can trigger WhatsApp sends. Only reachable
+    // when the operator opted in (otherwise validateIngressManifest above rejected it); the warning
+    // reminds them to front the URL with a network/reverse-proxy ACL.
     warnUnauthenticatedIngressRoutes(manifest, this.logger);
+
+    // Same loud-warning treatment for an hmac route whose declared timestamp is not bound into the
+    // signature: freshness is enforced, but an unsigned timestamp lets a replay mint a fresh one.
+    warnUnsignedTimestampRoutes(manifest, this.logger);
 
     // Check if plugin already loaded
     if (this.plugins.has(manifest.id)) {
@@ -269,7 +477,9 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     const pluginInstance: PluginInstance = {
       manifest,
       status: PluginStatus.INSTALLED,
-      config: storedConfig,
+      // Seed schema-declared defaults under the stored config, so a defaulted field is never
+      // missing when the plugin later runs (explicit values are never overwritten).
+      config: seedConfigDefaults(manifest.configSchema, storedConfig),
       instance: null,
       loadedAt: new Date(),
       builtIn: false,
@@ -299,20 +509,27 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
    * load into a 500). Does NOT enable or run the plugin — boot never auto-executes plugin code.
    */
   private ensureRegistryEntry(manifest: PluginManifest, builtIn: boolean): void {
-    // Reconcile the persisted entry with the freshly-loaded runtime: the runtime always loads
-    // INSTALLED and is never auto-enabled on boot (enabling must stay an explicit ADMIN action that
-    // runs the lifecycle), so the entry's status is (re)set to INSTALLED to match — a previously
-    // enabled plugin must be re-enabled after a restart. The operator's persisted config is preserved
-    // so secrets/settings survive. Best-effort: saveRegistry swallows fs errors, so a disk failure
-    // never turns a load into a 500.
+    // Reconcile the persisted entry with the freshly-loaded runtime: loading never runs the plugin, so
+    // the entry's status is (re)set to INSTALLED to match the runtime. Enabling is a separate step that
+    // runs the lifecycle — at bootstrap for a plugin the operator had enabled (see
+    // onApplicationBootstrap), or on an explicit ADMIN action. The operator's persisted config and
+    // enable decision are preserved so settings/secrets and the decision itself survive. Best-effort:
+    // saveRegistry swallows fs errors, so a disk failure never turns a load into a 500.
     const existing = this.pluginStorage.getPluginEntry(manifest.id);
+    // The operator's standing enable decision (#856). `status` below is deliberately reset, so intent
+    // has to live in its own field or a restart loses it. A pre-#856 row has no such field: adopt it
+    // from a status of ENABLED, which can only have been written by an explicit enable since the last
+    // boot (every boot rewrites the status to INSTALLED), so it is a faithful record of the intent.
+    const enabledByOperator = existing?.enabledByOperator ?? existing?.status === PluginStatus.ENABLED;
     this.pluginStorage.setPluginEntry({
       id: manifest.id,
       type: manifest.type,
       name: manifest.name,
       version: manifest.version,
       status: PluginStatus.INSTALLED,
-      config: existing?.config ?? {},
+      // The operator's persisted config survives, with schema-declared defaults seeded under it so
+      // the persisted entry matches the seeded runtime config (see loadPlugin).
+      config: seedConfigDefaults(manifest.configSchema, existing?.config ?? {}),
       builtIn,
       installedAt: existing?.installedAt ?? new Date(),
       updatedAt: new Date(),
@@ -320,7 +537,20 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       // carried over or every boot wipes them from disk (lost after the second restart).
       activeSessions: existing?.activeSessions,
       sessionConfig: existing?.sessionConfig,
+      enabledByOperator,
     });
+  }
+
+  /**
+   * Record that the operator wants this plugin on (or off), so bootstrap can restore it (#856).
+   *
+   * Call this ONLY from an operator-facing action. In particular it must never be called from
+   * disablePlugin: onModuleDestroy disables every running plugin during a graceful shutdown, and
+   * treating that as "the operator turned it off" would erase the decision on the way out — which is
+   * the very bug this exists to fix, just moved somewhere harder to see.
+   */
+  setOperatorEnabled(pluginId: string, enabled: boolean): void {
+    this.pluginStorage.setPluginEnabledByOperator(pluginId, enabled);
   }
 
   async enablePlugin(pluginId: string): Promise<void> {
@@ -391,7 +621,15 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  async disablePlugin(pluginId: string): Promise<void> {
+  /**
+   * Disable an enabled plugin (best-effort force-teardown for sandboxed ones). `opts.unload` is set
+   * ONLY by the unload path (uninstall / in-place update): it additionally dispatches the plugin's
+   * onUnload hook. A plain disable (REST / shutdown teardown) deliberately does NOT fire onUnload —
+   * disable is reversible and its cleanup hook is onDisable, while onUnload means "removed from the
+   * runtime". (For a sandboxed plugin the worker thread does die on disable, but terminate() itself
+   * releases its timers/sockets; the hook contract stays: onUnload only on unload.)
+   */
+  async disablePlugin(pluginId: string, opts?: { unload?: boolean }): Promise<void> {
     const plugin = this.plugins.get(pluginId);
     if (!plugin) {
       throw new Error(`Plugin ${pluginId} not found`);
@@ -416,6 +654,21 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
             error: error instanceof Error ? error.message : String(error),
           });
         }
+        if (opts?.unload) {
+          // The worker is about to be terminated, so this is the ONLY chance onUnload ever gets for
+          // a sandboxed plugin — after terminate the hook is unreachable, and unloadPlugin's
+          // in-process call can't help (plugin.instance is null). Same bounded, best-effort policy
+          // as onDisable above: a wedged/throwing onUnload must never block the teardown.
+          try {
+            await host.runLifecycle('onUnload', SANDBOX_LIFECYCLE_TIMEOUT_MS);
+          } catch (error) {
+            this.logger.warn(`Sandboxed plugin ${pluginId} onUnload failed during unload; terminating anyway`, {
+              pluginId,
+              action: 'sandbox_unload_lifecycle_failed',
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
         await host.terminate().catch(() => undefined);
         this.sandboxHosts.delete(pluginId);
       } else {
@@ -433,6 +686,8 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       plugin.status = PluginStatus.DISABLED;
 
       this.pluginStorage.setPluginStatus(pluginId, PluginStatus.DISABLED);
+      // A fresh enable starts with a clean hook-error slate (the state is per runtime, not persisted).
+      this.lastSandboxHookError.delete(pluginId);
 
       this.logger.log(`Plugin disabled: ${plugin.manifest.name}`, {
         pluginId,
@@ -451,12 +706,16 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       throw new Error(`Plugin ${pluginId} not found`);
     }
 
-    // Disable first if enabled
+    // Disable first if enabled. `unload: true` so a SANDBOXED plugin also gets its onUnload hook:
+    // disable terminates the worker thread, which would otherwise make onUnload unreachable. An
+    // in-process plugin's onUnload runs below instead (its instance survives disable). A sandboxed
+    // plugin that is already disabled has no live worker left to notify — its resources were
+    // released when the worker terminated, so there is nothing to clean up.
     if (plugin.status === PluginStatus.ENABLED) {
-      await this.disablePlugin(pluginId);
+      await this.disablePlugin(pluginId, { unload: true });
     }
 
-    // Call onUnload
+    // Call onUnload (in-process plugins; a sandboxed one received it above, before terminate)
     if (plugin.instance?.onUnload) {
       const context = this.createPluginContext(plugin);
       await plugin.instance.onUnload(context);
@@ -501,6 +760,12 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     if (dir !== base && dir.startsWith(base + path.sep) && fs.existsSync(dir)) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+
+    // Drop the plugin's ctx.storage data dir. Under shipped defaults it lives INSIDE the package
+    // dir (already gone above), but a split-dir deployment (PLUGINS_DIR outside the data dir) would
+    // otherwise leak <dataDir>/plugins/<id> — persisted secrets included — on every uninstall.
+    // Best-effort, and strictly that one plugin's directory.
+    this.pluginStorage.deletePluginData(pluginId);
 
     this.logger.log(`Plugin uninstalled: ${pluginId}`, { pluginId, action: 'plugin_uninstalled' });
   }
@@ -593,6 +858,35 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Surface a sandboxed plugin's hook-handler failure host-side: record it for the plugin's health
+   * surface and emit one structured warn per event per SANDBOX_HOOK_ERROR_LOG_INTERVAL_MS — a hook
+   * that throws on every message must be visible, but must not become a log-flood vector. Suppressed
+   * occurrences are counted and ride the next emitted line.
+   */
+  private recordSandboxHookError(
+    pluginId: string,
+    event: string,
+    error: string,
+    rateLimit: Map<string, { lastAt: number; suppressed: number }>,
+  ): void {
+    this.lastSandboxHookError.set(pluginId, { event, error, at: new Date() });
+    const now = Date.now();
+    const state = rateLimit.get(event);
+    if (state && now - state.lastAt < SANDBOX_HOOK_ERROR_LOG_INTERVAL_MS) {
+      state.suppressed++;
+      return;
+    }
+    const suppressed = state?.suppressed ?? 0;
+    rateLimit.set(event, { lastAt: now, suppressed: 0 });
+    this.logger.warn(`Sandboxed plugin ${pluginId} hook '${event}' handler failed: ${error}`, {
+      pluginId,
+      event,
+      action: 'sandbox_hook_error',
+      ...(suppressed > 0 ? { suppressed } : {}),
+    });
+  }
+
+  /**
    * Run a plugin's healthCheck across both tiers. A sandboxed plugin's healthCheck lives in the worker
    * (plugin.instance is null), so route to the live worker host (time-bounded); built-ins use the
    * in-process instance. Returns the default "healthy" when the plugin implements no health check.
@@ -600,7 +894,14 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
   async checkPluginHealth(pluginId: string): Promise<{ healthy: boolean; message?: string }> {
     const sandboxHost = this.sandboxHosts.get(pluginId);
     if (sandboxHost) {
-      return sandboxHost.healthCheck(SANDBOX_HEALTH_TIMEOUT_MS);
+      const result = await sandboxHost.healthCheck(SANDBOX_HEALTH_TIMEOUT_MS);
+      // Attach the last hook-handler error the worker reported: a plugin whose hook throws on every
+      // event can still answer healthCheck "healthy" while doing nothing useful. This is operator
+      // context, not a verdict override — the worker's own healthCheck stays authoritative.
+      const lastError = this.lastSandboxHookError.get(pluginId);
+      if (!lastError) return result;
+      const note = `last hook error in '${lastError.event}' at ${lastError.at.toISOString()}: ${lastError.error}`;
+      return { healthy: result.healthy, message: result.message ? `${result.message}; ${note}` : note };
     }
     const plugin = this.plugins.get(pluginId);
     if (plugin?.instance?.healthCheck) {
@@ -624,6 +925,11 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     // provisioning wrote) so the ingress handler reads it as ctx.config — this is what makes a minted
     // instance multi-tenant. Best-effort: an unresolved plugin just yields undefined (base config only).
     const plugin = this.plugins.get(d.pluginId);
+    const route = plugin?.manifest.ingress?.find(candidate => candidate.route === d.route);
+    // Reaching dispatch means every authenticating scheme already passed host verification. A route
+    // explicitly configured with scheme:none is unauthenticated and must never be labelled verified.
+    // Missing/hot-swapped route metadata fails closed.
+    const verified = route ? route.signature.scheme !== 'none' : false;
     const instance = await this.getPluginInstanceService().resolve(d.pluginId, d.instanceId);
     const config = plugin
       ? resolvePluginConfig(
@@ -636,12 +942,12 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     const result = await host.dispatchWebhook({
       instanceId: d.instanceId,
       route: d.route,
-      method: 'POST',
+      method: d.method ?? 'POST',
       headers: d.payload.headers,
       query: d.payload.query,
       body: d.payload.body,
       rawBody: d.payload.rawBody,
-      verified: true,
+      verified,
       deliveryId: d.deliveryId,
       sessionId: d.sessionId,
       config,
@@ -773,6 +1079,22 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Definitive "this session row no longer exists" probe for the stale-mapping repair paths below.
+   * True ONLY on a clean not-found from the sessions table; any other failure (service unresolvable,
+   * DB error) returns false, so the cross-session fences stay fail-CLOSED when the answer is
+   * indeterminate. The runtime engine map can't answer this — a stopped session has no engine but
+   * still owns its mappings.
+   */
+  private async isSessionGone(sessionId: string): Promise<boolean> {
+    try {
+      await this.getSessionService().findOne(sessionId);
+      return false;
+    } catch (error) {
+      return error instanceof NotFoundException;
+    }
+  }
+
+  /**
    * Build a worker host for a sandboxed (untrusted) plugin. Overridable so tests can inject a fake
    * instead of spawning a real OS thread. Production loads the compiled worker bootstrap from dist.
    */
@@ -801,6 +1123,7 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       SANDBOX_MAX_INFLIGHT_CAPS,
       onSearchProviderRegister,
       onWorkerExit,
+      this.configService.get<number>('plugins.capTimeoutMs') ?? SANDBOX_CAP_TIMEOUT_MS,
     );
   }
 
@@ -868,6 +1191,9 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       if (subscribedEvents.has(event)) return;
       if (subscribedEvents.size >= KNOWN_HOOK_EVENTS.size) return; // can't exceed the known set
       subscribedEvents.add(event);
+      // Per-event rate-limit state for the hook-error log; local to this enable call so it is dropped
+      // on disable exactly like subscribedEvents.
+      const hookErrorLogState = new Map<string, { lastAt: number; suppressed: number }>();
       this.hookManager.register(
         pluginId,
         event,
@@ -922,7 +1248,12 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
                   action: 'sandbox_hook_timeout',
                 }),
             })
-            .then(result => ({ continue: result.continue, data: result.data }));
+            .then(result => {
+              // The worker reports (not throws) a hook-handler failure: surface it host-side instead
+              // of failing open in silence. The chain itself still proceeds fail-open.
+              if (result.error) this.recordSandboxHookError(pluginId, event, result.error, hookErrorLogState);
+              return { continue: result.continue, data: result.data };
+            });
         },
         priority,
       );
@@ -945,10 +1276,39 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     });
 
     // Route the worker plugin's ctx.logger.* calls to the same per-plugin logger an in-process plugin
-    // uses, so sandboxed plugins log identically (prefixed + structured) instead of bare stdout.
+    // uses, so sandboxed plugins log identically (prefixed + structured) instead of bare stdout. The
+    // relay is bounded: oversized lines are truncated and throughput is capped per window — a chatty
+    // or buggy plugin must not flood the host log. Dropped lines are counted and surfaced as one warn
+    // per window (never one line per drop, or the bound itself would be a flood vector), plus a final
+    // flush on worker exit so a plugin that goes quiet first doesn't silently lose the count. State is
+    // local to this enable call, so it resets on disable.
+    let logWindowStart = Date.now();
+    let logCount = 0;
+    let logDropped = 0;
     const onLog = (level: PluginLogLevel, message: string, meta?: Record<string, unknown>): void => {
-      if (level === 'error') context.logger.error(message, undefined, meta);
-      else context.logger[level](message, meta);
+      const now = Date.now();
+      if (now - logWindowStart >= SANDBOX_LOG_WINDOW_MS) {
+        if (logDropped > 0) {
+          this.logger.warn(
+            `Dropped ${logDropped} log messages from sandboxed plugin ${pluginId} (log relay rate limit)`,
+            { pluginId, action: 'sandbox_log_relay_dropped', dropped: logDropped },
+          );
+        }
+        logWindowStart = now;
+        logCount = 0;
+        logDropped = 0;
+      }
+      logCount++;
+      if (logCount > SANDBOX_LOG_MAX_PER_WINDOW) {
+        logDropped++;
+        return;
+      }
+      const bounded =
+        typeof message === 'string' && message.length > SANDBOX_LOG_MAX_MESSAGE_LENGTH
+          ? `${message.slice(0, SANDBOX_LOG_MAX_MESSAGE_LENGTH)}…[truncated]`
+          : message;
+      if (level === 'error') context.logger.error(bounded, undefined, meta);
+      else context.logger[level](bounded, meta);
     };
 
     // When the worker declares itself a search provider (ctx.registerSearchProvider →
@@ -974,6 +1334,16 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     // provider ACTIVE). Mirrors the enable-failure cleanup. Broader crash-lifecycle cleanup (status, hooks)
     // is a pre-existing gap for all bridges and out of scope here.
     const onWorkerExit = (code: number, intentional: boolean): void => {
+      // Final log-relay flush: the per-window drop warn above only fires when a new line arrives in a
+      // later window, so without this a plugin that goes quiet (or is disabled) before the rollover
+      // silently discards its pending count. The worker is gone, so no further lines can arrive.
+      if (logDropped > 0) {
+        this.logger.warn(
+          `Dropped ${logDropped} log messages from sandboxed plugin ${pluginId} (log relay rate limit)`,
+          { pluginId, action: 'sandbox_log_relay_dropped', dropped: logDropped },
+        );
+        logDropped = 0;
+      }
       // Always release the search-provider slot so the registry can fall back to builtin-fts. On a crash
       // this is the only cleanup; on a deliberate disable/enable-failure the explicit unregister already
       // ran, making this a harmless no-op.
@@ -1150,7 +1520,7 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
         assertPermission: this.assertPermission.bind(this),
         assertSessionActive: (sessionId: string) => this.assertSessionActive(plugin, sessionId),
         resolveChatId: async env => {
-          if (!env.instanceId || !env.source) {
+          if (!env.instanceId || !env.source?.externalConversationId) {
             throw new PluginCapabilityError(
               `Plugin ${plugin.manifest.id}: conversation.send requires chatId, or both instanceId and source to resolve one`,
             );
@@ -1163,6 +1533,31 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
           if (!mapping) {
             throw new PluginCapabilityError(
               `Plugin ${plugin.manifest.id}: no conversation mapping for instance ${env.instanceId} / ${env.source.externalConversationId}`,
+            );
+          }
+          // Fail closed on a cross-session mapping: getByProvider keys on (pluginId, instanceId,
+          // providerConversationId) only, so a stale row can resolve to a chat owned by a DIFFERENT
+          // session than the envelope's. Parity with the assertSessionActive(m.sessionId) check on
+          // mappings.getByProvider below — never send through a session the mapping does not belong to.
+          // (mapping.sessionId is NOT NULL in the entity, so a plain inequality check suffices. The
+          // env.sessionId guard is for the type only — the facade rejects a missing sessionId first.)
+          if (env.sessionId && mapping.sessionId !== env.sessionId) {
+            // Repair path: the mapping's session was DELETED (operator re-paired under a new id), so
+            // the row is stale rather than cross-session. Rebind it to the envelope's session —
+            // already activation-gated by the facade — and let the send proceed; without this the
+            // dead session's rows bricked conversation.send permanently. A mapping owned by another
+            // EXISTING session is a genuine cross-session violation and still throws.
+            if (await this.isSessionGone(mapping.sessionId)) {
+              await this.getConversationMappingService().rebindSession(mapping.id, env.sessionId);
+              this.logger.warn(
+                `Rebound conversation mapping for instance ${env.instanceId} / ${env.source.externalConversationId} ` +
+                  `from deleted session ${mapping.sessionId} to ${env.sessionId}`,
+                { pluginId: plugin.manifest.id, action: 'conversation_mapping_rebound' },
+              );
+              return mapping.chatId;
+            }
+            throw new PluginCapabilityError(
+              `Plugin ${plugin.manifest.id}: conversation mapping for instance ${env.instanceId} / ${env.source.externalConversationId} belongs to session ${mapping.sessionId}, not ${env.sessionId}`,
             );
           }
           return mapping.chatId;
@@ -1179,6 +1574,7 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
         sendText: (sessionId, opts) => this.getMessageService().sendText(sessionId, opts),
         reply: (sessionId, opts) => this.getMessageService().reply(sessionId, opts),
         sendMedia: (sessionId, opts) => dispatchConversationMedia(this.getMessageService(), sessionId, opts),
+        sendLocation: (sessionId, opts) => this.getMessageService().sendLocation(sessionId, opts),
       } satisfies Parameters<typeof buildConversationSendFacade>[0]) satisfies PluginConversationsCapability,
       handover: {
         set: async (key, state) => {
@@ -1204,10 +1600,30 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
         upsert: async (key, providerConversationId) => {
           this.assertPermission(plugin.manifest, PluginCapabilityPermission.CONVERSATION_SEND);
           this.assertSessionActive(plugin, key.sessionId);
-          await this.getConversationMappingService().upsert(
-            { sessionId: key.sessionId, chatId: key.chatId, pluginId: plugin.manifest.id, instanceId: key.instanceId },
-            providerConversationId,
-          );
+          const mappingKey = {
+            sessionId: key.sessionId,
+            chatId: key.chatId,
+            pluginId: plugin.manifest.id,
+            instanceId: key.instanceId,
+          };
+          try {
+            await this.getConversationMappingService().upsert(mappingKey, providerConversationId);
+          } catch (error) {
+            if (!(error instanceof ConversationMappingConflict)) throw error;
+            // The reverse unique key is held by another row. If that row's session was DELETED
+            // (operator re-paired under a new id), the adapter can never converge — the forward key
+            // carries the new sessionId, so every upsert bricks on the dead session's row. Supersede
+            // the stale row and retry once. A row owned by an EXISTING session is a genuine conflict
+            // and rethrows.
+            const stale = await this.getConversationMappingService().getByProvider(
+              plugin.manifest.id,
+              key.instanceId,
+              providerConversationId,
+            );
+            if (!stale || !(await this.isSessionGone(stale.sessionId))) throw error;
+            await this.getConversationMappingService().delete(stale.id);
+            await this.getConversationMappingService().upsert(mappingKey, providerConversationId);
+          }
         },
         get: async key => {
           this.assertPermission(plugin.manifest, PluginCapabilityPermission.CONVERSATION_SEND);

@@ -51,6 +51,11 @@ services:
       - XDG_CONFIG_HOME=/tmp/.config
       - XDG_CACHE_HOME=/tmp/.cache
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      # Restart-resilience: auto-start previously authenticated sessions on boot. The liveness
+      # watchdog (#798) only covers a RUNNING container — a `compose down/up` or rebuild kills every
+      # engine, and without this flag sessions sit at `disconnected` until started by hand. Default
+      # ON for the dev compose (single-operator box); the app-level default stays OFF.
+      - AUTO_START_SESSIONS=${AUTO_START_SESSIONS:-true}
       - DATABASE_TYPE=${DATABASE_TYPE:-sqlite}
       - DATABASE_NAME=${DATABASE_NAME:-}
       - DATABASE_SYNCHRONIZE=${DATABASE_SYNCHRONIZE:-true}
@@ -62,20 +67,35 @@ services:
       - SESSION_DATA_PATH=${SESSION_DATA_PATH:-/app/data/sessions}
       - PUPPETEER_HEADLESS=${PUPPETEER_HEADLESS:-true}
       - PUPPETEER_ARGS=${PUPPETEER_ARGS:---no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu}
-      # Optional WhatsApp Web version override. Leave empty for whatsapp-web.js auto-selection.
-      # If a session hangs at "authenticating", set WWEBJS_WEB_VERSION to a known-good cached build
-      # from wppconnect-team/wa-version; latest|auto|off also forces auto-selection.
+      # Optional WhatsApp Web version override. DEFAULT (empty, "latest", or "auto"): OpenWA auto-resolves a
+      # settled build from the third-party wppconnect-team/wa-version registry and pins its remote HTML
+      # (fetched into the web.whatsapp.com origin without an integrity check). Set "off" to disable pinning
+      # and use the first-party build served by WhatsApp, or an exact version to pin a specific build.
       - WWEBJS_WEB_VERSION=${WWEBJS_WEB_VERSION:-}
       - WWEBJS_WEB_VERSION_REMOTE_PATH=${WWEBJS_WEB_VERSION_REMOTE_PATH:-}
       # Raise whatsapp-web.js's first-boot init wait (default 30000ms) on slow boots. Empty = default.
       - WWEBJS_AUTH_TIMEOUT_MS=${WWEBJS_AUTH_TIMEOUT_MS:-}
+      # Forward the plain-HTTP dashboard CSP override; unset preserves the application default.
+      - CSP_UPGRADE_INSECURE_REQUESTS=${CSP_UPGRADE_INSECURE_REQUESTS:-}
       - STORAGE_TYPE=${STORAGE_TYPE:-local}
       - STORAGE_LOCAL_PATH=${STORAGE_LOCAL_PATH:-/app/data/media}
       # Install plugins into the writable, persistent data volume (the root FS is read-only). Matches
       # docker-compose.yml; without this it falls back to ./plugins on the read-only root and install fails.
       - PLUGINS_DIR=${PLUGINS_DIR:-/app/data/plugins}
       - WEBHOOK_TIMEOUT=${WEBHOOK_TIMEOUT:-10000}
-      - WEBHOOK_MAX_RETRIES=${WEBHOOK_MAX_RETRIES:-3}
+      - WEBHOOK_RETRY_DELAY=${WEBHOOK_RETRY_DELAY:-5000}
+      - WEBHOOK_DISPATCH_CONCURRENCY=${WEBHOOK_DISPATCH_CONCURRENCY:-16}
+      - WEBHOOK_DISPATCH_MAX_QUEUED=${WEBHOOK_DISPATCH_MAX_QUEUED:-1000}
+      - RATE_LIMIT_SHORT_TTL=${RATE_LIMIT_SHORT_TTL:-}
+      - RATE_LIMIT_SHORT_LIMIT=${RATE_LIMIT_SHORT_LIMIT:-}
+      - RATE_LIMIT_MEDIUM_TTL=${RATE_LIMIT_MEDIUM_TTL:-}
+      - RATE_LIMIT_MEDIUM_LIMIT=${RATE_LIMIT_MEDIUM_LIMIT:-}
+      - RATE_LIMIT_LONG_TTL=${RATE_LIMIT_LONG_TTL:-}
+      - RATE_LIMIT_LONG_LIMIT=${RATE_LIMIT_LONG_LIMIT:-}
+      # Max request body size. Base64 media sends ride in the JSON body, so the default is generous;
+      # raise this for large documents (e.g. BODY_SIZE_LIMIT=50mb). Blank keeps the app default of 25mb.
+      - BODY_SIZE_LIMIT=${BODY_SIZE_LIMIT:-}
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
       - QUEUE_ENABLED=${QUEUE_ENABLED:-false}
     volumes:
       - ./data:/app/data

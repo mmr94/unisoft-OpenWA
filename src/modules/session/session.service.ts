@@ -4,6 +4,7 @@ import {
   ConflictException,
   BadRequestException,
   ServiceUnavailableException,
+  BadGatewayException,
   HttpException,
   HttpStatus,
   OnModuleDestroy,
@@ -14,7 +15,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
 import { Repository, In, Not, IsNull, DataSource, FindManyOptions } from 'typeorm';
-import { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
+import { QueryDeepPartialEntity } from 'typeorm';
 import { Session, SessionStatus } from './entities/session.entity';
 import { Message, MessageDirection, MessageStatus } from '../message/entities/message.entity';
 import { MessageBatch } from '../message/entities/message-batch.entity';
@@ -29,6 +30,9 @@ import { userPart } from '../../engine/identity/wa-id';
 import { paginate, ListOptions, resolveListWindow } from '../../common/utils/paginate';
 import { isUniqueConstraintError } from '../../common/utils/unique-constraint.util';
 import { resolveFeatureFlags } from '../../config/feature-flags';
+import { DEFAULT_MEDIA_MAX_BYTES, STATUS_TTL_MS, StatusStoreService } from '../status-store/status-store.service';
+import { buildIncomingStatus } from '../status-store/incoming-status';
+import type { StatusUpdate } from '../status-store/entities/status-update.entity';
 import {
   IWhatsAppEngine,
   EngineStatus,
@@ -37,6 +41,9 @@ import {
   DeliveryStatus,
   IncomingMessage,
   ReactionEvent,
+  EditedMessage,
+  GroupEvent,
+  IncomingCallEvent,
 } from '../../engine/interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
 import { ShutdownService } from '../../common/services/shutdown.service';
@@ -52,6 +59,18 @@ import {
   deliveryStatusToAck,
   ackStatusTransitionFrom,
 } from '../message/message-status.util';
+
+// Message types that carry downloadable media. Any persisted row of these types must have a media
+// marker in metadata — never NULL — or the dashboard renders an empty bubble (no placeholder) and the
+// by-type stats filter skips the row. Sources that lack the payload (wwjs own-send echo, media-free
+// history sync) get the omitted marker synthesized at the persistence chokepoints.
+const MEDIA_MESSAGE_TYPES = new Set(['image', 'video', 'audio', 'voice', 'sticker', 'document']);
+
+// How many recent status-broadcast messages the connect-time seed pulls (each with its media).
+// ponytail: fixed ceiling — the most-recent 50 cover a normal account's 24h of stories; anything
+// posted after connect still lands live via onMessage. Make it configurable only if a flood account
+// proves 50 too few.
+const STATUS_SEED_LIMIT = 50;
 
 interface ReconnectState {
   attempts: number;
@@ -227,10 +246,16 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   // awaited hook and orphan an engine the lifecycle could never destroy.
   private initializingSessions: Set<string> = new Set();
 
-  // Serializes the read-modify-write of a message's reactions map per `${sessionId}:${waMessageId}`,
-  // so two concurrent reaction events on the same message don't clobber each other (both read the
-  // same snapshot, both full-row save, last writer wins). Entries are deleted once their chain drains.
-  private reactionChains: Map<string, Promise<void>> = new Map();
+  // Serializes stored-message mutations per `${sessionId}:${waMessageId}`. Reactions perform a
+  // read-modify-write and rapid edits must remain latest-write-wins; sharing one chain also preserves
+  // order when different mutation kinds for the same message arrive together.
+  private messageMutationChains: Map<string, Promise<void>> = new Map();
+
+  // Raw teardown promises that outlived their deadline race in teardownEngineSafely. A losing
+  // logout() promise keeps running and ends in an fs.rm of the session's on-disk profile — the
+  // same deterministic path a later start() re-creates — so start()/delete() consult this map and
+  // wait (bounded) for settlement before touching that path. Entries self-remove on settlement.
+  private readonly pendingTeardowns = new Map<string, Promise<void>>();
 
   constructor(
     @InjectRepository(Session, 'data')
@@ -243,6 +268,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     private readonly eventsGateway: EventsGateway,
     private readonly webhookService: WebhookService,
     private readonly hookManager: HookManager,
+    private readonly statusStore: StatusStoreService,
     @Optional()
     private readonly configService?: ConfigService,
     // Shared lid<->phone table (global). Used to persist an inbound @lid sender's resolved phone so
@@ -266,6 +292,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       SessionStatus.INITIALIZING,
       SessionStatus.QR_READY,
       SessionStatus.AUTHENTICATING,
+      SessionStatus.ACTION_REQUIRED,
     ];
 
     const result = await this.sessionRepository.update(
@@ -427,38 +454,90 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     this.engines.clear();
   }
 
-  /** Destroy one engine, isolating + time-bounding failures so shutdown can't be stalled or aborted. */
-  private async destroyEngineSafely(sessionId: string, engine: IWhatsAppEngine): Promise<void> {
+  /** Destroy one engine, isolating + time-bounding failures so shutdown can't be stalled or aborted.
+   *  Resolves to whether the destroy actually completed (see teardownEngineSafely). */
+  private async destroyEngineSafely(sessionId: string, engine: IWhatsAppEngine): Promise<boolean> {
     this.logger.log(`Destroying engine for session ${sessionId}`, { sessionId, action: 'shutdown' });
-    await this.teardownEngineSafely(sessionId, engine, e => e.destroy(), 'destroy');
+    return this.teardownEngineSafely(sessionId, engine, e => e.destroy(), 'destroy');
   }
 
   /**
    * Run an engine teardown (destroy/disconnect), isolating + time-bounding failures so a stuck
    * Chromium/socket can neither hang nor abort the caller. Always resolves — the caller is then free
    * to reconcile the engines Map and proceed with DB cleanup regardless of teardown outcome.
+   * Resolves to whether the teardown actually completed: `false` means it threw or hit the 10s
+   * deadline, so the underlying Chromium/socket may still be alive (a caller with an operator-facing
+   * outcome, like stopOrphanEngines, must surface that instead of reporting a clean stop).
+   *
+   * A teardown that loses the deadline race keeps running past the caller's return. For 'logout'
+   * that leftover promise ends in an fs.rm of the session's on-disk profile — the same path a
+   * later start() re-creates — so the raw promise is registered in pendingTeardowns and start()/
+   * delete() wait (bounded) for it to settle before touching that path.
    */
   private async teardownEngineSafely(
     sessionId: string,
     engine: IWhatsAppEngine,
     teardown: (e: IWhatsAppEngine) => Promise<void>,
-    label: 'destroy' | 'disconnect' | 'force-destroy',
-  ): Promise<void> {
+    label: 'destroy' | 'disconnect' | 'force-destroy' | 'logout',
+  ): Promise<boolean> {
+    const raw = teardown(engine);
+    if (label === 'logout') {
+      // Settlement marker only — never rejects, so it can't drive the race below to a false
+      // "completed"; the race still observes the raw promise. Identity-checked on removal so a
+      // newer teardown's entry isn't evicted by an older one settling.
+      const tracked = raw.catch(() => undefined);
+      this.pendingTeardowns.set(sessionId, tracked);
+      void tracked.finally(() => {
+        if (this.pendingTeardowns.get(sessionId) === tracked) {
+          this.pendingTeardowns.delete(sessionId);
+        }
+      });
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        teardown(engine),
+        raw,
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error(`engine.${label}() timed out`)), 10_000);
         }),
       ]);
+      return true;
     } catch (err) {
       this.logger.error(`Failed to ${label} engine for session ${sessionId}`, String(err), {
         sessionId,
         action: `engine_${label}_failed`,
       });
+      return false;
     } finally {
       if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Wait (bounded) for a teardown that lost its deadline race to settle. A losing logout() promise
+   * ends in an fs.rm of the on-disk profile — the same deterministic path start() re-creates and
+   * delete() purges — so those paths call this before touching disk. If the teardown is still
+   * wedged past the bound, proceed anyway: its rm sits behind the wedge, blocking the operator
+   * indefinitely is worse, and the residual window is logged.
+   */
+  private async awaitPendingTeardown(id: string): Promise<void> {
+    const pending = this.pendingTeardowns.get(id);
+    if (!pending) return;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settled = await Promise.race([
+      pending.then(() => true),
+      new Promise<boolean>(resolve => {
+        timer = setTimeout(() => resolve(false), 10_000);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (!settled) {
+      this.logger.warn(
+        `Proceeding while a previous logout teardown for session ${id} is still wedged — its ` +
+          'stale profile cleanup may land late',
+        { sessionId: id, action: 'pending_teardown_wait_exhausted' },
+      );
     }
   }
 
@@ -542,12 +621,16 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   /**
-   * Populate the transient `lastError` field from the in-memory error map. Only a
-   * FAILED session carries an error; any other status clears it so a recovered
-   * session never shows a stale failure reason.
+   * Populate the transient `lastError` field from the in-memory error map. A FAILED session always
+   * carries its failure reason, and an ACTION_REQUIRED session carries what the operator must do
+   * (e.g. the whatsapp-web.js onboarding-modal fallback, #982); any other status clears it so a
+   * recovered session never shows a stale reason.
    */
   private attachLastError(session: Session): Session {
-    session.lastError = session.status === SessionStatus.FAILED ? this.sessionErrors.get(session.id) : undefined;
+    session.lastError =
+      session.status === SessionStatus.FAILED || session.status === SessionStatus.ACTION_REQUIRED
+        ? this.sessionErrors.get(session.id)
+        : undefined;
     return session;
   }
 
@@ -575,7 +658,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       const engine = this.engines.get(id);
       if (engine) {
         await this.teardownEngineSafely(id, engine, e => e.forceDestroy(), 'force-destroy');
-        this.engines.delete(id);
+        if (this.isLiveEngine(id, engine)) this.engines.delete(id);
       }
 
       // Execute hook BEFORE delete so plugins can access session data
@@ -614,10 +697,14 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         action: 'delete',
       });
 
-      // Purge the engine's persistent on-disk auth/store dir. It's keyed by session NAME and lives
-      // independently of the (now torn-down, and on delete often never-loaded) engine instance, so the
-      // teardown above doesn't touch it. Without this, recreating a session under the same name reloads
-      // a stale store. Best-effort inside the factory — never fails an otherwise-successful delete.
+      // Purge the persistent on-disk auth/store dirs — BOTH engine shapes (see EngineFactory), since
+      // an engine switch may have left a live link for the other engine behind. They're keyed by
+      // session NAME and live independently of the (now torn-down, and on delete often never-loaded)
+      // engine instance, so the teardown above doesn't touch them. Without this, recreating a session
+      // under the same name reloads a stale store. Best-effort inside the factory — never fails an
+      // otherwise-successful delete. A wedged logout teardown from before this delete may still hold
+      // a pending fs.rm of the same dirs — wait (bounded) for it to settle first.
+      await this.awaitPendingTeardown(id);
       await this.engineFactory.purgeSessionData(session.name);
     } finally {
       // Always clear the teardown mark so a later recreate/start with this id isn't suppressed.
@@ -630,31 +717,38 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   async start(id: string): Promise<Session> {
-    const session = await this.findOne(id);
-
-    // Reserve the slot SYNCHRONOUSLY (same tick as the has() check) so two near-simultaneous
-    // start() calls can't both pass the check and orphan an engine — the has() -> engines.set()
-    // window spans the awaited hook below. The second caller is rejected; the finally clears the
-    // reservation on success AND failure so a failed start never wedges at "already starting".
-    if (this.engines.has(id)) {
-      throw new BadRequestException('Session is already started');
-    }
+    // Reserve the slot SYNCHRONOUSLY at entry — before even the findOne await. Two near-simultaneous
+    // start() calls must not both pass the check and orphan an engine (the has() -> engines.set()
+    // window spans the awaited hook below), and the infra import pre-flight (getActiveSessionIds)
+    // must see an in-flight start during the findOne round-trip too: registered only after findOne,
+    // a start would be invisible in that window and a stopOrphans import could DELETE the session
+    // row while an engine for it is being created. The finally clears the reservation on success
+    // AND failure so a failed start never wedges at "already starting".
     if (this.initializingSessions.has(id)) {
       throw new BadRequestException('Session is already starting');
-    }
-    const maxConcurrentSessions = resolveMaxConcurrentSessions(this.configService);
-    if (maxConcurrentSessions !== null) {
-      // Count each session once. A session mid-initialization is transiently in BOTH `engines` (set at
-      // the start of initializeEngine) and `initializingSessions` (until start()'s finally), so summing
-      // the two sizes would double-count it and falsely reject new starts at ~half the configured cap.
-      const activeCount = new Set<string>([...this.engines.keys(), ...this.initializingSessions]).size;
-      if (activeCount >= maxConcurrentSessions) {
-        throw new BadRequestException(`Maximum concurrent sessions reached (${maxConcurrentSessions})`);
-      }
     }
     this.initializingSessions.add(id);
 
     try {
+      const session = await this.findOne(id);
+
+      if (this.engines.has(id)) {
+        throw new BadRequestException('Session is already started');
+      }
+      const maxConcurrentSessions = resolveMaxConcurrentSessions(this.configService);
+      if (maxConcurrentSessions !== null) {
+        // Count each OTHER session once. A session mid-initialization is transiently in BOTH
+        // `engines` (set at the start of initializeEngine) and `initializingSessions` (until
+        // start()'s finally), so summing the two sizes would double-count it; and `id` itself is
+        // already reserved in `initializingSessions` (added at entry), so it must not count
+        // against the cap it is being checked against.
+        const activeIds = new Set<string>([...this.engines.keys(), ...this.initializingSessions]);
+        activeIds.delete(id);
+        if (activeIds.size >= maxConcurrentSessions) {
+          throw new BadRequestException(`Maximum concurrent sessions reached (${maxConcurrentSessions})`);
+        }
+      }
+
       // A fresh start intentionally (re-)creates the engine — clear any stale stop/delete mark.
       this.stoppingSessions.delete(id);
 
@@ -678,6 +772,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // so a poisoned value can't drive a NaN/immediate-relaunch storm or an unbounded loop.
       const { maxAttempts, baseDelay } = resolveReconnectConfig(session.config);
       this.reconnectStates.set(id, { attempts: 0, timer: null, maxAttempts, baseDelay });
+
+      // A logout teardown that lost its deadline race may still be running, and it ends in an
+      // fs.rm of this session's on-disk profile — the same path initializeEngine is about to
+      // populate. Wait (bounded) for it to settle so the stale rm can't land on fresh credentials.
+      await this.awaitPendingTeardown(id);
 
       try {
         await this.initializeEngine(id, session);
@@ -712,8 +811,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         const resurrected = this.engines.get(id);
         if (resurrected) {
           await this.teardownEngineSafely(id, resurrected, e => e.destroy(), 'destroy');
-          this.engines.delete(id);
+          if (this.isLiveEngine(id, resurrected)) this.engines.delete(id);
         }
+        // A delete() that raced this start purged the on-disk auth dirs BEFORE this init re-created
+        // them — purge again so the window leaves no credential residue behind (no-op for a stop()).
+        await this.purgeAuthDirsIfDeleted(id, session.name);
       }
       return this.findOne(id);
     } finally {
@@ -732,6 +834,108 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    */
   private isLiveEngine(id: string, engine: IWhatsAppEngine): boolean {
     return this.engines.get(id) === engine;
+  }
+
+  /**
+   * Backfill currently-active statuses from the engine on connect, so the store has today's stories
+   * even for ones posted before this session came online (live posts land via onMessage). Best-effort:
+   * Baileys doesn't support this (throws EngineNotSupportedError) and any other engine error must not
+   * take down the ready path, so every failure is swallowed here. Ingest is idempotent on
+   * `(sessionId, waStatusId)`, so this can never double-count a status onMessage already ingested.
+   */
+  private async seedStatuses(sessionId: string, engine: IWhatsAppEngine): Promise<void> {
+    try {
+      // Read the status-broadcast chat's own recent messages rather than getContactStatuses(): on
+      // whatsapp-web.js the latter reads the StatusV3 collection, which loads asynchronously and is
+      // near-empty right after ready, so a status posted before connect would silently never reach the
+      // store. Fetching the chat's messages (the same on-demand fetch the chat-history endpoint uses)
+      // reliably returns the currently-active statuses with downloadable media/video, and each maps
+      // through the very buildIncomingStatus the live onMessage path uses — so a seeded status is
+      // indistinguishable from one that arrives live. No status.received webhook is dispatched here:
+      // this is a backfill of posts that predate the connection, not a live arrival.
+      // Pre-gate media downloads at the store's own cap: a larger blob would be discarded as
+      // over_cap on ingest anyway, so downloading it is pure waste (heap + bandwidth).
+      const mediaMaxBytes =
+        this.configService?.get<number>('status.mediaMaxBytes', DEFAULT_MEDIA_MAX_BYTES) ?? DEFAULT_MEDIA_MAX_BYTES;
+      const messages = await engine.getChatHistory('status@broadcast', STATUS_SEED_LIMIT, true, mediaMaxBytes);
+      // getChatHistory maps a message's contact from the sync cache only, so status posters (usually
+      // @lid ids) come back nameless. Resolve each unique poster once via getContactById — the same
+      // lookup the contacts API uses, which maps the @lid to the real contact — so a seeded status
+      // carries the poster's name like a live one does. Cached per JID: one lookup per contact, not
+      // one per status.
+      const contactNames = new Map<string, { name?: string; pushName?: string }>();
+      const resolvePoster = async (jid: string): Promise<{ name?: string; pushName?: string }> => {
+        const cached = contactNames.get(jid);
+        if (cached) return cached;
+        let resolved: { name?: string; pushName?: string } = {};
+        try {
+          const contact = await engine.getContactById(jid);
+          if (contact) resolved = { name: contact.name, pushName: contact.pushName };
+        } catch {
+          // Best-effort: a failed lookup just leaves the status nameless.
+        }
+        contactNames.set(jid, resolved);
+        return resolved;
+      };
+      for (const msg of messages) {
+        try {
+          // Mirrors the live path's own-send drop: the broadcast chat's history also contains the
+          // account's OWN active statuses, which must not come back as if a contact had posted them.
+          if (msg.fromMe) continue;
+          // A status whose 24h already ran out is hidden by WhatsApp and would only live until the
+          // next purge sweep — don't backfill it (its media was downloaded by getChatHistory
+          // regardless; this just skips the row).
+          if (msg.timestamp * 1000 + STATUS_TTL_MS <= Date.now()) continue;
+          const status = buildIncomingStatus(msg);
+          if (!status) continue;
+          if (!status.contactName && !status.contactPushName) {
+            const poster = await resolvePoster(status.contactJid);
+            status.contactName = poster.name;
+            status.contactPushName = poster.pushName;
+          }
+          await this.statusStore.ingest(sessionId, status);
+        } catch (itemErr) {
+          // One bad item must not abort the whole backfill.
+          this.logger.warn('Status seed item skipped', {
+            sessionId,
+            error: itemErr instanceof Error ? itemErr.message : String(itemErr),
+          });
+        }
+      }
+    } catch (err) {
+      this.logger.debug('Status seed skipped', {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Dispatches the opt-in `status.received` webhook once an inbound status row is ingested, and
+   * mirrors it over the websocket so the dashboard's statuses view refreshes live instead of
+   * waiting for a focus refetch. `WebhookService.dispatch` already filters delivery to webhooks
+   * whose `events` array includes `status.received`, so no extra gating is needed here. No media
+   * bytes are included in the payload — consumers fetch media via the status media endpoint.
+   */
+  private dispatchStatusReceived(sessionId: string, row: StatusUpdate): void {
+    const payload = {
+      sessionId,
+      statusId: row.waStatusId,
+      contact: {
+        id: row.contactJid,
+        ...(row.contactName ? { name: row.contactName } : {}),
+        ...(row.contactPushName ? { pushName: row.contactPushName } : {}),
+      },
+      type: row.type,
+      ...(row.caption ? { caption: row.caption } : {}),
+      hasMedia: Boolean(row.mediaPath) && !row.mediaOmitted,
+      mediaOmitted: row.mediaOmitted,
+      ...(row.omitReason ? { omitReason: row.omitReason } : {}),
+      postedAt: row.postedAt,
+      expiresAt: row.expiresAt,
+    };
+    void this.webhookService.dispatch(sessionId, 'status.received', payload);
+    this.eventsGateway.emitStatusReceived(sessionId, payload);
   }
 
   /**
@@ -765,7 +969,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       const chunkIds = ids.slice(i, i + CHUNK);
       const existing = await this.messageRepository.find({
         where: { sessionId: id, waMessageId: In(chunkIds) },
-        select: ['waMessageId'],
+        select: { waMessageId: true },
       });
       const seen = new Set(existing.map(r => r.waMessageId));
       const rows = chunkIds
@@ -773,13 +977,23 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         .map(x => {
           const m = byId.get(x)!;
           const metadata: Record<string, unknown> = {};
-          if (m.media) metadata.media = m.media;
+          if (m.media) {
+            metadata.media = m.media;
+          } else if (MEDIA_MESSAGE_TYPES.has(m.type)) {
+            // History sync maps messages media-free (footprint). Without the marker the row renders
+            // as an empty bubble — the DB copy wins over the engine-history placeholder in the
+            // dashboard merge — and the by-type stats filter would skip it.
+            metadata.media = { mimetype: '', omitted: true };
+          }
           if (m.quotedMessage) metadata.quotedMessage = m.quotedMessage;
           if (m.call) metadata.call = m.call;
           const row = this.messageRepository.create({
             sessionId: id,
             waMessageId: m.id,
             chatId: m.chatId,
+            // Group poster for inbound rows only — the account's own backfilled group messages must
+            // not carry author (the column's contract is "null on outgoing echoes").
+            author: m.fromMe ? undefined : m.author,
             from: m.from,
             to: m.to,
             body: m.body,
@@ -910,12 +1124,41 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
               error: err instanceof Error ? err.message : String(err),
             }),
           );
+
+        // Best-effort snapshot of the account's own contacts' currently-active statuses. Live status
+        // posts arrive through onMessage below; this just backfills what was already up before we
+        // connected. Not awaited — onReady must not block on it.
+        void this.seedStatuses(id, engine);
       },
       onMessage: (message): void => {
         if (!this.isLiveEngine(id, engine)) return;
-        // Status/Story posts arrive via the inbound path for some engines; don't persist or webhook them.
-        // Mirrors the isStatusBroadcast guard in onMessageCreate below.
+        // Status/Story posts arrive via the inbound path for some engines; ingest them into the
+        // status store instead of the message pipeline. Mirrors the isStatusBroadcast guard in
+        // onMessageCreate below: an own-send echo (fromMe) stays a plain drop — never ingested,
+        // never dispatched — so a status you posted never re-appears in your own webhooks/API as
+        // if a contact had posted it.
         if (message.isStatusBroadcast) {
+          if (message.fromMe) return;
+          const status = buildIncomingStatus(message);
+          if (status) {
+            void this.statusStore
+              .ingest(id, status)
+              // Dispatch only on a fresh insert: ingest also resolves with the pre-existing row
+              // for a duplicate delivery (or the winner's row after a lost insert race), and the
+              // webhook must fire once per status, not once per (re)delivery.
+              .then(({ row, created }) => {
+                // The ingest awaited; a stop()/delete() can retire this engine mid-flight — don't
+                // dispatch for a session that no longer exists (mirrors message.received's re-check).
+                if (!this.isLiveEngine(id, engine)) return;
+                if (created) this.dispatchStatusReceived(id, row);
+              })
+              .catch(err =>
+                this.logger.warn('Status ingest failed', {
+                  sessionId: id,
+                  error: err instanceof Error ? err.message : String(err),
+                }),
+              );
+          }
           return;
         }
         // Ephemeral/disappearing messages: skip persist + dispatch when the operator opted out.
@@ -950,11 +1193,23 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             sessionId: id,
             source: 'Engine',
           })
-          .then(async ({ continue: shouldContinue, data: finalMessage }) => {
-            if (!shouldContinue) {
-              // A plugin handled the event and asked to stop the chain (continue: false).
-              return;
-            }
+          .then(async ({ data: finalMessage }) => {
+            // `continue: false` is deliberately NOT read here. It means "stop the handler chain", which
+            // HookManager has already done — the plugins after the one that returned it never ran. It
+            // does not mean "this message never happened".
+            //
+            // Honouring it here used to skip everything below: the message was never written to the
+            // messages table, never dispatched to webhooks, and never emitted over the websocket. An
+            // auto-reply plugin returning `false` for its ordinary purpose — keeping other bots from
+            // answering the same message — silently erased the customer's message from the operator's
+            // own history, leaving a thread of bot replies answering nothing. Nothing in the hook
+            // contract (`HookResult.continue`, docs/19) or the webhook contract (`message.received`
+            // fires when "an inbound message arrives", docs/06) hinted at that, and a sandboxed
+            // marketplace plugin could swallow a session's entire inbound traffic with no audit trail.
+            //
+            // The message has already arrived at WhatsApp. A plugin can stop other plugins from acting
+            // on it; it cannot make the gateway forget it. Pre-action hooks are where a veto belongs —
+            // `message:sending` blocks a send that has not happened yet (core/hooks/sending-gate.ts).
 
             // Persist the incoming message so the dashboard chats view can render history.
             const incoming: IncomingMessage = finalMessage;
@@ -981,9 +1236,16 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
             const dbMessage = this.messageRepository.create({
               sessionId: id,
-              waMessageId: incoming.id,
+              // Mirror saveOutgoingMessage's chokepoint: an engine that received a message but could
+              // not read its id back reports the empty sentinel, and NULL is what the non-partial
+              // (sessionId, waMessageId) unique index exempts — `''` would collide the second such
+              // message and lose the row.
+              waMessageId: incoming.id || undefined,
               chatId: incoming.chatId,
               chatName,
+              // Group poster (participant JID) — `from` is the group JID, so this is the stable
+              // sender identity the chat view keys attribution runs/colors on. Undefined for 1:1.
+              author: incoming.author,
               from: incoming.from,
               to: incoming.to,
               body: incoming.body,
@@ -1095,18 +1357,90 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             sessionId: id,
             source: 'Engine',
           })
-          .then(({ continue: shouldContinue, data: finalMessage }) => {
-            if (!shouldContinue) {
-              return;
+          .then(async ({ data: finalMessage }) => {
+            // `continue: false` is not read here, for the same reason as the message:received path
+            // above: the send has already happened, so a plugin can stop the handler chain but cannot
+            // un-send it. Skipping the persist below dropped the operator's own outgoing message from
+            // history and from `message.sent` webhooks.
+
+            // Persist the outgoing message so local history reflects sends composed on a linked phone
+            // (message_create is the ONLY event those produce). It also fires for API-originated sends,
+            // which the REST send path persists itself — the UNIQUE(sessionId, waMessageId) index is
+            // the atomic dedup oracle between the two writers: the loser skips its insert, and
+            // persistSentState additionally drops its redundant PENDING row when the echo won. The
+            // webhook/WS dispatch below is identical whether the insert won, lost, or failed — the
+            // message.sent contract is unchanged.
+            const outgoing: IncomingMessage = finalMessage;
+            const metadata: Record<string, unknown> = {};
+            if (outgoing.media) {
+              metadata.media = outgoing.media;
+            } else if (MEDIA_MESSAGE_TYPES.has(outgoing.type)) {
+              // The wwjs own-send echo carries no media field at all (Baileys emits an omitted
+              // marker); synthesize it so the dashboard renders the 📎 placeholder instead of an
+              // empty bubble, and the row stays countable in the by-type stats.
+              metadata.media = { mimetype: '', omitted: true };
+            }
+            if (outgoing.quotedMessage) {
+              metadata.quotedMessage = outgoing.quotedMessage;
+            }
+            if (outgoing.call) {
+              metadata.call = outgoing.call;
             }
 
-            // NOTE: unlike onMessage (incoming), this path intentionally does NOT mirror the message
-            // to the `messages` table. message_create ALSO fires for API-originated sends, which the
-            // REST send path already persists — saving here would double-persist them. Safe
-            // persistence of phone-composed sends needs a unique (sessionId, waMessageId) index +
-            // de-dup and is tracked as a separate enhancement; until then this path only webhooks/
-            // emits. So local message history reflects API sends + all inbound, but not sends
-            // composed on a linked phone.
+            // The ephemeral opt-out gates STORAGE only (mirrors onMessage); the live dispatch below
+            // is today's contract and stays.
+            const mayPersist =
+              resolveFeatureFlags(this.configService).storeEphemeralMessages ||
+              !(outgoing.ephemeralDuration && outgoing.ephemeralDuration > 0);
+
+            if (mayPersist) {
+              const dbMessage = this.messageRepository.create({
+                sessionId: id,
+                // Mirror onMessage's chokepoint: an unreadable id is the empty sentinel, stored as
+                // NULL — `''` would collide on the second such message.
+                waMessageId: outgoing.id || undefined,
+                chatId: outgoing.chatId,
+                from: outgoing.from,
+                to: outgoing.to,
+                body: outgoing.body,
+                type: outgoing.type,
+                direction: MessageDirection.OUTGOING,
+                timestamp: outgoing.timestamp,
+                status: MessageStatus.SENT,
+                metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+              });
+              // The hook chain above is async; a delete()/teardown can retire this engine while it
+              // awaits. Re-check liveness so a late continuation can't persist an orphan row
+              // (mirrors onMessage).
+              if (!this.isLiveEngine(id, engine)) return;
+              let persisted = false;
+              try {
+                const result = await this.messageRepository.insert(
+                  dbMessage as unknown as QueryDeepPartialEntity<Message>,
+                );
+                Object.assign(dbMessage, result.identifiers[0] ?? {}, result.generatedMaps?.[0] ?? {});
+                persisted = true;
+              } catch (err) {
+                // Unique violation = the REST send path already persisted this API-originated send —
+                // the dedup oracle working as intended, not an error. Anything else is a real DB
+                // failure; fail open so a real send is never dropped on a transient DB fault.
+                if (!isUniqueConstraintError(err)) {
+                  this.logger.error(`Failed to save outgoing message ${outgoing.id} to database`, String(err));
+                }
+              }
+              if (persisted) {
+                // Fire-and-forget, mirroring onMessage: plugin providers (search etc.) see phone-
+                // composed sends exactly like API sends.
+                void this.hookManager
+                  .execute(
+                    'message:persisted',
+                    { sessionId: id, message: dbMessage },
+                    { sessionId: id, source: 'SessionService' },
+                  )
+                  .catch(() => undefined);
+              }
+            }
+
             void this.webhookService.dispatch(id, 'message.sent', finalMessage);
             // Emit real-time event to WebSocket clients (as message.sent, not message.received)
             this.eventsGateway.emitMessageSent(id, finalMessage);
@@ -1230,24 +1564,62 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       },
       onMessageReaction: (event): void => {
         if (!this.isLiveEngine(id, engine)) return;
+        if (!event.messageId) {
+          this.logger.warn('Ignoring message reaction without a target message id', {
+            sessionId: id,
+            action: 'message_reaction_ignored',
+          });
+          return;
+        }
         this.logger.debug(`Message reaction received: ${event.messageId} -> ${event.reaction}`, {
           sessionId: id,
           messageId: event.messageId,
           action: 'message_reaction_received',
         });
 
-        // Serialize per message so two concurrent reactions don't read the same snapshot and clobber
-        // each other on the full-row save. A prior chain's failure must not block later reactions.
-        const key = `${id}:${event.messageId}`;
-        const prior = this.reactionChains.get(key) ?? Promise.resolve();
-        const next = prior.catch(() => undefined).then(() => this.applyReaction(id, event));
-        this.reactionChains.set(key, next);
-        void next.finally(() => {
-          // Clean up only if no newer reaction chained after us, so the map can't leak per message.
-          if (this.reactionChains.get(key) === next) {
-            this.reactionChains.delete(key);
-          }
+        this.enqueueMessageMutation(id, event.messageId, () => this.applyReaction(id, event));
+      },
+      onMessageEdited: (message): void => {
+        if (!this.isLiveEngine(id, engine)) return;
+        if (!message.messageId) {
+          this.logger.warn('Ignoring message edit without a target message id', {
+            sessionId: id,
+            action: 'message_edit_ignored',
+          });
+          return;
+        }
+        this.logger.debug(`Message edited: ${message.messageId}`, {
+          sessionId: id,
+          messageId: message.messageId,
+          action: 'message_edited',
         });
+
+        this.enqueueMessageMutation(id, message.messageId, () => this.applyMessageEdit(id, message));
+      },
+      onGroupEvent: (event): void => {
+        if (!this.isLiveEngine(id, engine)) return;
+        this.logger.debug(`Group event: ${event.kind} in ${event.groupId}`, {
+          sessionId: id,
+          groupId: event.groupId,
+          kind: event.kind,
+          action: 'group_event',
+        });
+        this.dispatchGroupEvent(id, event);
+      },
+      onCall: (event: IncomingCallEvent): void => {
+        if (!this.isLiveEngine(id, engine)) return;
+        this.logger.log(`Incoming call from ${event.from}`, {
+          sessionId: id,
+          callId: event.callId,
+          isVideo: event.isVideo,
+          isGroup: event.isGroup,
+          action: 'call_received',
+        });
+        const payload: Record<string, unknown> = { ...event };
+        this.eventsGateway.emitCallReceived(id, payload);
+        void this.webhookService.dispatch(id, 'call.received', payload);
+        // Opt-in auto-reject runs AFTER the dispatch so a reject failure can never eat the event.
+        void this.maybeAutoRejectCall(id, engine, event.callId);
       },
       onDisconnected: (reason: string): void => {
         // Ignore callbacks from a superseded/torn-down engine (#410).
@@ -1278,12 +1650,27 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           [EngineStatus.QR_READY]: SessionStatus.QR_READY,
           [EngineStatus.AUTHENTICATING]: SessionStatus.AUTHENTICATING,
           [EngineStatus.READY]: SessionStatus.READY,
+          [EngineStatus.ACTION_REQUIRED]: SessionStatus.ACTION_REQUIRED,
           [EngineStatus.FAILED]: SessionStatus.FAILED,
         };
         const newStatus = statusMap[engineState];
         if (newStatus) {
           void this.updateStatus(id, newStatus);
         }
+      },
+      onActionRequired: (reason: string): void => {
+        if (!this.isLiveEngine(id, engine)) return;
+        this.logger.warn(`Session requires operator action: ${reason}`, {
+          sessionId: id,
+          reason,
+          action: 'action_required',
+        });
+        // Record the reason so attachLastError surfaces it while the session is ACTION_REQUIRED,
+        // then updateStatus (via onStateChanged above) has already written the status. Set here too
+        // to be defensive: the callback order is onActionRequired then onStateChanged, but persisting
+        // the reason here means it is available regardless.
+        this.sessionErrors.set(id, reason);
+        void this.hookManager.execute('session:error', { reason }, { sessionId: id, source: 'Engine' });
       },
       onError: (reason: string): void => {
         if (!this.isLiveEngine(id, engine)) return;
@@ -1402,6 +1789,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    */
   private async applyReaction(id: string, event: ReactionEvent): Promise<void> {
     try {
+      // Guard the lookup key before it reaches TypeORM: `findOne` DROPS an undefined condition from
+      // the where-clause rather than matching nothing, so an engine that couldn't resolve the reacted
+      // message's id would silently match an arbitrary row and clobber/emit its reactions. `!msg` is
+      // no protection against that — the row it finds is real, just the wrong one.
+      if (!event.messageId) return;
+
       const msg = await this.messageRepository.findOne({ where: { sessionId: id, waMessageId: event.messageId } });
       if (!msg) return;
 
@@ -1415,7 +1808,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       metadata.reactions = reactions;
       // Scoped update of ONLY the metadata column. A full-row save(msg) would re-persist the `status`
       // read at findOne time, clobbering a concurrent ack UPDATE (SENT→DELIVERED/READ) that committed in
-      // the window between this findOne and the write — reactionChains serializes reaction-vs-reaction
+      // the window between this findOne and the write — the mutation chain serializes reaction-vs-reaction
       // but NOT reaction-vs-ack, so scoping the write to metadata is what keeps delivery state monotonic
       // (#220). Other metadata fields are carried through untouched (they were read into `metadata`).
       await this.messageRepository.update({ sessionId: id, waMessageId: event.messageId }, {
@@ -1428,6 +1821,137 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       void this.webhookService.dispatch(id, 'message.reaction', { ...event, reactions });
     } catch (err) {
       this.logger.error(`Failed to update message reaction: ${event.messageId}`, String(err));
+    }
+  }
+
+  /** Queue a message-scoped mutation. A failed operation is isolated so later events still run. */
+  private enqueueMessageMutation(id: string, messageId: string, work: () => Promise<void>): void {
+    const key = `${id}:${messageId}`;
+    const prior = this.messageMutationChains.get(key) ?? Promise.resolve();
+    const next = prior
+      .catch(() => undefined)
+      .then(work)
+      .catch(err => {
+        // Both current mutation implementations contain their own contextual error handling. Keep a
+        // final guard here so a future implementation cannot leak a rejected fire-and-forget promise
+        // or permanently block the message's later mutations.
+        this.logger.error(`Unexpected failure applying message mutation: ${messageId}`, String(err));
+      });
+    this.messageMutationChains.set(key, next);
+    void next.finally(() => {
+      if (this.messageMutationChains.get(key) === next) {
+        this.messageMutationChains.delete(key);
+      }
+    });
+  }
+
+  /** Persist an edit before notifying consumers, while still surfacing the occurrence if storage fails. */
+  private async applyMessageEdit(id: string, message: EditedMessage): Promise<void> {
+    try {
+      await this.messageRepository.update({ sessionId: id, waMessageId: message.messageId }, { body: message.body });
+    } catch (err) {
+      this.logger.error(`Failed to update edited message: ${message.messageId}`, String(err));
+    }
+
+    const editedPayload = message as unknown as Record<string, unknown>;
+    this.eventsGateway.emitMessageEdited(id, editedPayload);
+    void this.webhookService.dispatch(id, 'message.edited', editedPayload);
+  }
+
+  /**
+   * Reflect an OUTBOUND edit (REST MessageService.editMessage) in the stored row, routed through the
+   * same per-message mutation queue as the inbound edit/reaction paths so the two writers cannot
+   * interleave (latest-write-wins holds across both directions). Same best-effort semantics as
+   * applyMessageEdit: a missing row or a failed write must not fail the request — the engine edit
+   * already succeeded. Resolves once the queued write has run.
+   */
+  async recordOutboundMessageEdit(sessionId: string, messageId: string, body: string): Promise<void> {
+    await new Promise<void>(resolve => {
+      this.enqueueMessageMutation(sessionId, messageId, async () => {
+        try {
+          await this.messageRepository.update({ sessionId, waMessageId: messageId }, { body });
+        } catch (err) {
+          this.logger.warn(`Failed to update stored body of edited message ${messageId}`, { error: String(err) });
+        } finally {
+          resolve();
+        }
+      });
+    });
+  }
+
+  /**
+   * Fan a neutral engine GroupEvent out to consumers: the WebSocket room and the webhook stream.
+   * The `kind` selects the event name (`group.join` / `group.leave` / `group.update`); the payload
+   * is the same plain camelCase shape on both channels, with `kind` itself carried by the name.
+   * There is no persistence here — group membership/metadata lives in the engine, not the message
+   * store — so unlike message edits there is nothing to apply before notifying.
+   */
+  private dispatchGroupEvent(id: string, event: GroupEvent): void {
+    const payload: Record<string, unknown> = {
+      groupId: event.groupId,
+      participantIds: event.participantIds,
+      timestamp: event.timestamp,
+    };
+    // Optional fields are added only when present so consumers never see explicit `undefined`s.
+    if (event.actorId !== undefined) {
+      payload.actorId = event.actorId;
+    }
+    if (event.changes !== undefined) {
+      payload.changes = event.changes;
+    }
+
+    switch (event.kind) {
+      case 'join':
+        this.eventsGateway.emitGroupJoin(id, payload);
+        void this.webhookService.dispatch(id, 'group.join', payload);
+        break;
+      case 'leave':
+        this.eventsGateway.emitGroupLeave(id, payload);
+        void this.webhookService.dispatch(id, 'group.leave', payload);
+        break;
+      case 'update':
+        this.eventsGateway.emitGroupUpdate(id, payload);
+        void this.webhookService.dispatch(id, 'group.update', payload);
+        break;
+    }
+  }
+
+  /**
+   * Reject a ringing call when the session opted in via `config.autoRejectCalls`. The session row
+   * is re-read here rather than trusting initializeEngine's closure snapshot — a call can arrive
+   * long after start, and the row is the only always-current source (mirrors
+   * handleEngineDisconnected). `config` is an untyped JSON column: only a strict boolean `true`
+   * opts in — truthy strings/numbers are ignored (the coercion discipline of
+   * resolveReconnectConfig). Never throws: a reject failure is logged, and the `call.received`
+   * dispatch already happened before this ran.
+   */
+  private async maybeAutoRejectCall(id: string, engine: IWhatsAppEngine, callId: string): Promise<void> {
+    let session: Session | null;
+    try {
+      session = await this.sessionRepository.findOne({ where: { id } });
+    } catch (err) {
+      this.logger.error('Failed to reload the session for call auto-reject', String(err), {
+        sessionId: id,
+        action: 'call_auto_reject_error',
+      });
+      return;
+    }
+    if (session?.config?.autoRejectCalls !== true) {
+      return;
+    }
+    try {
+      await engine.rejectCall(callId);
+      this.logger.log('Auto-rejected incoming call', {
+        sessionId: id,
+        callId,
+        action: 'call_auto_rejected',
+      });
+    } catch (err) {
+      this.logger.warn('Failed to auto-reject incoming call', {
+        sessionId: id,
+        callId,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -1605,6 +2129,15 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           : `Reconnection failed after ${state.attempts} attempts — restart the session.`,
       );
       void this.updateStatus(id, SessionStatus.FAILED);
+      // Terminal path — evict the dead engine so it neither holds a concurrency slot nor makes a
+      // subsequent start() reject the session as "already started". This mirrors onError's terminal
+      // path (the same rationale: leaving the engine in the map wedges the session). The engine may
+      // already be gone in the executeReconnect-catch path (it evicts the half-built engine before
+      // scheduling a reconnect), so guard on its presence — evictAndForceDestroy takes a non-null engine.
+      const deadEngine = this.engines.get(id);
+      if (deadEngine) {
+        this.evictAndForceDestroy(id, deadEngine);
+      }
       return;
     }
 
@@ -1672,6 +2205,32 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     return (await this.sessionRepository.findOne({ where: { id } })) == null;
   }
 
+  /**
+   * Re-purge a retired session's on-disk auth dirs when its row was deleted while a slow
+   * engine.initialize() was still in flight. A start()/(re)connect that lands between delete()'s
+   * engine eviction and its row removal initializes a fresh engine that RE-CREATES the auth dir
+   * purgeSessionData just emptied (both engines mkdir at init); the post-init guard tears the engine
+   * down, but engine teardown never touches the on-disk dirs, so without this second purge the race
+   * leaves live WhatsApp credentials behind — and a later same-name recreate would silently re-link
+   * them. Gated two ways so ONLY the delete race purges: a stop() retirement still has its row (its
+   * credentials must survive), and a row re-created under the SAME name now owns those dirs, so
+   * purging would wipe the fresh session's link. Best-effort: a failure is logged, never thrown —
+   * the retirement path must still surface the deleted session as NotFound.
+   */
+  private async purgeAuthDirsIfDeleted(id: string, name: string): Promise<void> {
+    try {
+      if ((await this.sessionRepository.findOne({ where: { id } })) != null) return;
+      if ((await this.sessionRepository.findOne({ where: { name } })) != null) return;
+      await this.engineFactory.purgeSessionData(name);
+    } catch (error) {
+      this.logger.warn('Failed to re-purge session auth dirs after a start/delete race', {
+        sessionId: id,
+        action: 'engine_repurge_failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   private async executeReconnect(id: string, session: Session, state: ReconnectState): Promise<void> {
     // The session may have been stopped/deleted before this fired — don't resurrect it.
     if (this.stoppingSessions.has(id)) {
@@ -1685,7 +2244,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       const oldEngine = this.engines.get(id);
       if (oldEngine) {
         await this.teardownEngineSafely(id, oldEngine, e => e.destroy(), 'destroy');
-        this.engines.delete(id);
+        if (this.isLiveEngine(id, oldEngine)) this.engines.delete(id);
       }
 
       // Re-initialize
@@ -1708,8 +2267,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         const resurrected = this.engines.get(id);
         if (resurrected) {
           await this.teardownEngineSafely(id, resurrected, e => e.destroy(), 'destroy');
-          this.engines.delete(id);
+          if (this.isLiveEngine(id, resurrected)) this.engines.delete(id);
         }
+        // Same start/delete window as start()'s post-init guard: this re-init re-created auth dirs
+        // delete() had already purged — purge again so no credentials outlive the row.
+        await this.purgeAuthDirsIfDeleted(id, session.name);
         return;
       }
     } catch (error: unknown) {
@@ -1761,7 +2323,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       } finally {
         this.intentionalStops.delete(id);
       }
-      this.engines.delete(id);
+      if (this.isLiveEngine(id, engine)) this.engines.delete(id);
     }
 
     this.logger.log(`Session stopped: ${session.name}`, {
@@ -1807,6 +2369,69 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       { sessionId: id, source: 'SessionService' },
     );
 
+    return this.findOne(id);
+  }
+
+  /**
+   * Log out of WhatsApp — unlinks this device from the account — then tear the session down.
+   *
+   * Differs from stop() in the one way that matters to a user: logout() asks WhatsApp to remove
+   * the companion device, so the entry disappears from the phone's Linked Devices list. stop() and
+   * delete() only release things locally (delete also purges the on-disk auth dirs), which leaves
+   * the device listed on the phone indefinitely — there is currently no way to clear it from the
+   * API, only by hand on the handset.
+   *
+   * Both engines implement a real unlink, so this is not a best-effort approximation: Baileys sends
+   * <remove-companion-device reason="user_initiated"/> to s.whatsapp.net, and whatsapp-web.js calls
+   * WAWebSocketModel.Socket.logout() in the page.
+   *
+   * Must run while the engine is still live — logout is a network round-trip to WhatsApp, so it
+   * cannot be performed after destroy()/forceDestroy(). Mirrors stop()'s lifecycle otherwise
+   * (stop-mark + cancel-reconnect + bounded, isolated teardown + Map reconciliation).
+   *
+   * Requires a started session: with no engine loaded there is nothing to send the unlink through,
+   * so the request is rejected rather than reporting an unlink that never happened (the on-disk
+   * credentials would also survive, letting a later start() reconnect with no QR). To just release
+   * a stopped session locally, use stop()/delete().
+   *
+   * Throws BadGatewayException when the engine's logout does not complete: the session is still
+   * torn down locally (map reconciled, status updated), but the unlink was not confirmed by
+   * WhatsApp, so reporting success would record a SESSION_LOGGED_OUT audit row for an unlink
+   * that never happened. The operator can start the session and retry the logout.
+   */
+  async logout(id: string): Promise<Session> {
+    const session = await this.findOne(id);
+    const engine = this.engines.get(id);
+
+    if (!engine) {
+      throw new BadRequestException('Session is not started. Call POST /sessions/:id/start first.');
+    }
+
+    // Mark as tearing down BEFORE cleanup so an in-flight reconnect can't resurrect it.
+    this.stoppingSessions.add(id);
+    // Cancel any reconnection attempts
+    this.cancelReconnect(id);
+
+    const unlinked = await this.teardownEngineSafely(id, engine, e => e.logout(), 'logout');
+    if (this.isLiveEngine(id, engine)) this.engines.delete(id);
+    await this.updateStatus(id, SessionStatus.DISCONNECTED);
+
+    if (!unlinked) {
+      this.logger.warn(`Session stopped locally but the unlink was not confirmed: ${session.name}`, {
+        sessionId: id,
+        action: 'logout_unconfirmed',
+      });
+      throw new BadGatewayException(
+        'Session was stopped locally, but WhatsApp did not confirm the device unlink — the ' +
+          'device may still be listed under Linked Devices on the phone. Start the session and ' +
+          'retry the logout to confirm it.',
+      );
+    }
+
+    this.logger.log(`Session logged out: ${session.name}`, {
+      sessionId: id,
+      action: 'logout',
+    });
     return this.findOne(id);
   }
 
@@ -1918,7 +2543,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     const engine = this.engines.get(id);
     if (engine) {
       await this.teardownEngineSafely(id, engine, e => e.forceDestroy(), 'force-destroy');
-      this.engines.delete(id);
+      if (this.isLiveEngine(id, engine)) this.engines.delete(id);
     }
 
     this.logger.warn(`Session force-killed: ${session.name}`, {
@@ -2168,6 +2793,82 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    */
   isActive(id: string): boolean {
     return this.engines.has(id);
+  }
+
+  /**
+   * Ids of every session with a live engine — including ones mid-initialization (their engine is not
+   * in `engines` yet but will register when start() completes). The infra import pre-flight uses this
+   * to refuse a full-replace restore that would orphan a running engine.
+   */
+  getActiveSessionIds(): string[] {
+    return [...new Set([...this.engines.keys(), ...this.initializingSessions])];
+  }
+
+  /**
+   * Stop the engines for the given session ids WITHOUT touching the sessions DB row (the caller,
+   * the infra import path, is about to DELETE that row as part of a full replace). This is the one
+   * stop path that bypasses findOne()/stop()/delete() — every other path keys through the row, so an
+   * engine orphaned by a restore was previously unstoppable until process restart.
+   *
+   * Each id is handled in isolation and time-bounded: a stuck Chromium/socket on one orphan can
+   * neither stall nor abort the others, and the whole call is bounded by teardownEngineSafely's
+   * per-engine 10s deadline. The mark + reconnect-cancel happen first so an in-flight reconnect
+   * cannot resurrect the id while teardown runs. Engines that are mid-initialization (no entry in
+   * `engines` yet) are marked but cannot be torn down here — their start() will see the stop mark
+   * via its existing guard and self-abort; the caller learns about them in `notRunning`.
+   *
+   * Always resolves. Best-effort: a `failed` entry means teardown threw or timed out, and the engine
+   * is removed from the Map regardless so it stops holding a concurrency slot.
+   */
+  async stopOrphanEngines(
+    sessionIds: string[],
+  ): Promise<{ stopped: string[]; notRunning: string[]; failed: string[] }> {
+    const stopped: string[] = [];
+    const notRunning: string[] = [];
+    const failed: string[] = [];
+
+    if (sessionIds.length === 0) return { stopped, notRunning, failed };
+
+    await Promise.allSettled(
+      sessionIds.map(async id => {
+        // Mark + cancel BEFORE teardown so a late reconnect cannot resurrect the id mid-teardown.
+        this.stoppingSessions.add(id);
+        this.cancelReconnect(id);
+
+        const engine = this.engines.get(id);
+        if (!engine) {
+          // Either never started, or still inside initializeEngine (no Map entry yet). The stop mark
+          // above is what aborts the initializing case via start()'s existing guard.
+          notRunning.push(id);
+          return;
+        }
+        try {
+          const tornDown = await this.destroyEngineSafely(id, engine);
+          // The engine leaves the Map regardless of teardown outcome so it stops holding a
+          // concurrency slot — but only a completed teardown counts as `stopped`. A throw/timeout
+          // means the Chromium/socket may still be alive and writing, so the id lands in `failed`
+          // and the caller (the infra import) can flag restartRequired instead of reporting a
+          // clean stop for a wedged engine.
+          if (this.isLiveEngine(id, engine)) this.engines.delete(id);
+          if (tornDown) {
+            stopped.push(id);
+          } else {
+            failed.push(id);
+          }
+        } catch (err) {
+          // destroyEngineSafely never throws today (it isolates via teardownEngineSafely), but defend
+          // against a future change so a single orphan cannot abort the batch.
+          this.logger.error(`Failed to stop orphan engine for session ${id}`, String(err), {
+            sessionId: id,
+            action: 'stop_orphan_failed',
+          });
+          if (this.isLiveEngine(id, engine)) this.engines.delete(id);
+          failed.push(id);
+        }
+      }),
+    );
+
+    return { stopped, notRunning, failed };
   }
 
   private delay(ms: number): Promise<void> {

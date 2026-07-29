@@ -109,6 +109,28 @@ describe('evaluateFilters', () => {
     ).toBe(true);
   });
 
+  it('applies message-family smart filters to the normalized message.edited payload', () => {
+    const edit = msg({
+      from: '120@g.us',
+      author: 'part@c.us',
+      body: 'Updated invoice',
+      type: 'image',
+      isGroup: true,
+      hasMedia: true,
+      mentionedIds: ['boss@c.us'],
+    });
+    const f = filters(
+      { field: 'sender', operator: 'is', value: ['part@c.us'] },
+      { field: 'body', operator: 'contains', value: 'invoice' },
+      { field: 'type', operator: 'is', value: ['image'] },
+      { field: 'hasMedia', operator: 'is', value: true },
+      { field: 'mentions', operator: 'is', value: ['boss@c.us'] },
+    );
+
+    expect(evaluateFilters(f, 'message.edited', edit)).toBe(true);
+    expect(evaluateFilters(f, 'message.edited', { ...edit, hasMedia: false })).toBe(false);
+  });
+
   it('mentions (idArray) intersects', () => {
     const f = filters({ field: 'mentions', operator: 'is', value: ['boss@c.us'] });
     expect(evaluateFilters(f, 'message.received', msg({ mentionedIds: ['boss@c.us', 'x@c.us'] }))).toBe(true);

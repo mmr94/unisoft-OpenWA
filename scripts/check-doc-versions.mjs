@@ -11,6 +11,10 @@
  *      package.json automatically — never a hardcoded `badge/version-x.y.z`.
  *   2. src/config/swagger.config.ts must source the version from package.json — never `setVersion('x.y.z')`.
  *   3. CHANGELOG.md must carry a `## [<current version>]` entry (the release notes exist).
+ *   4. The runtime/framework majors the READMEs advertise (Node, NestJS, TypeScript) must match
+ *      package.json. The NestJS/TypeScript badges track it themselves via the shields
+ *      `dependency-version` endpoint, but the Tech Stack table and the Node badge are plain prose —
+ *      shields cannot read `engines.node` — so they are gated here instead.
  *
  * Run locally: `npm run check:versions`. Runs in CI (lint job).
  */
@@ -19,7 +23,8 @@ import { readFileSync } from 'node:fs';
 const root = new URL('../', import.meta.url);
 const read = (rel) => readFileSync(new URL(rel, root), 'utf8');
 
-const version = JSON.parse(read('package.json')).version;
+const pkg = JSON.parse(read('package.json'));
+const version = pkg.version;
 const errors = [];
 
 // 1) README badges must be dynamic, not a pinned `badge/version-x`.
@@ -37,6 +42,26 @@ if (/setVersion\(\s*['"]\d/.test(read('src/config/swagger.config.ts'))) {
 // 3) CHANGELOG must have an entry for the current version.
 if (!read('CHANGELOG.md').includes(`## [${version}]`)) {
   errors.push(`CHANGELOG.md: missing a "## [${version}]" entry for the current package.json version — add the release notes before tagging.`);
+}
+
+// 4) Runtime/framework majors advertised in the READMEs must match package.json.
+const majorOf = (range) => range?.match(/(\d+)/)?.[1];
+const stack = [
+  ['Node', majorOf(pkg.engines?.node), /node-(\d+)_LTS|Node\.js (\d+) LTS/g],
+  ['NestJS', majorOf(pkg.dependencies?.['@nestjs/core']), /NestJS[ -](\d+)\.x/g],
+  ['TypeScript', majorOf(pkg.devDependencies?.typescript), /TypeScript[ -](\d+)\.x/g],
+];
+for (const f of ['README.md', 'docs/README.md']) {
+  const text = read(f);
+  for (const [name, want, pattern] of stack) {
+    if (!want) continue;
+    for (const m of text.matchAll(pattern)) {
+      const found = m[1] ?? m[2];
+      if (found !== want) {
+        errors.push(`${f}: advertises ${name} ${found} but package.json declares ${want} — update the doc (or the dependency).`);
+      }
+    }
+  }
 }
 
 if (errors.length) {

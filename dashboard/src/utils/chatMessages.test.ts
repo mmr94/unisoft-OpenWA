@@ -83,14 +83,19 @@ test('mergeChatMessages: returns ascending by timestamp (oldest first, newest la
   const older = mapEngineHistoryMessage(hist({ id: 'a', timestamp: 1000 }));
   const newer = mapEngineHistoryMessage(hist({ id: 'b', timestamp: 2000 }));
   const merged = mergeChatMessages([], [newer, older]);
-  assert.deepEqual(merged.map(m => m.id), ['a', 'b']);
+  assert.deepEqual(
+    merged.map(m => m.id),
+    ['a', 'b'],
+  );
 });
 
 import {
   mergeOrAppend,
-  replaceMessageById,
   updateMessageById,
   removeMessageById,
+  findRevokedIndex,
+  applyMessageEdit,
+  senderKey,
   type ChatMessageView,
 } from './chatMessages.ts';
 
@@ -141,6 +146,45 @@ test('mergeOrAppend keeps existing metadata when the incoming copy carries none'
   assert.deepEqual(after[0].metadata, { media: { mimetype: 'image/png' } });
 });
 
+test('mergeOrAppend: an omitted-media echo does NOT clobber the copy holding the payload', () => {
+  // The optimistic send bubble holds the only base64 copy; the engine's own-send echo carries just
+  // `{media: {omitted: true}}` (no data). Replacing wholesale would blank the sent image.
+  const optimistic = msg({
+    id: 'm-1',
+    type: 'image',
+    metadata: { media: { mimetype: 'image/png', filename: 'a.png', data: 'BASE64' } },
+  });
+  const echo = msg({
+    id: 'm-1',
+    type: 'image',
+    metadata: { media: { mimetype: 'image/png', omitted: true, sizeBytes: 1234 } },
+  });
+  const after = mergeOrAppend([optimistic], echo);
+  assert.equal(after.length, 1);
+  assert.equal(after[0].metadata?.media?.data, 'BASE64');
+  assert.equal(after[0].metadata?.media?.omitted, undefined);
+});
+
+test('mergeOrAppend: incoming media WITH a payload replaces the existing marker', () => {
+  const before = [msg({ id: 'm-1', type: 'image', metadata: { media: { mimetype: 'image/png', omitted: true } } })];
+  const live = msg({
+    id: 'm-1',
+    type: 'image',
+    metadata: { media: { mimetype: 'image/png', data: 'FRESH' } },
+  });
+  const after = mergeOrAppend(before, live);
+  assert.equal(after[0].metadata?.media?.data, 'FRESH');
+});
+
+test('mergeOrAppend: an echo with undefined leaves keeps the existing quote/call fields', () => {
+  // The WS mapper builds metadata as `{media, quotedMessage, call}` with undefined leaves — those
+  // must not erase fields the existing copy has (a wholesale spread would overwrite with undefined).
+  const before = [msg({ id: 'm-1', metadata: { quotedMessage: { id: 'q-1', body: 'quoted' } } })];
+  const echo = msg({ id: 'm-1', metadata: { media: undefined } });
+  const after = mergeOrAppend(before, echo);
+  assert.deepEqual(after[0].metadata, { quotedMessage: { id: 'q-1', body: 'quoted' } });
+});
+
 test('mergeOrAppend dedupes a live WS message against its DB copy (id != id but same waMessageId)', () => {
   // DB-persisted copy: id = UUID, waMessageId = WA serialized id.
   const dbCopy = msg({ id: 'uuid-1', waMessageId: 'true_g@g.us_WA1', body: 'persisted' });
@@ -158,25 +202,11 @@ test('mergeOrAppend does not mutate the input array', () => {
   assert.equal(before.length, 1);
 });
 
-test('replaceMessageById swaps the entry with matching id', () => {
-  const before = [msg({ id: 'temp-1', status: 'sending' }), msg({ id: 'm-2' })];
-  const after = replaceMessageById(before, 'temp-1', msg({ id: 'real-1', status: 'sent' }));
-  assert.equal(after.length, 2);
-  assert.equal(after[0].id, 'real-1');
-  assert.equal(after[0].status, 'sent');
-});
-
-test('replaceMessageById is a no-op when oldId is not present', () => {
-  const before = [msg({ id: 'm-1' })];
-  const after = replaceMessageById(before, 'missing', msg({ id: 'real' }));
-  assert.deepEqual(after, before);
-});
-
 test('updateMessageById applies a partial patch by id', () => {
-  const before = [msg({ id: 'm-1', status: 'sending' })];
+  const before = [msg({ id: 'm-1', status: 'pending' })];
   const after = updateMessageById(before, 'm-1', { status: 'failed' });
   assert.equal(after[0].status, 'failed');
-  assert.equal(after[0].body, 'hello');  // other fields unchanged
+  assert.equal(after[0].body, 'hello'); // other fields unchanged
 });
 
 test('updateMessageById is a no-op when id is not present', () => {
@@ -196,4 +226,167 @@ test('removeMessageById is a no-op when id is not present', () => {
   const before = [msg({ id: 'm-1' })];
   const after = removeMessageById(before, 'missing');
   assert.deepEqual(after, before);
+});
+
+// message.revoked carries TWO candidate ids: `id` and `revokedId` (the original deleted message,
+// when the engine could resolve it). Match on either — see findRevokedIndex for why not `?? `.
+
+test('findRevokedIndex matches the original via revokedId when it differs from id (wwebjs)', () => {
+  const list = [msg({ id: 'row-1', waMessageId: 'ORIGINAL' })];
+  assert.equal(findRevokedIndex(list, { id: 'REVOKE_NOTIF', revokedId: 'ORIGINAL' }), 0);
+});
+
+test('findRevokedIndex still matches when id === revokedId (Baileys — guards the working path)', () => {
+  const list = [msg({ id: 'row-1', waMessageId: 'ORIGINAL' })];
+  assert.equal(findRevokedIndex(list, { id: 'ORIGINAL', revokedId: 'ORIGINAL' }), 0);
+});
+
+test('findRevokedIndex matches on id when revokedId is absent (original not in the engine store)', () => {
+  const list = [msg({ id: 'row-1', waMessageId: 'ORIGINAL' })];
+  assert.equal(findRevokedIndex(list, { id: 'ORIGINAL' }), 0);
+});
+
+test('findRevokedIndex matches the DB row id, not just waMessageId', () => {
+  const list = [msg({ id: 'row-1', waMessageId: 'ORIGINAL' })];
+  assert.equal(findRevokedIndex(list, { id: 'row-1' }), 0);
+});
+
+test('findRevokedIndex returns -1 when neither id matches', () => {
+  const list = [msg({ id: 'row-1', waMessageId: 'ORIGINAL' })];
+  assert.equal(findRevokedIndex(list, { id: 'REVOKE_NOTIF', revokedId: 'OTHER' }), -1);
+});
+
+test('findRevokedIndex ignores an undefined revokedId rather than matching a row with no waMessageId', () => {
+  // A row whose waMessageId is undefined must not be matched by an absent revokedId (undefined ===
+  // undefined would otherwise revoke an arbitrary bubble).
+  const list = [msg({ id: 'row-1', waMessageId: undefined })];
+  assert.equal(findRevokedIndex(list, { id: 'REVOKE_NOTIF' }), -1);
+});
+
+test('applyMessageEdit updates a persisted row by waMessageId without mutating the input', () => {
+  const before = [msg({ id: 'row-uuid', waMessageId: 'WA_EDIT_1', body: 'old' })];
+  const after = applyMessageEdit(before, { messageId: 'WA_EDIT_1', body: 'new' });
+
+  assert.notEqual(after, before);
+  assert.equal(after[0].body, 'new');
+  assert.equal(before[0].body, 'old');
+});
+
+test('applyMessageEdit updates a live row by id', () => {
+  const before = [msg({ id: 'WA_EDIT_1', waMessageId: undefined, body: 'old' })];
+  const after = applyMessageEdit(before, { messageId: 'WA_EDIT_1', body: '' });
+  assert.equal(after[0].body, '');
+});
+
+test('applyMessageEdit is a referential no-op for an empty or unknown target id', () => {
+  const before = [msg({ id: 'm-1', body: 'old' })];
+  assert.equal(applyMessageEdit(before, { messageId: '', body: 'new' }), before);
+  assert.equal(applyMessageEdit(before, { messageId: 'missing', body: 'new' }), before);
+});
+
+test('mapEngineHistoryMessage: carries the group participant JID as author', () => {
+  const m = mapEngineHistoryMessage(hist({ author: '628111@c.us' }));
+  assert.equal(m.author, '628111@c.us');
+});
+
+test('mergeChatMessages: salvages author from the engine copy when the DB row predates the column', () => {
+  // A legacy DB row (no stable sender id) merged over an engine-history copy that has one must not
+  // lose it — that id is what keeps same-named participants in separate attribution runs.
+  const history = [mapEngineHistoryMessage(hist({ id: 'WA_S1', author: '628111@c.us' }))];
+  const rows = [db({ waMessageId: 'WA_S1', author: undefined })];
+  const merged = mergeChatMessages(rows, history);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].author, '628111@c.us');
+  // …while the rest of the winning DB row (authoritative status) is untouched.
+  assert.equal(merged[0].status, 'delivered');
+});
+
+test('mergeChatMessages: a DB-persisted author wins over the engine copy', () => {
+  const history = [mapEngineHistoryMessage(hist({ id: 'WA_S2', author: '628111@c.us' }))];
+  const rows = [db({ waMessageId: 'WA_S2', author: '628222@c.us' })];
+  assert.equal(mergeChatMessages(rows, history)[0].author, '628222@c.us');
+});
+
+test('mergeOrAppend: an author-less echo keeps the cached author', () => {
+  const list = [msg({ id: 'WA_E1', waMessageId: 'WA_E1', author: '628111@c.us' })];
+  const echo = msg({ id: 'WA_E1', waMessageId: 'WA_E1', author: undefined, body: 'echo' });
+  const out = mergeOrAppend(list, echo);
+  assert.equal(out[0].author, '628111@c.us');
+});
+
+test('senderKey prefers the participant JID and falls back to the display name', () => {
+  assert.equal(senderKey({ author: '628111@c.us', chatName: 'Alice' }), '628111@c.us');
+  assert.equal(senderKey({ chatName: 'Alice' }), 'Alice');
+  assert.equal(senderKey({}), undefined);
+});
+
+import { capMediaPayloads, MEDIA_PAYLOAD_CACHE_LIMIT } from './chatMessages.ts';
+
+const mediaMsg = (id: string, data?: string): ChatMessageView =>
+  msg({ id, type: 'image', metadata: { media: { mimetype: 'image/jpeg', filename: `${id}.jpg`, data } } });
+
+test('capMediaPayloads: under the limit the list is returned untouched (stable reference)', () => {
+  const list = [mediaMsg('m-1', 'AAA'), mediaMsg('m-2', 'BBB'), msg({ id: 'm-3' })];
+  assert.equal(capMediaPayloads(list), list);
+});
+
+test('the media cap covers the whole fetch window (no dead-end placeholder inside it)', () => {
+  // useChatMessages fetches a 100-message slice WITH media and caches it at staleTime: Infinity.
+  // A cap below the window strips payloads the user can scroll to, with no refetch path — the
+  // stripped rows render the 📎 placeholder forever even though the payload was fetched.
+  assert.ok(MEDIA_PAYLOAD_CACHE_LIMIT >= 100);
+});
+
+test('capMediaPayloads: past the limit the OLDEST payloads strip to the omitted marker, newest stay', () => {
+  // One over the cap, so exactly the oldest payload must go.
+  const list = Array.from({ length: MEDIA_PAYLOAD_CACHE_LIMIT + 1 }, (_, i) => mediaMsg(`m-${i}`, `PAYLOAD_${i}`));
+  const capped = capMediaPayloads(list);
+  const stripped = capped[0].metadata?.media;
+  assert.equal(stripped?.data, undefined);
+  assert.equal(stripped?.omitted, true); // renders the 📎 placeholder, not an empty bubble
+  assert.equal(stripped?.mimetype, 'image/jpeg'); // type/filename survive the strip
+  assert.equal(capped[1].metadata?.media?.data, 'PAYLOAD_1');
+  assert.equal(capped[MEDIA_PAYLOAD_CACHE_LIMIT].metadata?.media?.data, `PAYLOAD_${MEDIA_PAYLOAD_CACHE_LIMIT}`);
+  // The retained payload count is exactly the cap.
+  assert.equal(
+    capped.filter(m => m.metadata?.media?.data).length,
+    MEDIA_PAYLOAD_CACHE_LIMIT,
+  );
+  // Input is not mutated.
+  assert.equal(list[0].metadata?.media?.data, 'PAYLOAD_0');
+});
+
+test('capMediaPayloads: rows already carrying only the omitted marker are not counted as payloads', () => {
+  const omitted = mediaMsg('m-0', undefined);
+  omitted.metadata = { media: { mimetype: '', omitted: true } };
+  const list = [omitted, ...Array.from({ length: MEDIA_PAYLOAD_CACHE_LIMIT }, (_, i) => mediaMsg(`m-${i}`, 'X'))];
+  const capped = capMediaPayloads(list);
+  assert.equal(capped.filter(m => m.metadata?.media?.data).length, MEDIA_PAYLOAD_CACHE_LIMIT);
+  assert.equal(capped[0].metadata?.media?.omitted, true);
+});
+
+test('mergeOrAppend enforces the payload cap on a live media append', () => {
+  const list = Array.from({ length: MEDIA_PAYLOAD_CACHE_LIMIT }, (_, i) => mediaMsg(`m-${i}`, `PAYLOAD_${i}`));
+  const after = mergeOrAppend(list, mediaMsg('m-new', 'NEW'));
+  assert.equal(after.filter(m => m.metadata?.media?.data).length, MEDIA_PAYLOAD_CACHE_LIMIT);
+  assert.equal(after[0].metadata?.media?.data, undefined); // oldest stripped
+  assert.equal(after[0].metadata?.media?.omitted, true);
+  assert.equal(after[after.length - 1].metadata?.media?.data, 'NEW'); // fresh append keeps its payload
+});
+
+test('mergeChatMessages enforces the payload cap on the initial load', () => {
+  const rows = Array.from({ length: MEDIA_PAYLOAD_CACHE_LIMIT + 2 }, (_, i) =>
+    db({
+      id: `row-${i}`,
+      waMessageId: `WA_${i}`,
+      type: 'image',
+      timestamp: 1782053999 + i,
+      metadata: { media: { mimetype: 'image/jpeg', data: `DB_${i}` } },
+    }),
+  );
+  const merged = mergeChatMessages(rows, []);
+  assert.equal(merged.filter(m => m.metadata?.media?.data).length, MEDIA_PAYLOAD_CACHE_LIMIT);
+  assert.equal(merged[0].metadata?.media?.omitted, true);
+  assert.equal(merged[1].metadata?.media?.omitted, true);
+  assert.equal(merged[2].metadata?.media?.data, 'DB_2'); // newest MEDIA_PAYLOAD_CACHE_LIMIT survive
 });

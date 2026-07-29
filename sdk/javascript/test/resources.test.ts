@@ -57,6 +57,63 @@ describe('GroupsResource — exact paths and bodies', () => {
     await c.groups.revokeInviteCode('s', 'g');
     expect(t.lastCall!.url).toContain('/invite-code/revoke');
   });
+
+  it('joinGroup posts the invite code to /groups/join', async () => {
+    const t = new MockTransport().on('POST', /\/groups\/join$/, { body: { success: true, groupId: 'g1@g.us' } });
+    const res = await client(t).groups.joinGroup('s', { inviteCode: 'AbCdEf' });
+    expect(t.lastCall!.url).toBe('http://x/api/sessions/s/groups/join');
+    expect(t.lastCall!.body).toEqual({ inviteCode: 'AbCdEf' });
+    expect(res.groupId).toBe('g1@g.us');
+  });
+
+  it('getGroupSettings / updateGroupSettings hit /groups/:id/settings', async () => {
+    const t = new MockTransport()
+      .on('GET', /\/groups\/g1@g\.us\/settings$/, { body: { announce: true, ephemeralSeconds: 604800 } })
+      .on('PUT', /\/groups\/g1@g\.us\/settings$/, { body: { success: true, message: 'Group settings updated' } });
+    const c = client(t);
+    const settings = await c.groups.getGroupSettings('s', 'g1@g.us');
+    expect(t.lastCall!.url).toBe('http://x/api/sessions/s/groups/g1@g.us/settings');
+    expect(settings.announce).toBe(true);
+    expect(settings.ephemeralSeconds).toBe(604800);
+    await c.groups.updateGroupSettings('s', 'g1@g.us', { locked: true });
+    expect(t.lastCall!.method).toBe('PUT');
+    expect(t.lastCall!.body).toEqual({ locked: true });
+  });
+});
+
+describe('ProfileResource — exact paths and bodies', () => {
+  it('setProfileName / setProfileStatus / setProfilePicture PUT to /profile/*', async () => {
+    const t = new MockTransport()
+      .on('PUT', /\/profile\/name$/, { body: { success: true, message: 'Profile name updated' } })
+      .on('PUT', /\/profile\/status$/, { body: { success: true, message: 'Profile status updated' } })
+      .on('PUT', /\/profile\/picture$/, { body: { success: true, message: 'Profile picture updated' } });
+    const c = client(t);
+    await c.profile.setProfileName('s', 'My Bot');
+    expect(t.lastCall!.url).toBe('http://x/api/sessions/s/profile/name');
+    expect(t.lastCall!.body).toEqual({ name: 'My Bot' });
+    await c.profile.setProfileStatus('s', '');
+    expect(t.lastCall!.url).toBe('http://x/api/sessions/s/profile/status');
+    expect(t.lastCall!.body).toEqual({ status: '' });
+    await c.profile.setProfilePicture('s', { url: 'https://e.com/avatar.jpg' });
+    expect(t.lastCall!.url).toBe('http://x/api/sessions/s/profile/picture');
+    expect(t.lastCall!.body).toEqual({ url: 'https://e.com/avatar.jpg' });
+  });
+
+  it('setProfilePicture forwards the base64 + mimetype variant verbatim', async () => {
+    const t = new MockTransport().on('PUT', /\/profile\/picture$/, { body: { success: true } });
+    await client(t).profile.setProfilePicture('s', { base64: 'aGVsbG8=', mimetype: 'image/png' });
+    expect(t.lastCall!.body).toEqual({ base64: 'aGVsbG8=', mimetype: 'image/png' });
+  });
+});
+
+describe('CallsResource — exact paths', () => {
+  it('rejectCall POSTs to /calls/:callId/reject with no body', async () => {
+    const t = new MockTransport().on('POST', /\/calls\/CALL123\/reject$/, { body: { success: true } });
+    const res = await client(t).calls.rejectCall('s', 'CALL123');
+    expect(t.lastCall!.url).toBe('http://x/api/sessions/s/calls/CALL123/reject');
+    expect(t.lastCall!.body).toBeUndefined();
+    expect(res.success).toBe(true);
+  });
 });
 
 describe('ContactsResource — exact paths', () => {
@@ -86,6 +143,16 @@ describe('ContactsResource — exact paths', () => {
     expect(t.lastCall!.method).toBe('POST');
     await c.contacts.unblock('s', 'a@c.us');
     expect(t.lastCall!.method).toBe('DELETE');
+  });
+
+  it('profilePictures batch-resolves ids via the ids query param', async () => {
+    const t = new MockTransport().on('GET', /\/contacts\/profile-pictures$/, {
+      body: { pictures: { 'a@c.us': 'http://p/a', 'b@c.us': null } },
+    });
+    const res = await client(t).contacts.profilePictures('s', ['a@c.us', 'b@c.us']);
+    expect(t.lastCall!.method).toBe('GET');
+    expect(t.lastCall!.url).toBe('http://x/api/sessions/s/contacts/profile-pictures?ids=a%40c.us%2Cb%40c.us');
+    expect(res.pictures).toEqual({ 'a@c.us': 'http://p/a', 'b@c.us': null });
   });
 });
 
@@ -119,6 +186,21 @@ describe('WebhooksResource — exact paths', () => {
     await c.webhooks.test('s', 'w1');
     expect(t.lastCall!.url).toContain('/webhooks/w1/test');
   });
+
+  it('create forwards polymorphic filter values (string, string[], boolean) verbatim', async () => {
+    const t = new MockTransport().on('POST', /\/webhooks$/, {
+      body: { id: 'w1', sessionId: 's', url: 'u', events: ['*'], active: true, createdAt: '', updatedAt: '' },
+    });
+    const filters = {
+      conditions: [
+        { field: 'sender', operator: 'is', value: ['123@c.us'] },
+        { field: 'body', operator: 'contains', value: 'invoice', caseSensitive: true },
+        { field: 'isGroup', operator: 'is', value: false },
+      ],
+    };
+    await client(t).webhooks.create('s', { url: 'u', events: ['message.received'], filters });
+    expect(t.lastCall!.body).toEqual({ url: 'u', events: ['message.received'], filters });
+  });
 });
 
 describe('StatusResource — nested media bodies', () => {
@@ -131,6 +213,15 @@ describe('StatusResource — nested media bodies', () => {
     expect(t.lastCall!.body).toEqual({ image: { url: 'http://img' }, recipients: ['a@c.us'], caption: 'hi' });
     await c.status.sendVideo('s', { video: { url: 'http://vid' }, recipients: ['a@c.us'] });
     expect(t.lastCall!.body).toEqual({ video: { url: 'http://vid' }, recipients: ['a@c.us'] });
+  });
+
+  it('media fetches the stored status bytes with their content type', async () => {
+    const t = new MockTransport().on('GET', /\/status\/w1\/media$/, { text: 'PNG_BYTES', contentType: 'image/png' });
+    const res = await client(t).status.media('s', 'w1');
+    expect(t.lastCall!.method).toBe('GET');
+    expect(t.lastCall!.url).toBe('http://x/api/sessions/s/status/w1/media');
+    expect(new TextDecoder().decode(res.data)).toBe('PNG_BYTES');
+    expect(res.contentType).toBe('image/png');
   });
 });
 

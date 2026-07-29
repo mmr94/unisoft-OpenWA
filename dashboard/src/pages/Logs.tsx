@@ -8,6 +8,8 @@ import { useLogsQuery } from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
 import { CustomSelect } from '../components/CustomSelect';
 import { pageWindow } from '../utils/pageWindow';
+import { fetchAllPages } from '../utils/fetchAllPages';
+import { escapeCsvCell } from '../utils/csv';
 import './Logs.css';
 
 export function Logs() {
@@ -48,10 +50,6 @@ export function Logs() {
       'statusCode',
       'errorMessage',
     ];
-    const escape = (value: unknown): string => {
-      const s = value === undefined || value === null ? '' : String(value);
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    };
     const lines = rows.map(log =>
       [
         log.createdAt,
@@ -65,7 +63,7 @@ export function Logs() {
         log.statusCode,
         log.errorMessage,
       ]
-        .map(escape)
+        .map(escapeCsvCell)
         .join(','),
     );
     return [headers.join(','), ...lines].join('\n');
@@ -87,17 +85,10 @@ export function Logs() {
   const handleExportCsv = async () => {
     if (exporting) return;
     setExporting(true);
-    const PAGE = 500;
-    const CAP = 50000;
     try {
-      const all: AuditLog[] = [];
-      let offset = 0;
-      for (;;) {
-        const res = await auditApi.list({ severity: severityParam, limit: PAGE, offset });
-        all.push(...res.data);
-        offset += res.data.length;
-        if (res.data.length < PAGE || offset >= res.total || all.length >= CAP) break;
-      }
+      const all = await fetchAllPages<AuditLog>((limit, offset) =>
+        auditApi.list({ severity: severityParam, limit, offset }),
+      );
       const q = searchQuery.toLowerCase();
       const rows = q
         ? all.filter(l => l.action.toLowerCase().includes(q) || (l.errorMessage || '').toLowerCase().includes(q))

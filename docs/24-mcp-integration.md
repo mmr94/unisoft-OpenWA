@@ -127,8 +127,10 @@ declares a `tier` (`read` | `write`) and, for writes, a required role.
 | **Webhook** | list, get (read-only) | — |
 
 **Deliberately excluded from the surface** (not exposed as tools): session lifecycle
-(create/delete/start/stop/force-kill), chat delete, bulk send, message delete, group
-leave/remove/promote/demote/invite-revoke, all API-key management, all plugin management,
+(create/delete/start/stop/logout/force-kill), chat delete, bulk send, message delete, message edit,
+group
+leave/remove/promote/demote/invite-revoke/join, group settings writes, all own-profile writes
+(name/status/picture), call reject, all API-key management, all plugin management,
 infrastructure import/export/restart, settings writes, and webhook create/update/delete.
 These are destructive, privileged, or have no agent use case.
 
@@ -151,7 +153,9 @@ only when an agent genuinely needs to send messages / mutate state.
   that carries an `allowedIps` list will be rejected. Use a key without `allowedIps` for
   MCP.
 - **Rate limiting.** A per-key limiter (keyed by the *authenticated* key id) bounds tool
-  calls. Buckets are pruned when idle. This is independent of the REST throttler.
+  calls. The key map is capped (approximate-LRU eviction at 50,000 keys), so a
+  distinct-key flood cannot grow process memory without limit. This is independent of
+  the REST throttler.
   Tune with `MCP_RATE_LIMIT_MAX` (default `60`) and `MCP_RATE_LIMIT_WINDOW_MS`
   (default `60000`). Any missing, blank, non-positive, or non-numeric value falls back
   to the default. A **second, pre-auth per-IP throttle** runs on the `/mcp` mount *before*

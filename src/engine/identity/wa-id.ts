@@ -110,3 +110,28 @@ export function toNeutralJid(jid: string, resolvePhone?: (jid: string) => string
 export function isChannelJid(jid: string): boolean {
   return parseWaId(jid).kind === 'newsletter';
 }
+
+/** User-facing chat kind. The engine-neutral, consumer-visible vocabulary (never raw WaIdKind). */
+export type ChatKind = 'individual' | 'group' | 'channel' | 'status' | 'broadcast' | 'unknown';
+
+/**
+ * Map any WhatsApp JID to its user-facing chat kind. `lid` folds into `individual` (a lid is a
+ * privacy dialect of a user); `newsletter` surfaces as `channel`. Pure wrapper over {@link parseWaId}.
+ */
+export function chatKind(jid: string): ChatKind {
+  switch (parseWaId(jid).kind) {
+    case 'user':
+    case 'lid':
+      return 'individual';
+    case 'group':
+      return 'group';
+    case 'newsletter':
+      return 'channel';
+    case 'status':
+      return 'status';
+    case 'broadcast':
+      return 'broadcast';
+    default:
+      return 'unknown';
+  }
+}

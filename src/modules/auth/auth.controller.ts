@@ -3,13 +3,16 @@ import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import type { Request } from 'express';
 import { AuthService } from './auth.service';
 import { CreateApiKeyDto, UpdateApiKeyDto, ApiKeyResponseDto, ApiKeyCreatedResponseDto } from './dto';
-import { RequireRole, CurrentApiKey } from './decorators/auth.decorators';
+import { RequireRole, CurrentApiKey, RequireUnscopedKey } from './decorators/auth.decorators';
 import { type ApiKey, ApiKeyRole } from './entities/api-key.entity';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction } from './../audit/entities/audit-log.entity';
 
 @ApiTags('auth')
 @Controller('auth/api-keys')
+// Key lifecycle routes have no session dimension, so a session-scoped ADMIN key could otherwise
+// escape its confinement here (mint an unrestricted key, or clear another key's allowedSessions).
+@RequireUnscopedKey()
 export class AuthController {
   constructor(
     private readonly authService: AuthService,
@@ -118,8 +121,30 @@ export class AuthController {
   @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Update API key (admin only)' })
   @ApiResponse({ status: 200, description: 'The updated API key.', type: ApiKeyResponseDto })
-  async update(@Param('id') id: string, @Body() dto: UpdateApiKeyDto): Promise<ApiKeyResponseDto> {
+  @ApiResponse({ status: 409, description: 'The change would remove the last usable admin key.' })
+  async update(
+    @Param('id') id: string,
+    @Body() dto: UpdateApiKeyDto,
+    @Req() req: Request,
+    @CurrentApiKey() actor?: ApiKey,
+  ): Promise<ApiKeyResponseDto> {
+    const before = await this.authService.findOne(id);
     const k = await this.authService.update(id, dto);
+    const authzSnapshot = (key: ApiKey) => ({
+      role: key.role,
+      allowedIps: key.allowedIps,
+      allowedSessions: key.allowedSessions,
+      expiresAt: key.expiresAt,
+    });
+    await this.auditService.logInfo(AuditAction.API_KEY_UPDATED, {
+      ...this.auditContext(req, actor),
+      metadata: {
+        targetKeyId: k.id,
+        targetKeyName: k.name,
+        before: authzSnapshot(before),
+        after: authzSnapshot(k),
+      },
+    });
     return {
       id: k.id,
       name: k.name,
@@ -140,6 +165,7 @@ export class AuthController {
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Delete API key (admin only)' })
   @ApiResponse({ status: 204, description: 'API key deleted' })
+  @ApiResponse({ status: 409, description: 'The key is the last usable admin key.' })
   async delete(@Param('id') id: string, @Req() req: Request, @CurrentApiKey() actor?: ApiKey): Promise<void> {
     const target = await this.authService.findOne(id);
     await this.authService.delete(id);
@@ -151,8 +177,10 @@ export class AuthController {
 
   @Post(':id/revoke')
   @RequireRole(ApiKeyRole.ADMIN)
+  @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Revoke API key (admin only)' })
   @ApiResponse({ status: 200, description: 'The revoked API key (isActive now false).', type: ApiKeyResponseDto })
+  @ApiResponse({ status: 409, description: 'The key is the last usable admin key.' })
   async revoke(
     @Param('id') id: string,
     @Req() req: Request,

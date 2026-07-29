@@ -9,28 +9,30 @@
 
 ## 10.1 Infrastructure Overview
 
+OpenWA is a **single-process** application, so a deployment is exactly one app instance per
+session-data volume (`replicas: 1` — see §10.2). The repo has no staging/production environments and
+no auto-deploy: CI builds and publishes images, and pulling one onto a server is the operator's step.
+
 ```mermaid
 flowchart TB
     subgraph Development["Development"]
         DEV[Local Docker Compose]
     end
     
-    subgraph Staging["Staging"]
-        STG[Single Server]
+    subgraph Registry["Container Registry"]
+        GHCR["GHCR branch / SHA / release tags"]
     end
     
-    subgraph Production["Production"]
-        LB[Load Balancer]
-        LB --> APP1[App Instance 1]
-        LB --> APP2[App Instance 2]
-        APP1 --> DB[(PostgreSQL)]
-        APP2 --> DB
-        APP1 --> REDIS[(Redis)]
-        APP2 --> REDIS
+    subgraph Deployment["Deployment (single server)"]
+        PROXY[Reverse Proxy]
+        PROXY --> APP[OpenWA - one instance]
+        APP --> DB[(PostgreSQL or SQLite)]
+        APP --> REDIS[(Redis - optional)]
+        APP --> VOL["Data volume (/app/data)"]
     end
     
-    DEV --> |deploy| STG
-    STG --> |promote| Production
+    DEV --> |CI builds and pushes| GHCR
+    GHCR --> |operator pulls| Deployment
 ```
 
 ## 10.2 Docker Configuration
@@ -41,7 +43,7 @@ flowchart TB
 # Dockerfile (multi-stage build)
 
 # Build stage
-FROM node:22-slim AS build
+FROM node:22-slim AS builder
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
@@ -119,29 +121,47 @@ CMD ["node", "dist/main.js"]
 
 ### Docker Compose (Development)
 
+The repo's own `docker-compose.dev.yml` is a single-container local smoke test that runs the
+**production** image against a bind-mounted `./data` — it has no source mount and no `start:dev`.
+The multi-service file below is a hypothetical hot-reload variant you would write yourself under a
+different name (writing it to `docker-compose.dev.yml` would overwrite the shipped file); the
+`builder` target is the first stage of the repo `Dockerfile`.
+
 ```yaml
-# docker-compose.yml
+# docker-compose.hotreload.yml (write this yourself; not shipped in the repo)
 version: '3.8'
 
 services:
   app:
     build:
       context: .
-      target: build
+      target: builder
     command: npm run start:dev
     ports:
       - "2785:2785"
     environment:
       - NODE_ENV=development
-      - DATABASE_URL=postgresql://openwa:openwa@postgres:5432/openwa
-      - REDIS_URL=redis://redis:6379
+      - DATABASE_TYPE=postgres
+      - DATABASE_HOST=postgres
+      - DATABASE_PORT=5432
+      - DATABASE_NAME=openwa
+      - DATABASE_USERNAME=openwa
+      - DATABASE_PASSWORD=openwa
+      - REDIS_ENABLED=true
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
       # The env var is API_MASTER_KEY (not API_KEY_MASTER); never hardcode a key — set a
       # strong secret. Production refuses to boot with a placeholder/default.
       - API_MASTER_KEY=
+      # Without this, plugins fall back to ./plugins (outside the data volume) and are lost
+      # when the container is replaced. The shipped compose sets it for the same reason.
+      - PLUGINS_DIR=/app/data/plugins
     volumes:
       - ./:/app
       - /app/node_modules
-      - session-data:/app/.wwebjs_auth
+      # Everything the app writes locally (session auth, the main (auth/audit) SQLite DB, media,
+      # plugins) lives under /app/data; with DATABASE_TYPE=postgres above, the data DB does not
+      - openwa-data:/app/data
     depends_on:
       - postgres
       - redis
@@ -171,13 +191,21 @@ services:
 volumes:
   postgres-data:
   redis-data:
-  session-data:
+  openwa-data:
 ```
 
 ### Docker Compose (Production)
 
+The repo ships `docker-compose.yml` (full stack, builds the image from source) and
+`docker-compose.dev.yml` (local smoke test). The file below is an image-based variant you would
+write yourself for a release deployment; it mirrors the shipped compose in the part that matters —
+the single `/app/data` volume that holds session auth, the main (auth/audit) SQLite DB, media and
+plugins. Note the example below sets `DATABASE_TYPE=postgres`, so the **data** database lives in
+PostgreSQL and needs its own backup; only with the SQLite default (what the shipped
+`docker-compose.yml` leaves in place) does the data DB sit in this volume too.
+
 ```yaml
-# docker-compose.prod.yml
+# docker-compose.release.yml (write this yourself; not shipped in the repo)
 version: '3.8'
 
 services:
@@ -194,11 +222,23 @@ services:
           memory: 1G
     environment:
       - NODE_ENV=production
-      - DATABASE_URL=${DATABASE_URL}
-      - REDIS_URL=${REDIS_URL}
+      - DATABASE_TYPE=postgres
+      - DATABASE_HOST=${DATABASE_HOST}
+      - DATABASE_PORT=${DATABASE_PORT}
+      - DATABASE_NAME=${DATABASE_NAME}
+      - DATABASE_USERNAME=${DATABASE_USERNAME}
+      - DATABASE_PASSWORD=${DATABASE_PASSWORD}
+      - REDIS_ENABLED=true
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
       - API_MASTER_KEY=${API_MASTER_KEY}
+      # Without this, plugins fall back to ./plugins (outside the data volume) and are lost
+      # when the container is replaced. The shipped compose sets it for the same reason.
+      - PLUGINS_DIR=/app/data/plugins
     volumes:
-      - session-data:/app/.wwebjs_auth
+      # Session auth, the main (auth/audit) SQLite DB, media and plugins all live here — losing
+      # this volume loses the linked WhatsApp sessions and the API keys.
+      - openwa-data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:2785/api/health/ready"]
       interval: 30s
@@ -219,7 +259,7 @@ services:
     restart: always
 
 volumes:
-  session-data:
+  openwa-data:
     driver: local
 ```
 
@@ -236,141 +276,24 @@ volumes:
 
 ### GitHub Actions Workflow
 
-```yaml
-# .github/workflows/ci.yml
-name: CI/CD Pipeline
+`.github/workflows/ci.yml` (`name: CI`) runs on pushes and pull requests targeting `main` /
+`develop`. It is **integration only** — no job deploys anywhere. The final job publishes branch and
+SHA image tags to GHCR; `latest` is deliberately not set there and moves only through the separate,
+boot-smoke-gated release workflow.
 
-on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main]
+| Job | Needs | What it runs |
+|-----|-------|--------------|
+| `lint` | — | ESLint, `tsc --noEmit -p tsconfig.json` (full program, so spec files are type-checked too), `format:check`, `check:versions`, `check:dockerignore`, `openapi:check` |
+| `audit` | — | `npm audit --audit-level=high`, split out of `lint` so a newly published advisory can't abort the code-quality gates |
+| `test` | — | `npm test -- --coverage`, `test:scripts`, `test:e2e` (a `redis:7-alpine` service backs the queue-on e2e suite), coverage upload |
+| `test-postgres` | — | `npm run build`, then `test:pg-smoke` (migrations + uuid-default) and the Postgres FTS migration spec against a `postgres:16-alpine` service |
+| `dashboard` | — | In `dashboard/`: `lint`, `typecheck`, `i18n:check`, `build`, `test:unit` |
+| `scripts-smoke` | — | `shellcheck` plus the backup/restore smoke test for `scripts/backup.sh` and `scripts/restore.sh` |
+| `build` | lint, audit, test, dashboard, scripts-smoke | `npm run build`, uploads the `dist` artifact |
+| `docker` | build, test-postgres | Buildx multi-arch build (`linux/amd64,linux/arm64`) with provenance + SBOM attestations; pushes to `ghcr.io/<owner>/<repo>` on push events (fork PRs build both architectures without publishing) |
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
-      
-      - name: Install dependencies
-        run: npm ci
-      
-      - name: Run linter
-        run: npm run lint
-      
-      - name: Run tests
-        run: npm run test:cov
-        env:
-          DATABASE_URL: postgresql://test:test@localhost:5432/test
-      
-      - name: Upload coverage
-        uses: codecov/codecov-action@v3
-        with:
-          files: ./coverage/lcov.info
-
-  build:
-    needs: test
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      
-      - name: Login to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=sha,prefix=
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-      
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  deploy-staging:
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/develop'
-    environment: staging
-    
-    steps:
-      - name: Deploy to Staging
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.STAGING_HOST }}
-          username: ${{ secrets.STAGING_USER }}
-          key: ${{ secrets.STAGING_SSH_KEY }}
-          script: |
-            cd /opt/openwa
-            docker compose pull
-            docker compose up -d
-            docker system prune -f
-
-  deploy-production:
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    environment: production
-    
-    steps:
-      - name: Deploy to Production
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.PROD_HOST }}
-          username: ${{ secrets.PROD_USER }}
-          key: ${{ secrets.PROD_SSH_KEY }}
-          script: |
-            cd /opt/openwa
-            docker compose -f docker-compose.prod.yml pull
-            docker compose -f docker-compose.prod.yml up -d --no-deps app
-            docker system prune -f
-```
+Rollout is left to the operator — the repo has no SSH deploy step, no staging/production
+environments and no auto-deploy on merge.
 
 ## 10.4 Deployment Architecture
 
@@ -432,14 +355,15 @@ flowchart TB
 ### Environment Variables
 
 ```bash
-# .env.example
+# .env — excerpt of the commonly-tuned keys. The repo's `.env.example` is the canonical,
+# fully annotated list; add nothing here that does not appear there.
 
 # ===========================================
 # APPLICATION
 # ===========================================
 NODE_ENV=production
 PORT=2785
-API_PREFIX=/api
+# The global `/api` prefix is fixed in code — there is no env var for it.
 LOG_LEVEL=info
 LOG_FORMAT=json
 
@@ -447,59 +371,65 @@ LOG_FORMAT=json
 # DATABASE (choose one)
 # ===========================================
 # Option 1: SQLite (for minimal deployments)
+# For SQLite, DATABASE_NAME is the database FILE PATH.
 DATABASE_TYPE=sqlite
-DATABASE_SQLITE_PATH=./data/openwa.db
+DATABASE_NAME=./data/openwa.sqlite
 
-# Option 2: PostgreSQL (for production)
+# Option 2: PostgreSQL (for production) — DATABASE_NAME is the database NAME here
 # DATABASE_TYPE=postgres
-# DATABASE_URL=postgresql://user:pass@localhost:5432/openwa
-# DATABASE_POOL_MAX=20
+# DATABASE_HOST=localhost
+# DATABASE_PORT=5432
+# DATABASE_NAME=openwa
+# DATABASE_USERNAME=user
+# DATABASE_PASSWORD=pass
+# DATABASE_POOL_SIZE=20
 # DATABASE_SSL=false
 
 # ===========================================
 # MEDIA STORAGE (choose one)
 # ===========================================
+# STORAGE_TYPE accepts only `local` or `s3` — env validation rejects anything else and the app
+# FAILS TO BOOT ("Invalid environment configuration"). There is no silent fallback to local disk.
 # Option 1: Local filesystem (default)
 STORAGE_TYPE=local
-STORAGE_LOCAL_PATH=./media
-STORAGE_LOCAL_BASE_URL=/media
+STORAGE_LOCAL_PATH=./data/media
 
-# Option 2: S3
+# Option 2: S3 (AWS) — leave S3_ENDPOINT unset; the SDK derives it from the region
 # STORAGE_TYPE=s3
-# STORAGE_S3_BUCKET=openwa-media
-# STORAGE_S3_REGION=ap-southeast-1
-# STORAGE_S3_ACCESS_KEY_ID=your-access-key
-# STORAGE_S3_SECRET_ACCESS_KEY=your-secret-key
+# S3_BUCKET=openwa
+# S3_REGION=ap-southeast-1
+# S3_ACCESS_KEY_ID=your-access-key
+# S3_SECRET_ACCESS_KEY=your-secret-key
 
-# Option 3: MinIO (S3-compatible)
-# STORAGE_TYPE=minio
-# STORAGE_S3_BUCKET=openwa-media
-# STORAGE_S3_ENDPOINT=http://minio:9000
-# STORAGE_S3_ACCESS_KEY_ID=minioadmin
-# STORAGE_S3_SECRET_ACCESS_KEY=minioadmin
-# STORAGE_S3_FORCE_PATH_STYLE=true
+# Option 3: MinIO / other S3-compatible store — same STORAGE_TYPE=s3 plus an endpoint.
+# Setting S3_ENDPOINT is what enables path-style addressing; there is no separate flag.
+# STORAGE_TYPE=s3
+# S3_ENDPOINT=http://minio:9000
+# S3_BUCKET=openwa
+# S3_ACCESS_KEY_ID=minioadmin
+# S3_SECRET_ACCESS_KEY=minioadmin
 
 # ===========================================
-# CACHE & QUEUE (choose one)
+# CACHE & QUEUE
 # ===========================================
-# Option 1: In-Memory (for single instance)
-CACHE_TYPE=memory
-CACHE_TTL=300
-CACHE_MAX=1000
-
-# Option 2: Redis (for multi-instance / production)
-# CACHE_TYPE=redis
-# REDIS_URL=redis://localhost:6379
+# Both are opt-in and both need a reachable Redis, configured with the discrete host/port pair
+# (there is no REDIS_URL). Defaults: no cache at all (CacheService is a no-op and every read falls
+# through to the database — there is no in-memory tier) and inline (non-queued) dispatch.
+REDIS_ENABLED=false
+REDIS_HOST=localhost
+REDIS_PORT=6379
+# Redis-backed caching switches on when REDIS_ENABLED=true OR CACHE_ENABLED=true — enabling Redis
+# for the queue alone therefore also enables the cache.
+# CACHE_ENABLED=true
+# QUEUE_ENABLED=true   # process webhooks/ingress through the BullMQ queue
 
 # ===========================================
 # WHATSAPP ENGINE
 # ===========================================
-ENGINE_TYPE=whatsapp-web.js
-# ENGINE_TYPE=baileys
 # ENGINE_TYPE=baileys   # whatsapp-web.js (default) | baileys; omit to use the dashboard selection
 
 # Session
-SESSION_DATA_PATH=./.wwebjs_auth
+SESSION_DATA_PATH=./data/sessions
 
 # Puppeteer (for whatsapp-web.js)
 PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
@@ -517,9 +447,11 @@ API_KEY_PEPPER=optional-key-hashing-pepper
 # ===========================================
 # WEBHOOK
 # ===========================================
-WEBHOOK_TIMEOUT=30000
-WEBHOOK_RETRY_COUNT=3
+WEBHOOK_TIMEOUT=10000
 WEBHOOK_RETRY_DELAY=5000
+WEBHOOK_DISPATCH_CONCURRENCY=16
+WEBHOOK_DISPATCH_MAX_QUEUED=1000
+# Retry attempts are configured per webhook with the retryCount API field (default 3, range 0-5).
 
 # ===========================================
 # RATE LIMITING
@@ -532,38 +464,66 @@ RATE_LIMIT_MEDIUM_LIMIT=100
 ### Configuration Service
 
 ```typescript
-// config/configuration.ts
+// config/configuration.ts (shape abbreviated — see src/config/configuration.ts for the real file)
 export default () => ({
-  port: parseInt(process.env.PORT, 10) || 3000,
+  port: parseInt(process.env.PORT || '2785', 10),
+  // Main boot DB: always SQLite (auth/audit)
   database: {
-    url: process.env.DATABASE_URL,
+    type: 'sqlite',
+    database: process.env.MAIN_DATABASE_NAME || './data/main.sqlite',
+  },
+  // Data DB: pluggable backend
+  dataDatabase: {
+    type: process.env.DATABASE_TYPE || 'sqlite',
+    // SQLite file path when type is sqlite; PostgreSQL database name when type is postgres
+    database: process.env.DATABASE_NAME || './data/openwa.sqlite',
+    name: process.env.DATABASE_NAME || 'openwa',
+    host: process.env.DATABASE_HOST || 'localhost',
+    port: parseInt(process.env.DATABASE_PORT || '5432', 10),
+    username: process.env.DATABASE_USERNAME,
+    password: process.env.DATABASE_PASSWORD,
   },
   redis: {
-    url: process.env.REDIS_URL,
+    host: process.env.REDIS_HOST || 'localhost',
+    port: parseInt(process.env.REDIS_PORT || '6379', 10),
+    username: process.env.REDIS_USERNAME,
+    password: process.env.REDIS_PASSWORD,
   },
+  // API_MASTER_KEY is NOT part of this factory — `security` holds only trustedProxies, and the
+  // master key is read straight from process.env by the auth service.
   security: {
-    masterApiKey: process.env.API_MASTER_KEY,
+    trustedProxies: (process.env.TRUSTED_PROXIES || '').split(',').map(proxy => proxy.trim()).filter(Boolean),
   },
-  session: {
-    dataPath: process.env.SESSION_DATA_PATH || './.wwebjs_auth',
+  // Session data path and Puppeteer both live under `engine` — there is no top-level
+  // `session` or `puppeteer` key.
+  engine: {
+    type: process.env.ENGINE_TYPE || 'whatsapp-web.js',
+    sessionDataPath: process.env.SESSION_DATA_PATH || './data/sessions',
+    puppeteer: {
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      headless: process.env.PUPPETEER_HEADLESS !== 'false',
+      // Split on commas AND whitespace; the default is a four-flag string, not an empty list
+      args: (process.env.PUPPETEER_ARGS || '--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu')
+        .split(/[\s,]+/)
+        .filter(Boolean),
+    },
   },
   webhook: {
-    timeout: parseInt(process.env.WEBHOOK_TIMEOUT, 10) || 30000,
-    retryCount: parseInt(process.env.WEBHOOK_RETRY_COUNT, 10) || 3,
-    retryDelay: parseInt(process.env.WEBHOOK_RETRY_DELAY, 10) || 5000,
+    timeout: parseInt(process.env.WEBHOOK_TIMEOUT || '10000', 10),
+    retryDelay: parseInt(process.env.WEBHOOK_RETRY_DELAY || '5000', 10),
+    dispatchConcurrency: parseInt(process.env.WEBHOOK_DISPATCH_CONCURRENCY || '16', 10),
+    dispatchMaxQueued: parseInt(process.env.WEBHOOK_DISPATCH_MAX_QUEUED || '1000', 10),
   },
-  rateLimit: {
-    shortTtl: parseInt(process.env.RATE_LIMIT_SHORT_TTL, 10) || 1000,
-    shortLimit: parseInt(process.env.RATE_LIMIT_SHORT_LIMIT, 10) || 10,
-    mediumTtl: parseInt(process.env.RATE_LIMIT_MEDIUM_TTL, 10) || 60000,
-    mediumLimit: parseInt(process.env.RATE_LIMIT_MEDIUM_LIMIT, 10) || 100,
-    longTtl: parseInt(process.env.RATE_LIMIT_LONG_TTL, 10) || 3600000,
-    longLimit: parseInt(process.env.RATE_LIMIT_LONG_LIMIT, 10) || 1000,
-  },
-  puppeteer: {
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-    headless: process.env.PUPPETEER_HEADLESS !== 'false',
-    args: process.env.PUPPETEER_ARGS?.split(',') || [],
+  // Rate limits are nested under `api` — read them as `api.rateLimit.*`
+  api: {
+    rateLimit: {
+      shortTtl: parseInt(process.env.RATE_LIMIT_SHORT_TTL || '1000', 10),
+      shortLimit: parseInt(process.env.RATE_LIMIT_SHORT_LIMIT || '10', 10),
+      mediumTtl: parseInt(process.env.RATE_LIMIT_MEDIUM_TTL || '60000', 10),
+      mediumLimit: parseInt(process.env.RATE_LIMIT_MEDIUM_LIMIT || '100', 10),
+      longTtl: parseInt(process.env.RATE_LIMIT_LONG_TTL || '3600000', 10),
+      longLimit: parseInt(process.env.RATE_LIMIT_LONG_LIMIT || '1000', 10),
+    },
   },
 });
 ```
@@ -615,6 +575,8 @@ services:
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
       - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml
+      # Holds the METRICS_TOKEN value; see the scrape config below
+      - ./monitoring/metrics_token:/etc/prometheus/metrics_token:ro
       - prometheus-data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
@@ -708,6 +670,12 @@ scrape_configs:
     static_configs:
       - targets: ['app:2785']
     metrics_path: '/api/metrics'
+    # /api/metrics is disabled (404) until METRICS_TOKEN is set, and then rejects a scrape
+    # without the bearer (401) — either way `up` goes to 0 and ServiceDown fires.
+    # Prometheus does not expand env vars in its config, so mount the token as a file.
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/metrics_token
 
   - job_name: 'node'
     static_configs:
@@ -748,15 +716,15 @@ groups:
           summary: "WhatsApp session disconnected"
           description: "{{ $value }} session(s) in disconnected state"
 
-      # Failed messages climbing
-      - alert: FailedMessagesRising
-        expr: rate(openwa_messages_failed_total[5m]) > 0
+      # Failed messages currently stored
+      - alert: FailedMessagesPresent
+        expr: openwa_messages_failed_total > 0
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "Messages are failing"
-          description: "openwa_messages_failed_total is increasing over the last 5 minutes"
+          description: "{{ $value }} message(s) are currently in FAILED state"
 
       # Process memory growth (app-exported RSS; ~2GB example threshold)
       - alert: HighProcessMemory
@@ -921,8 +889,8 @@ export class MetricsService {
 | `openwa_sessions_total` | gauge | — | Configured sessions |
 | `openwa_sessions_active` | gauge | — | READY (active) sessions |
 | `openwa_sessions` | gauge | `status` | Session count per status |
-| `openwa_messages_total` | counter | `direction` (`incoming`/`outgoing`) | Messages by direction |
-| `openwa_messages_failed_total` | counter | — | Messages in FAILED state |
+| `openwa_messages_total` | gauge | `direction` (`incoming`/`outgoing`) | Current stored messages by direction |
+| `openwa_messages_failed_total` | gauge | — | Current messages in FAILED state |
 
 ### Grafana Dashboard Definition
 
@@ -941,11 +909,11 @@ export class MetricsService {
       ]
     },
     {
-      "title": "Messages Sent (24h)",
+      "title": "Stored Outgoing Messages",
       "type": "stat",
       "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
       "targets": [
-        { "expr": "increase(openwa_messages_total{direction=\"outgoing\"}[24h])" }
+        { "expr": "openwa_messages_total{direction=\"outgoing\"}" }
       ]
     },
     {
@@ -965,11 +933,11 @@ export class MetricsService {
       ]
     },
     {
-      "title": "Message Rate by Direction",
+      "title": "Stored Messages by Direction",
       "type": "timeseries",
       "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
       "targets": [
-        { "expr": "rate(openwa_messages_total[5m])", "legendFormat": "{{direction}}" }
+        { "expr": "openwa_messages_total", "legendFormat": "{{direction}}" }
       ]
     },
     {
@@ -995,62 +963,36 @@ export class MetricsService {
 
 ### Structured Logging
 
+Logging is dependency-free: there is no winston (or any logging library) in `package.json`. The
+logger is a small custom `LoggerService` in `src/common/services/logger.service.ts` that writes to
+the console — `error` and `warn` go to **stderr**, every other level to **stdout**, so a shipper
+configured for stdout alone drops exactly the lines you most want. `LOG_LEVEL`
+(`error|warn|info|debug|verbose`) sets verbosity and `LOG_FORMAT` (`json|pretty`) the rendering,
+defaulting to `json` under `NODE_ENV=production` and `pretty` elsewhere. Metadata whose **key name**
+looks like a secret (password, token, api-key, authorization, …) keeps the key and has its **value**
+replaced with `[REDACTED]` before the line is written.
+
+There is no in-app Loki transport: in the stack above, logs reach Loki because **promtail** scrapes
+the container's stdout and stderr from `/var/lib/docker/containers`.
+
 ```typescript
-// common/logging/logger.service.ts
-import { Injectable, LoggerService } from '@nestjs/common';
-import * as winston from 'winston';
+// common/services/logger.service.ts — usage
+import { createLogger } from '../common/services/logger.service';
 
 @Injectable()
-export class AppLoggerService implements LoggerService {
-  private logger: winston.Logger;
+export class MessageService {
+  private readonly logger = createLogger('MessageService');
 
-  constructor() {
-    this.logger = winston.createLogger({
-      level: process.env.LOG_LEVEL || 'info',
-      format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.json()
-      ),
-      defaultMeta: { 
-        service: 'openwa',
-        version: process.env.npm_package_version 
-      },
-      transports: [
-        new winston.transports.Console(),
-        // For Loki
-        new winston.transports.Http({
-          host: process.env.LOKI_HOST || 'loki',
-          port: 3100,
-          path: '/loki/api/v1/push',
-        }),
-      ],
+  async send(): Promise<void> {
+    // log/warn/debug/verbose take (message, context?) where context is a string or metadata object;
+    // error() is (message, trace?, context?) — the stack trace comes second
+    this.logger.log('Message sent', {
+      sessionId: 'sess_123',
+      chatId: '628xxx@c.us',
+      messageType: 'text',
     });
   }
-
-  log(message: string, context?: object) {
-    this.logger.info(message, { context });
-  }
-
-  error(message: string, trace?: string, context?: object) {
-    this.logger.error(message, { trace, context });
-  }
-
-  warn(message: string, context?: object) {
-    this.logger.warn(message, { context });
-  }
-
-  debug(message: string, context?: object) {
-    this.logger.debug(message, { context });
-  }
 }
-
-// Usage example
-this.logger.log('Message sent', {
-  sessionId: 'sess_123',
-  chatId: '628xxx@c.us',
-  messageType: 'text',
-  duration: 1.5
-});
 ```
 
 ### Key Metrics to Monitor
@@ -1063,9 +1005,9 @@ These are the metrics OpenWA actually exports at `GET /api/metrics`:
 | **Sessions** | `openwa_sessions_total` | Configured sessions | Near your expected session count |
 | **Sessions** | `openwa_sessions_active` | READY (active) sessions | Drops below expected |
 | **Sessions** | `openwa_sessions{status="..."}` | Per-status counts (e.g. `disconnected`, `failed`) | `disconnected`/`failed` > 0 |
-| **Messages** | `openwa_messages_total{direction="outgoing"}` | Outgoing messages | Sudden drop |
-| **Messages** | `openwa_messages_total{direction="incoming"}` | Incoming messages | Sudden drop |
-| **Messages** | `openwa_messages_failed_total` | Messages in FAILED state | Rising rate |
+| **Messages** | `openwa_messages_total{direction="outgoing"}` | Current stored outgoing messages | Unexpected change |
+| **Messages** | `openwa_messages_total{direction="incoming"}` | Current stored incoming messages | Unexpected change |
+| **Messages** | `openwa_messages_failed_total` | Current messages in FAILED state | Above acceptable threshold |
 | **System** | `openwa_process_resident_memory_bytes` | RSS | Growth / near limit |
 | **System** | `openwa_process_heap_used_bytes` | V8 heap used | Growth |
 | **System** | `openwa_process_uptime_seconds` | Process uptime | Frequent restarts (resets) |
@@ -1098,59 +1040,17 @@ flowchart TB
 
 ### Backup Script
 
-```bash
-#!/bin/bash
-# scripts/backup.sh
-
-set -e
-
-DATE=$(date +%Y%m%d_%H%M%S)
-BACKUP_DIR="/backups"
-S3_BUCKET="s3://openwa-backups"
-
-# Database backup
-echo "Backing up database..."
-pg_dump -Fc $DATABASE_URL > $BACKUP_DIR/db_$DATE.dump
-gzip $BACKUP_DIR/db_$DATE.dump
-
-# Session data backup
-echo "Backing up session data..."
-tar -czf $BACKUP_DIR/sessions_$DATE.tar.gz /app/.wwebjs_auth
-
-# Upload to S3
-echo "Uploading to S3..."
-aws s3 cp $BACKUP_DIR/db_$DATE.dump.gz $S3_BUCKET/database/
-aws s3 cp $BACKUP_DIR/sessions_$DATE.tar.gz $S3_BUCKET/sessions/
-
-# Cleanup local files older than 7 days
-find $BACKUP_DIR -mtime +7 -delete
-
-echo "Backup completed: $DATE"
-```
+Use the shipped [`scripts/backup.sh`](../scripts/backup.sh); do not maintain a second inline copy.
+It captures the always-SQLite `main.sqlite`, the configured data database, whatsapp-web.js session
+state (`SESSION_DATA_PATH`), Baileys auth state (`BAILEYS_AUTH_DIR`, default `./data/baileys`), local
+media, installed plugin packages, plugin registry/state, and generated secret/config files. See the
+authoritative [backup runbook](./11-operational-runbooks.md#runbook-database-backup).
 
 ### Recovery Procedure
 
-```bash
-#!/bin/bash
-# scripts/restore.sh
-
-set -e
-
-BACKUP_DATE=$1
-
-# Download from S3
-aws s3 cp s3://openwa-backups/database/db_$BACKUP_DATE.dump.gz /tmp/
-aws s3 cp s3://openwa-backups/sessions/sessions_$BACKUP_DATE.tar.gz /tmp/
-
-# Restore database
-gunzip /tmp/db_$BACKUP_DATE.dump.gz
-pg_restore -d $DATABASE_URL /tmp/db_$BACKUP_DATE.dump
-
-# Restore sessions
-tar -xzf /tmp/sessions_$BACKUP_DATE.tar.gz -C /
-
-echo "Restore completed"
-```
+Use the matching [`scripts/restore.sh`](../scripts/restore.sh) and follow the
+[restore runbook](./11-operational-runbooks.md#runbook-restore-from-backup). Stop the application
+before restoring; PostgreSQL dumps still require the explicit `psql` step described there.
 
 ## 10.8 Scaling Guidelines
 

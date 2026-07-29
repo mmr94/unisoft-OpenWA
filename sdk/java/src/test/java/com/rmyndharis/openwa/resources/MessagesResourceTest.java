@@ -10,6 +10,7 @@ import com.rmyndharis.openwa.model.BulkMessageContent;
 import com.rmyndharis.openwa.model.BulkMessageItem;
 import com.rmyndharis.openwa.model.BulkMessageType;
 import com.rmyndharis.openwa.model.DeleteMessageRequest;
+import com.rmyndharis.openwa.model.EditMessageRequest;
 import com.rmyndharis.openwa.model.ForwardMessageRequest;
 import com.rmyndharis.openwa.model.ListMessagesQuery;
 import com.rmyndharis.openwa.model.MessageHistoryQuery;
@@ -19,6 +20,8 @@ import com.rmyndharis.openwa.model.SendBulkRequest;
 import com.rmyndharis.openwa.model.SendContactRequest;
 import com.rmyndharis.openwa.model.SendLocationRequest;
 import com.rmyndharis.openwa.model.SendMediaRequest;
+import com.rmyndharis.openwa.model.SendAudioRequest;
+import com.rmyndharis.openwa.model.SendPollRequest;
 import com.rmyndharis.openwa.model.SendTemplateRequest;
 import com.rmyndharis.openwa.model.SendTextRequest;
 import com.rmyndharis.openwa.support.MockTransport;
@@ -58,6 +61,37 @@ class MessagesResourceTest {
     }
 
     @Test
+    void sendTextForwardsMentionsVerbatim() {
+        tx.respond(200, MSG);
+        client.messages.sendText(
+            "s",
+            SendTextRequest.builder()
+                .chatId("120363@g.us")
+                .text("hi @628123")
+                .mentions(List.of("628123@c.us"))
+                .build());
+        assertTrue(tx.lastRequest().body().contains("\"mentions\":[\"628123@c.us\"]"));
+    }
+
+    @Test
+    void sendPollResolvesToSendPollPath() {
+        tx.respond(200, MSG);
+        client.messages.sendPoll(
+            "s",
+            SendPollRequest.builder()
+                .chatId("628@c.us")
+                .name("Where?")
+                .options(List.of("Park", "Beach"))
+                .allowMultipleAnswers(true)
+                .build());
+        assertEquals("http://h/api/sessions/s/messages/send-poll", tx.lastRequest().url());
+        assertEquals(HttpMethod.POST, tx.lastRequest().method());
+        assertTrue(tx.lastRequest().body().contains("\"name\":\"Where?\""));
+        assertTrue(tx.lastRequest().body().contains("\"options\":[\"Park\",\"Beach\"]"));
+        assertTrue(tx.lastRequest().body().contains("\"allowMultipleAnswers\":true"));
+    }
+
+    @Test
     void sendImageResolvesToSendImagePath() {
         tx.respond(200, MSG);
         client.messages.sendImage("s", SendMediaRequest.builder().chatId("628@c.us").url("http://image-url").build());
@@ -78,7 +112,7 @@ class MessagesResourceTest {
     void sendAudioResolvesToSendAudioPath() {
         tx.respond(200, MSG);
         client.messages.sendAudio(
-            "s", SendMediaRequest.builder().chatId("628@c.us").url("http://audio-url").ptt(true).build());
+            "s", SendAudioRequest.builder().chatId("628@c.us").url("http://audio-url").ptt(true).build());
         assertEquals("http://h/api/sessions/s/messages/send-audio", tx.lastRequest().url());
         assertTrue(tx.lastRequest().body().contains("audio-url"));
     }
@@ -156,6 +190,17 @@ class MessagesResourceTest {
         assertEquals("http://h/api/sessions/s/messages/react", tx.lastRequest().url());
         assertEquals(HttpMethod.POST, tx.lastRequest().method());
         assertTrue(tx.lastRequest().body().contains("react-msg"));
+    }
+
+    @Test
+    void editMessageHitsEditPath() {
+        tx.respond(200, MSG);
+        client.messages.editMessage(
+            "s", EditMessageRequest.builder().chatId("628@c.us").messageId("edit-msg").body("edited-text").build());
+        assertEquals("http://h/api/sessions/s/messages/edit", tx.lastRequest().url());
+        assertEquals(HttpMethod.POST, tx.lastRequest().method());
+        assertTrue(tx.lastRequest().body().contains("edit-msg"));
+        assertTrue(tx.lastRequest().body().contains("edited-text"));
     }
 
     @Test

@@ -1,4 +1,21 @@
 import { computeFeatureFlags } from './feature-flags';
+import { resolveInflightBodyBudgetBytes } from './inflight-body-budget';
+import { readWsRateLimitConfig } from '../modules/events/ws-rate-limit';
+
+/**
+ * Shared parser for numeric env knobs whose 0 is a documented opt-out (unlimited / disabled).
+ * `Number('')` is 0, so a blank or whitespace-only value — exactly what a compose `${KEY:-}`
+ * forward renders — would otherwise pass every `Number.isFinite(x) && x >= 0` guard and land
+ * silently on the opt-out sentinel (disabling a memory cap, a reaper, a retry backoff). Blank
+ * means "unset": fall back to the default; 0 stays reserved for an explicit opt-out. The value
+ * must be a plain decimal integer — the same rule env.validation.ts enforces — so the validated
+ * and the parsed value always agree (`parseInt('1e6', 10)` would silently read 1).
+ */
+export function resolveNonNegativeIntEnv(raw: string | undefined, fallback: number): number {
+  const trimmed = raw?.trim();
+  if (!trimmed || !/^\d+$/.test(trimmed)) return fallback;
+  return Number(trimmed);
+}
 
 export default () => ({
   port: parseInt(process.env.PORT || '2785', 10),
@@ -12,6 +29,13 @@ export default () => ({
     requestTimeoutMs: parseInt(process.env.REQUEST_TIMEOUT_MS || '300000', 10),
     headersTimeoutMs: parseInt(process.env.HEADERS_TIMEOUT_MS || '65000', 10),
     keepAliveTimeoutMs: parseInt(process.env.KEEPALIVE_TIMEOUT_MS || '5000', 10),
+    // Aggregate cap on request-body bytes buffered across ALL connections (the pre-body-parser
+    // budget middleware in main.ts). Defaults to 4 × the per-request BODY_SIZE_LIMIT so the two
+    // scale together; explicit bytes override via INFLIGHT_BODY_BUDGET_BYTES.
+    inflightBodyBudgetBytes: resolveInflightBodyBudgetBytes(
+      process.env.INFLIGHT_BODY_BUDGET_BYTES,
+      process.env.BODY_SIZE_LIMIT,
+    ),
   },
 
   // Global message search. Opt-out via SEARCH_ENABLED=false. Provider defaults to 'auto' (the
@@ -21,6 +45,14 @@ export default () => ({
     enabled: process.env.SEARCH_ENABLED !== 'false',
     provider: process.env.SEARCH_PROVIDER || 'auto',
     limitMax: Number(process.env.SEARCH_LIMIT_MAX) || 100,
+  },
+
+  // Dashboard statistics. The /stats aggregates run GROUP BY scans over the whole messages
+  // table (synchronously on the event loop with the default SQLite backend), so responses are
+  // memoized in-process for this TTL to keep dashboard polling from re-running the scans on
+  // every request. 0 disables the memo.
+  stats: {
+    cacheTtlMs: parseInt(process.env.STATS_CACHE_TTL_MS || '30000', 10),
   },
 
   // Runtime feature flags. Single source of truth: src/config/feature-flags.ts. Exposed here so the
@@ -145,11 +177,44 @@ export default () => ({
   // Webhook configuration
   webhook: {
     timeout: parseInt(process.env.WEBHOOK_TIMEOUT || '10000', 10),
-    maxRetries: parseInt(process.env.WEBHOOK_MAX_RETRIES || '3', 10),
     retryDelay: parseInt(process.env.WEBHOOK_RETRY_DELAY || '5000', 10),
     // Cap on how many matching webhooks are delivered CONCURRENTLY for one event. Without it, an event
     // matching N webhooks opens N outbound sockets at once (no per-event bound). Default 16.
     dispatchConcurrency: parseInt(process.env.WEBHOOK_DISPATCH_CONCURRENCY || '16', 10),
+    // Bound parked inline deliveries as well as active sockets. Queue-full dispatches are recorded in
+    // webhook_delivery_failures instead of retaining payload closures without limit.
+    dispatchMaxQueued: parseInt(process.env.WEBHOOK_DISPATCH_MAX_QUEUED || '1000', 10),
+    // Upper bound on the serialized webhook body after webhook:before hooks ran; oversize payloads
+    // are recorded as undelivered instead of being sent/persisted. Default 1 MiB. Fail-safe like the
+    // other byte caps: a non-numeric or non-positive value falls back to the default. 0 is NOT an
+    // opt-out here — a 0-byte cap rejects every dispatch (a total webhook outage), and a NaN would
+    // silently disable the cap (`payloadBytes > NaN` is always false). env.validation rejects
+    // non-decimal / non-positive values at boot.
+    maxPayloadBytes: (() => {
+      const n = parseInt(process.env.WEBHOOK_MAX_PAYLOAD_BYTES ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 1024 * 1024;
+    })(),
+    // Max webhooks registered per session. One inbound event fans out to every registered webhook
+    // of the session, so an unbounded count multiplies per-event copies of the payload. Creating a
+    // NEW webhook above the cap is rejected with 400; existing ones are grandfathered (never
+    // deleted). Default 16; 0 disables the cap. Garbage falls back to the default.
+    maxPerSession: (() => {
+      const n = parseInt(process.env.WEBHOOK_MAX_PER_SESSION ?? '', 10);
+      return Number.isFinite(n) && n >= 0 ? n : 16;
+    })(),
+    // Inline base64 media cap for webhook payloads (decoded bytes). A media blob larger than this
+    // is replaced with the { omitted: true, sizeBytes } marker BEFORE the payload is cloned per
+    // webhook / queued into Redis, so fan-out and failed-job retention never copy the blob. Media
+    // at or under the cap stays inline (unchanged). Default 1 MiB; 0 = never inline media. Garbage
+    // falls back to the default.
+    mediaInlineMaxBytes: (() => {
+      const n = parseInt(process.env.WEBHOOK_MEDIA_INLINE_MAX_BYTES ?? '', 10);
+      return Number.isFinite(n) && n >= 0 ? n : 1024 * 1024;
+    })(),
+    // How long shutdown waits for in-flight direct deliveries to finish before abandoning them.
+    // 0 = don't wait (explicit opt-out); blank/garbage falls back to the default — a NaN here would
+    // silently remove the drain deadline downstream (Math.max(0, NaN) is NaN).
+    shutdownDrainMs: resolveNonNegativeIntEnv(process.env.WEBHOOK_SHUTDOWN_DRAIN_MS, 5000),
   },
 
   // API configuration
@@ -166,6 +231,14 @@ export default () => ({
       longLimit: parseInt(process.env.RATE_LIMIT_LONG_LIMIT || '1000', 10),
     },
   },
+
+  // WebSocket (/events Socket.IO) rate limits. The gateway sits outside the Nest enhancer
+  // pipeline (global guards never run on WS frames), so EventsGateway enforces these
+  // in-process. Single source of truth is readWsRateLimitConfig (with the same
+  // missing/blank/non-positive/non-numeric → default fallback the MCP limiters use):
+  // per-key frame token bucket (framePerSecond sustained + frameBurst capacity),
+  // pre-auth per-IP handshake sliding window, and a per-key simultaneous-socket cap.
+  websocket: readWsRateLimitConfig(),
 
   // Security configuration
   security: {
@@ -193,6 +266,61 @@ export default () => ({
     downloadMaxBytes: (() => {
       const n = parseInt(process.env.PLUGIN_DOWNLOAD_MAX_BYTES ?? '', 10);
       return Number.isFinite(n) && n > 0 ? n : 5 * 1024 * 1024;
+    })(),
+    // Host-side budget for ONE worker-initiated capability call (see PluginWorkerHost.withCapTimeout).
+    // Same fail-safe parsing as downloadMaxBytes.
+    capTimeoutMs: (() => {
+      const n = parseInt(process.env.PLUGIN_CAP_TIMEOUT_MS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 30000;
+    })(),
+    // Per-plugin bound on ctx.storage writes. Same fail-safe parsing as downloadMaxBytes.
+    storageMaxBytes: (() => {
+      const n = parseInt(process.env.PLUGIN_STORAGE_MAX_BYTES ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 50 * 1024 * 1024;
+    })(),
+  },
+
+  // Integration Fabric ingress configuration
+  ingress: {
+    // Opt-in to load plugins whose ingress routes declare signature.scheme: 'none'. Such a route is a
+    // fully-unauthenticated @Public() endpoint: once an instance is provisioned against it, anyone who can
+    // reach the host can POST a forged payload that triggers outbound WhatsApp sends. Default off — only
+    // set ALLOW_UNSIGNED_INGRESS=true for a provider that genuinely offers no HMAC, and front the route
+    // with a network/reverse-proxy ACL. Refused in production by the boot guard unless explicitly set.
+    allowUnsigned: process.env.ALLOW_UNSIGNED_INGRESS === 'true',
+  },
+
+  // Status/Stories store configuration
+  status: {
+    // Per-file cap on status media persisted to disk/S3 (default 10 MiB). A status whose media exceeds
+    // this is stored omitted (mediaOmitted=true, omitReason='over_cap') rather than rejected outright.
+    mediaMaxBytes: (() => {
+      const n = parseInt(process.env.STATUS_MEDIA_MAX_BYTES ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 10 * 1024 * 1024;
+    })(),
+    // How often the reconciliation sweep re-lists status media files to find ones no row references
+    // (default 1h). Orphans only arise from a crash between the media write and its row update.
+    orphanSweepIntervalMs: (() => {
+      const n = parseInt(process.env.STATUS_ORPHAN_SWEEP_INTERVAL_MS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 60 * 60 * 1000;
+    })(),
+    // How long an unreferenced status media file must be observed by the sweep before it is deleted
+    // (default 1h), so a file mid-ingest is never reaped. A non-positive/garbage value falls back.
+    orphanGraceMs: (() => {
+      const n = parseInt(process.env.STATUS_ORPHAN_GRACE_MS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 60 * 60 * 1000;
+    })(),
+  },
+
+  // Message-template rendering
+  template: {
+    // Cap on the FINAL rendered text of a send-template request (header+body+footer joined, after
+    // caller-supplied variable substitution; default 64 KiB — also WhatsApp's own text-message
+    // ceiling). Without it a small template plus a huge variable inflates the payload to the
+    // engine/DB unboundedly. Over-cap renders are rejected (400), never silently truncated.
+    renderMaxChars: (() => {
+      const n = parseInt(process.env.TEMPLATE_RENDER_MAX_CHARS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 64 * 1024;
     })(),
   },
 

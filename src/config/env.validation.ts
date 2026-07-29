@@ -2,8 +2,40 @@ import { resolve } from 'path';
 
 type EnvConfig = Record<string, unknown>;
 
-// The 'main' (auth/audit) connection is always this fixed SQLite file (not env-overridable).
-const MAIN_DB_PATH = './data/main.sqlite';
+// Default SQLite file of the 'main' (auth/audit) connection. The runtime path is env-overridable via
+// MAIN_DATABASE_NAME (configuration.ts), so the collision guard below must resolve the EFFECTIVE
+// path — comparing against this constant alone would false-negative when MAIN_DATABASE_NAME moves
+// the main DB and DATABASE_NAME follows it, and false-positive when the main DB moved away but
+// DATABASE_NAME still points at the (now unused) default file.
+const MAIN_DB_DEFAULT_PATH = './data/main.sqlite';
+
+/**
+ * Collision guard shared by boot validation (validateEnv below) and the migration CLI
+ * (src/database/data-source.ts / data-source-main.ts — the TypeORM CLI never runs ConfigModule's
+ * validate(), so both entry points apply this guard themselves). When the 'data' connection is
+ * SQLite (explicit or defaulted), its file must not BE the 'main' connection's file: two TypeORM
+ * connections on one SQLite file run separate migration ledgers + synchronize policies against the
+ * same tables. Both paths are resolved exactly like the runtime (MAIN_DATABASE_NAME / DATABASE_NAME
+ * overriding the defaults in configuration.ts) and normalized to absolute, so a relative spelling
+ * ('./data/../data/main.sqlite') or an absolute path naming the same file is caught. Returns the
+ * error message on collision, null otherwise.
+ */
+export function sqliteDataMainPathCollision(config: EnvConfig): string | null {
+  const read = (key: string): string | undefined => {
+    const value = config[key];
+    return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined;
+  };
+  // Postgres uses a bare database NAME, never a file path — no collision is possible there.
+  const dbType = read('DATABASE_TYPE');
+  if (dbType !== undefined && dbType !== 'sqlite') return null;
+  const dataDbName = read('DATABASE_NAME');
+  if (!dataDbName) return null;
+  const mainDbPath = read('MAIN_DATABASE_NAME') || MAIN_DB_DEFAULT_PATH;
+  if (resolve(dataDbName) === resolve(mainDbPath)) {
+    return `DATABASE_NAME must not point at the main database file (${mainDbPath}); use a separate file`;
+  }
+  return null;
+}
 
 /**
  * Fail-fast environment validation. Wired as ConfigModule's `validate`
@@ -74,11 +106,14 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     // SQLite (explicit or default): DATABASE_NAME is a file path for the 'data' connection. It must
     // not resolve to the 'main' DB file — two TypeORM connections on one SQLite file run separate
     // migration ledgers + synchronize policies against the same tables, risking schema divergence and
-    // lock contention. (Postgres DATABASE_NAME is a bare db name, so this never applies there.)
-    const dataDbName = str('DATABASE_NAME');
-    if (dataDbName && resolve(dataDbName) === resolve(MAIN_DB_PATH)) {
-      errors.push(`DATABASE_NAME must not point at the main database file (${MAIN_DB_PATH}); use a separate file`);
+    // lock contention. The main path is resolved like the runtime (MAIN_DATABASE_NAME || default),
+    // not assumed to be the default file. (Postgres DATABASE_NAME is a bare db name, so this never
+    // applies there.)
+    const collision = sqliteDataMainPathCollision(config);
+    if (collision) {
+      errors.push(collision);
     }
+    const dataDbName = str('DATABASE_NAME');
     // Reject a bare name with no path separator and no .sqlite/.db suffix — the exact signature of a
     // PostgreSQL DATABASE_NAME (e.g. 'openwa') leaking into a SQLite run (#677). That bare name becomes
     // the SQLite file PATH, opening a file named 'openwa' under the read-only app rootfs →
@@ -92,10 +127,16 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     }
   }
 
+  // Plain decimal digits only: these numeric knobs are read downstream with parseInt(raw, 10),
+  // which silently truncates spellings Number() would accept (`1e6` → 1, `0x100` → 0) — the boot
+  // would validate one value and then configure another. Requiring digits keeps the validated
+  // value identical to the parsed one.
+  const DECIMAL_INTEGER = /^\d+$/;
+
   const checkPort = (key: string): void => {
     const raw = str(key);
     if (raw === undefined) return;
-    const n = Number(raw);
+    const n = DECIMAL_INTEGER.test(raw) ? Number(raw) : NaN;
     if (!Number.isInteger(n) || n < 1 || n > 65535) {
       errors.push(`${key} must be an integer port in [1, 65535] (got "${raw}")`);
     }
@@ -109,7 +150,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
   const checkNonNegativeInt = (key: string): void => {
     const raw = str(key);
     if (raw === undefined) return;
-    const n = Number(raw);
+    const n = DECIMAL_INTEGER.test(raw) ? Number(raw) : NaN;
     if (!Number.isInteger(n) || n < 0) {
       errors.push(`${key} must be a non-negative integer (got "${raw}")`);
     }
@@ -118,7 +159,6 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'RATE_LIMIT_SHORT_TTL',
     'RATE_LIMIT_MEDIUM_TTL',
     'RATE_LIMIT_LONG_TTL',
-    'WEBHOOK_MAX_RETRIES',
     'WEBHOOK_RETRY_DELAY',
     'DATABASE_POOL_SIZE',
     'DATABASE_STATEMENT_TIMEOUT_MS',
@@ -127,6 +167,10 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'REDIS_CONNECT_TIMEOUT_MS',
     'MAX_CONCURRENT_SESSIONS', // 0 = unlimited
     'INGRESS_INSTANCE_TTL',
+    'WEBHOOK_DISPATCH_MAX_QUEUED',
+    'STATS_CACHE_TTL_MS', // 0 = memo disabled
+    'WEBHOOK_MAX_PER_SESSION', // 0 = unlimited
+    'WEBHOOK_MEDIA_INLINE_MAX_BYTES', // 0 = never inline media
   ]) {
     checkNonNegativeInt(key);
   }
@@ -137,7 +181,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
   const checkPositiveInt = (key: string): void => {
     const raw = str(key);
     if (raw === undefined) return;
-    const n = Number(raw);
+    const n = DECIMAL_INTEGER.test(raw) ? Number(raw) : NaN;
     if (!Number.isInteger(n) || n < 1) {
       errors.push(`${key} must be a positive integer (got "${raw}")`);
     }
@@ -146,12 +190,22 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'RATE_LIMIT_SHORT_LIMIT',
     'RATE_LIMIT_MEDIUM_LIMIT',
     'RATE_LIMIT_LONG_LIMIT',
+    // WebSocket (/events) limits: 0 would disable a tier entirely (a self-DoS on the WS surface).
+    'WS_RATE_LIMIT_FRAME_PER_SECOND',
+    'WS_RATE_LIMIT_FRAME_BURST',
+    'WS_RATE_LIMIT_HANDSHAKE_MAX',
+    'WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS',
+    'WS_MAX_SOCKETS_PER_KEY',
     'WEBHOOK_TIMEOUT',
     'INGRESS_INSTANCE_LIMIT',
     'REQUEST_TIMEOUT_MS',
     'HEADERS_TIMEOUT_MS',
     'KEEPALIVE_TIMEOUT_MS',
     'WEBHOOK_DISPATCH_CONCURRENCY',
+    // 0 would reject every webhook dispatch (a total, silent webhook outage).
+    'WEBHOOK_MAX_PAYLOAD_BYTES',
+    // 0 would refuse every request carrying a body (a self-DoS), so the budget is positive-only.
+    'INFLIGHT_BODY_BUDGET_BYTES',
   ]) {
     checkPositiveInt(key);
   }
@@ -183,6 +237,9 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'RESOLVE_LID_TO_PHONE',
     'SIMULATE_TYPING',
     'SEARCH_ENABLED',
+    // Read at boot by the throttler factory (app.module.ts) and CacheService with `=== 'true'`: a
+    // typo like `ture` silently downgrades rate-limit storage + cache to per-process in-memory.
+    'REDIS_ENABLED',
   ]) {
     checkBool(key);
   }

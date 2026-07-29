@@ -219,6 +219,7 @@ export enum EngineStatus {
   QR_READY = 'qr_ready',
   AUTHENTICATING = 'authenticating',
   READY = 'ready',
+  ACTION_REQUIRED = 'action_required',
   FAILED = 'failed',
 }
 ```
@@ -236,7 +237,9 @@ connections**:
 - **`main`** — always SQLite (`./data/main.sqlite`); owns the auth (`api_keys`) and audit
   (`audit_logs`) entities. Fixed boot config, not pluggable.
 - **`data`** — the pluggable user-data connection: `sqlite` (default) or `postgres`, selected by
-  `DATABASE_TYPE`. Owns the session/webhook/message/template/engine entities.
+  `DATABASE_TYPE`. Owns the session/webhook/message/template/engine entities, plus the
+  integration-fabric (`plugin_instances`, `ingress_events`, `conversation_mappings`,
+  `integration_delivery_failures`) and status-store (`status_updates`) entities.
 
 The engine is provided by `EngineModule` as the `EngineFactory` **class** (a normal injectable, not a
 string token). Storage and cache are provided as the `StorageService` and `CacheService` classes by
@@ -295,7 +298,7 @@ sequenceDiagram
     Note over Env: STORAGE_TYPE=s3
     Env->>Config: Load + validateEnv
     Config->>Svc: storage.type = 's3'
-    Svc->>Svc: construct S3Client (forcePathStyle: true)
+    Svc->>Svc: construct S3Client (forcePathStyle only when S3_ENDPOINT is set)
     App->>Svc: putFile / getFile (unaware of backend)
 ```
 
@@ -378,90 +381,70 @@ flowchart TB
 
 ### NestJS Module Organization
 
+Trimmed to the load-bearing directories — `src/modules/` holds 27 feature modules. Only `*.module.ts`
+is common to all of them; the rest of the shape varies. Most pair a `*.controller.ts` with a
+`*.service.ts`, but `events/` is a WebSocket gateway, `mcp/` an MCP server and `queue/` pure BullMQ
+wiring (none of the three has either); `docker/` and `status-store/` are service-only; `health/`,
+`infra/` and `settings/` are controller-only; and 8 modules own an `entities/` directory:
+
 ```
 src/
 ├── main.ts                     # Application entry point
-├── app.module.ts               # Root module
+├── app.module.ts               # Root module (imports feature modules, both TypeORM connections)
 │
-├── common/                     # Shared utilities
-│   ├── decorators/
-│   ├── filters/
-│   ├── guards/
-│   ├── interceptors/
-│   ├── pipes/
-│   └── utils/
+├── common/                     # Shared, non-feature code
+│   ├── cache/                  # CacheService (ioredis)
+│   ├── storage/                # StorageService (local | s3)
+│   ├── errors/  interceptors/  media/  metrics/  middleware/
+│   ├── security/  services/    # services/ holds logger.service.ts
+│   └── throttler/  transformers/  utils/
 │
-├── config/                     # Configuration
-│   ├── config.module.ts
-│   ├── config.service.ts
-│   └── configuration.ts
+├── config/                     # configuration.ts, env.validation.ts, feature-flags.ts,
+│                               # app-validation.ts, swagger.config.ts, … (no config.module.ts)
 │
-├── modules/
-│   ├── session/               # Session management
-│   │   ├── session.module.ts
-│   │   ├── session.controller.ts
-│   │   ├── session.service.ts
-│   │   ├── session.repository.ts
-│   │   ├── dto/
-│   │   └── entities/
-│   │
-│   ├── message/               # Message handling
-│   │   ├── message.module.ts
-│   │   ├── message.controller.ts
-│   │   ├── message.service.ts
-│   │   └── dto/
-│   │
-│   ├── webhook/               # Webhook management
-│   │   ├── webhook.module.ts
-│   │   ├── webhook.controller.ts
-│   │   ├── webhook.service.ts
-│   │   └── dto/
-│   │
-│   ├── contact/               # Contact management
-│   │   ├── contact.module.ts
-│   │   ├── contact.controller.ts
-│   │   └── contact.service.ts
-│   │
-│   ├── group/                 # Group management
-│   │   ├── group.module.ts
-│   │   ├── group.controller.ts
-│   │   └── group.service.ts
-│   │
-│   ├── auth/                  # Authentication
-│   │   ├── auth.module.ts
-│   │   ├── auth.guard.ts
-│   │   └── api-key.strategy.ts
-│   │
-│   └── health/                # Health checks
-│       ├── health.module.ts
-│       └── health.controller.ts
+├── core/                       # Host-side extension machinery
+│   ├── plugins/                # Plugin loader + sandbox
+│   ├── hooks/
+│   └── agent-tools/
 │
-├── engine/                    # WhatsApp engine wrapper
+├── plugins/
+│   └── engines/                # Built-in whatsapp-web.js + baileys engine plugins
+│
+├── engine/                     # WhatsApp engine abstraction
 │   ├── engine.module.ts
-│   ├── engine.service.ts
 │   ├── engine.factory.ts
-│   └── interfaces/
+│   ├── adapters/               # whatsapp-web-js.adapter.ts, baileys.adapter.ts, mappers, stores
+│   ├── identity/               # Neutral WhatsApp id helpers + lid-mapping store
+│   ├── interfaces/             # whatsapp-engine.interface.ts
+│   └── types/
 │
-├── queue/                     # Job queue
-│   ├── queue.module.ts
-│   ├── processors/
-│   └── jobs/
+├── modules/                    # Feature modules
+│   ├── session/                # Session management (no separate repository class)
+│   ├── message/  webhook/  contact/  group/  template/  label/  profile/  catalog/
+│   ├── channel/  status/  status-store/  search/  stats/  call/
+│   ├── auth/                   # API-key auth: auth.service.ts, guards/, decorators/, entities/
+│   ├── queue/                  # BullMQ wiring + processors/
+│   ├── integration/            # Integration fabric (plugin instances, ingress, mappings)
+│   └── plugins/  mcp/  events/  infra/  docker/  settings/  metrics/  audit/  health/
 │
-└── database/                  # Database
-    ├── database.module.ts
-    ├── migrations/
-    └── seeds/
+└── database/                   # data-source.ts / data-source-main.ts
+    ├── migrations/             # 'data' connection
+    └── migrations-main/        # 'main' connection (auth + audit)
 ```
 
 ## 3.5 Core Components Design
 
 ### 3.5.1 Session Manager
 
+The diagram below is conceptual: `SessionManager` is the role played by `SessionService`
+(`src/modules/session/session.service.ts`), which injects the TypeORM `Repository<Session>` directly —
+there is no `SessionRepository` class in the codebase.
+
 ```mermaid
 classDiagram
     class SessionManager {
-        -sessions: Map~string, Session~
-        -repository: SessionRepository
+        -engines: Map~string, IWhatsAppEngine~
+        -sessionRepository: Repository~Session~
         -engineFactory: EngineFactory
         +createSession(config): Session
         +getSession(id): Session
@@ -487,7 +470,7 @@ classDiagram
         CREATED
         INITIALIZING
         QR_READY
-        AUTHENTICATED
+        AUTHENTICATING
         READY
         DISCONNECTED
         FAILED
@@ -658,27 +641,24 @@ flowchart TB
 ```mermaid
 flowchart TB
     subgraph Production["Production Environment"]
-        LB[Load Balancer] --> I1[Instance 1]
-        LB --> I2[Instance 2]
-        LB --> I3[Instance N]
-        
-        I1 --> DB[(PostgreSQL)]
-        I2 --> DB
-        I3 --> DB
-        
-        I1 --> REDIS[(Redis)]
-        I2 --> REDIS
-        I3 --> REDIS
+        API[OpenWA API<br/>single instance]
+        VOL[(Session-data volume<br/>auth dirs)]
+
+        API --- VOL
+        API --> DB[(PostgreSQL)]
+        API --> REDIS[(Redis)]
     end
-    
-    subgraph Storage["Shared Storage"]
-        S3[S3/MinIO<br/>Media Files]
+
+    subgraph Storage["External Storage"]
+        S3[S3/MinIO<br/>Media backup / migration]
     end
-    
-    I1 --> S3
-    I2 --> S3
-    I3 --> S3
+
+    API --> S3
 ```
+
+> Multi-replica deployment behind a load balancer is a future design, not the shipped topology — the
+> live engines are held in-process, so one API instance owns a session-data volume. See the
+> single-instance note in §3.2 and [13 - Horizontal Scaling](13-horizontal-scaling.md).
 
 ## 3.8 API Architecture
 
@@ -693,7 +673,7 @@ flowchart LR
         W["/api/sessions/:sessionId/webhooks"]
         C["/api/sessions/:sessionId/contacts"]
         G["/api/sessions/:sessionId/groups"]
-        H["/health"]
+        H["/api/health"]
     end
     
     subgraph Methods["HTTP Methods"]
@@ -763,31 +743,46 @@ flowchart TB
 
 ## 3.10 Error Handling Architecture
 
+Handlers throw NestJS's own HTTP exceptions; NestJS's built-in `BaseExceptionFilter` renders them.
+There is no custom filter and no custom exception base class — see
+[08 - Development Guidelines](./08-development-guidelines.md) for the domain errors in
+`src/common/errors/` and the status each maps to.
+
 ```mermaid
 flowchart TB
     E[Error Occurs] --> T{Error Type}
-    
-    T -->|Validation| V[ValidationException]
-    T -->|Not Found| N[NotFoundException]
-    T -->|Auth| A[UnauthorizedException]
-    T -->|Business| B[BusinessException]
-    T -->|System| S[InternalException]
-    
-    V --> F[Exception Filter]
+
+    T -->|Validation fails| V[BadRequestException 400]
+    T -->|Missing resource| N[NotFoundException 404]
+    T -->|Bad/absent key| A[UnauthorizedException 401]
+    T -->|Role or scope refused| FB[ForbiddenException 403]
+    T -->|Engine cannot do this| NI[EngineNotSupportedError → 501]
+    T -->|Engine not ready| C[EngineNotReadyError → 409]
+    T -->|Engine transport down| SU[EngineTransportError → 503]
+    T -->|Unhandled| S[InternalServerErrorException 500]
+
+    V --> F[NestJS BaseExceptionFilter]
     N --> F
     A --> F
-    B --> F
+    FB --> F
+    NI --> F
+    C --> F
+    SU --> F
     S --> F
-    
-    F --> R[Formatted Response]
-    F --> L[Log Error]
-    
-    L -->|Critical| AL[Alert]
+
+    F --> R["{ statusCode, message, error }"]
+    S --> L[Log with stack]
 ```
 
 ## 3.11 Scalability Considerations
 
-### Horizontal Scaling Strategy
+> **Future design, not the shipped topology.** Live engines are held in an in-process `Map` in
+> `SessionService`, so a session can only be driven by the instance that started it — there is no
+> session registry, node claim, or affinity router in the codebase. OpenWA runs as one API instance
+> per session-data volume; the two sketches below are retained for planning. See the single-instance
+> note in §3.2 and [13 - Horizontal Scaling](13-horizontal-scaling.md).
+
+### Horizontal Scaling Strategy (sketch)
 
 ```mermaid
 flowchart TB
@@ -814,7 +809,7 @@ flowchart TB
     Stateful --> Shared
 ```
 
-### Session Affinity
+### Session Affinity (sketch)
 
 ```mermaid
 flowchart LR
@@ -892,6 +887,7 @@ export enum EngineStatus {
   QR_READY = 'qr_ready',
   AUTHENTICATING = 'authenticating',
   READY = 'ready',
+  ACTION_REQUIRED = 'action_required',
   FAILED = 'failed',
 }
 
@@ -904,9 +900,13 @@ export interface EngineEventCallbacks {
   onMessageAck?: (messageId: string, status: DeliveryStatus) => void;
   onMessageRevoked?: (message: RevokedMessage) => void;
   onMessageReaction?: (event: ReactionEvent) => void;
+  onMessageEdited?: (message: EditedMessage) => void;
+  onGroupEvent?: (event: GroupEvent) => void;  // kind selects group.join / group.leave / group.update
+  onCall?: (event: IncomingCallEvent) => void; // incoming call ringing; rejectCall() while it rings
   onHistoryMessages?: (messages: IncomingMessage[]) => void; // bulk initial sync; persist, don't dispatch
   onDisconnected?: (reason: string) => void; // recoverable -> reconnect
   onStateChanged?: (state: EngineStatus) => void;
+  onActionRequired?: (reason: string) => void; // engine alive, but an operator must act
   onError?: (reason: string) => void; // terminal init/auth failure
 }
 
@@ -920,13 +920,14 @@ export interface IWhatsAppEngine {
 
   // Status / auth
   getStatus(): EngineStatus;
+  probeLiveness?(): Promise<boolean>; // optional active round-trip against the live connection
   getQRCode(): string | null;  // synchronous
   requestPairingCode(phoneNumber: string): Promise<string>;
   getPhoneNumber(): string | null;
   getPushName(): string | null;
 
   // Messaging (selected)
-  sendTextMessage(chatId: string, text: string): Promise<MessageResult>;
+  sendTextMessage(chatId: string, text: string, mentions?: string[]): Promise<MessageResult>;
   sendImageMessage(chatId: string, media: MediaInput): Promise<MessageResult>;
   sendLocationMessage(chatId: string, location: LocationInput): Promise<MessageResult>;
   sendContactMessage(chatId: string, contact: ContactCard): Promise<MessageResult>;
@@ -945,10 +946,15 @@ The factory resolves the engine through the **plugin loader**, not a hard-coded 
 configured engine (`engine.type`, default `'whatsapp-web.js'`) is read once in the constructor; the
 built-in `whatsapp-web.js` and `baileys` plugins are registered and the configured one is enabled in
 `onModuleInit()`. `create()` takes an **options object** (engine-neutral per-call config —
-`sessionId` / `proxyUrl` / `proxyType`), not a `type` argument. There is no `EngineType` union, no
-`switch`, and no `Unknown engine type` throw: if the plugin is unavailable it logs a warning and
-**falls back** to constructing a `WhatsAppWebJsAdapter` directly. (A typo in `ENGINE_TYPE` is rejected
-at boot by `validateEnv`, which whitelists `whatsapp-web.js` | `baileys`.)
+`sessionId` / `dbSessionId` / `proxyUrl` / `proxyType`), not a `type` argument. The two ids are
+distinct: `sessionId` is the session **name** (the on-disk auth-directory key), `dbSessionId` is the
+session **UUID** (`Session.id`), needed by FK-bound stores such as `baileys_stored_messages`. There is
+no `EngineType` union, no `switch`, and no `Unknown engine type` throw: if the plugin is unavailable it
+logs a warning and falls back to the legacy direct adapter — but that fallback can only build
+`whatsapp-web.js`. For any other configured engine (e.g. `ENGINE_TYPE=baileys` with its plugin
+missing) `createFallbackEngine` **throws** rather than silently running the wrong engine, so the
+session fails loudly at start. (A typo in `ENGINE_TYPE` is rejected at boot by `validateEnv`, which
+whitelists `whatsapp-web.js` | `baileys`.)
 
 ```typescript
 // engine/engine.factory.ts
@@ -959,7 +965,10 @@ import { WhatsAppWebJsAdapter } from './adapters/whatsapp-web-js.adapter';
 import { PluginLoaderService, PluginType, IEnginePlugin } from '../core/plugins';
 
 export interface EngineCreateOptions {
+  /** Session NAME — the on-disk auth-directory key. */
   sessionId: string;
+  /** Session UUID (Session.id) — the DB-row key for FK-bound stores (e.g. baileys_stored_messages). */
+  dbSessionId: string;
   proxyUrl?: string;
   proxyType?: 'http' | 'https' | 'socks4' | 'socks5';
 }
@@ -989,13 +998,25 @@ export class EngineFactory implements OnModuleInit {
       // registration, so the factory passes only engine-neutral per-call options here.
       return enginePlugin.instance.createEngine({
         sessionId: options.sessionId,
+        dbSessionId: options.dbSessionId,
         proxyUrl: options.proxyUrl,
         proxyType: options.proxyType,
       }) as IWhatsAppEngine;
     }
 
-    // Plugin missing -> warn and fall back to the direct whatsapp-web.js adapter (no throw).
+    // Plugin missing -> warn, then fall back to the direct whatsapp-web.js adapter.
     return this.createFallbackEngine(options);
+  }
+
+  private createFallbackEngine(options: EngineCreateOptions): IWhatsAppEngine {
+    // The legacy fallback can only construct whatsapp-web.js. Building it for a different configured
+    // engine would silently run the WRONG one — fail loudly instead.
+    if (this.engineType !== 'whatsapp-web.js') {
+      throw new Error(
+        `Engine '${this.engineType}' is unavailable and has no direct fallback; cannot start the session.`,
+      );
+    }
+    return new WhatsAppWebJsAdapter(/* ...sessionDataPath, puppeteer, proxy, lidMappingStore... */);
   }
 }
 ```
@@ -1184,7 +1205,7 @@ flowchart TB
 | **Community** | Large | Large |
 | **Multi-device** | ✅ | ✅ |
 | **QR Code** | ✅ | ✅ |
-| **Phone Link** | ❌ | ✅ |
+| **Phone Link** | ✅ | ✅ |
 | **Maintenance** | Active | Active |
 
 ### Benefits of Abstraction
@@ -1243,7 +1264,7 @@ flowchart TB
 |-----------|---------|---------|-------|
 | **WhatsApp Engine** | whatsapp-web.js, Baileys (`ENGINE_TYPE`) | whatsapp-web.js | Baileys is browser-free |
 | **Database** | SQLite, PostgreSQL (`DATABASE_TYPE`) | SQLite | PostgreSQL for large-scale production |
-| **Media Storage** | local, s3 (`STORAGE_TYPE`) | local | MinIO is the `s3` backend (`forcePathStyle`) |
+| **Media Storage** | local, s3 (`STORAGE_TYPE`) | local | MinIO is the `s3` backend (`S3_ENDPOINT` enables path-style) |
 | **Cache** | Redis or disabled (`REDIS_ENABLED`) | Disabled | When disabled/unreachable, cache fails open (no-op) |
 
 ### 3.13.1 Storage Service
@@ -1251,10 +1272,17 @@ flowchart TB
 Media storage is a **single service** (`src/common/storage/storage.service.ts`) that branches
 internally on `storageType` — there is no `I*Adapter` interface, separate adapter classes, or a
 `StorageFactory`. The two backends are `local` (the default; files under `./data/media`) and `s3`.
-**MinIO is not a separate type** — it is the `s3` backend; the S3 client is always created with
-`forcePathStyle: true`, which MinIO requires, and any S3-compatible endpoint works. The public method
-set is `putFile` / `getFile` / `listFiles` / `createExportStream` (export) / `importFromStream`
-(import), plus `getFileCount` and `getCurrentStorageType`.
+The main producer/consumer is the storage export/import migration and backup flow; the status store
+also writes status media through `putFile` (under `statuses/`) and sweeps orphans back out with
+`deleteFile`. Incoming and outgoing message media is returned inline to REST/webhook consumers and is
+**not** automatically written through `StorageService`.
+**MinIO is not a separate type** — it is the `s3` backend. The S3 client is created from credentials
+alone, so plain AWS S3 works with no endpoint (the SDK derives one from the region); `S3_ENDPOINT` is
+for S3-compatible stores (MinIO, R2, …), and setting it is also what enables `forcePathStyle: true`.
+The public method set is `putFile` / `getFile` / `deleteFile` / `listFiles` / `iterateFiles` /
+`createExportStream` (export) / `importFromStream` (import), plus `getFileCount`,
+`getCurrentStorageType` and `refreshS3Availability` (re-probes the bucket; the infra status endpoint
+calls it to report S3 reachability).
 
 ```typescript
 // src/common/storage/storage.service.ts
@@ -1269,15 +1297,16 @@ export class StorageService {
     this.localPath = this.configService.get<string>('storage.localPath') || './data/media';
 
     if (this.storageType === 's3') {
-      const endpoint = process.env.S3_ENDPOINT;             // S3 / MinIO endpoint
+      const endpoint = process.env.S3_ENDPOINT;             // optional: S3-compatible stores only
       const accessKeyId = process.env.S3_ACCESS_KEY_ID;     // legacy S3_ACCESS_KEY also read
       const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY;
-      if (endpoint && accessKeyId && secretAccessKey) {
+      // Credentials alone are enough — AWS S3 derives its endpoint from the region.
+      if (accessKeyId && secretAccessKey) {
         this.s3Client = new S3Client({
-          endpoint,
+          ...(endpoint ? { endpoint } : {}),
           region: process.env.S3_REGION || 'us-east-1',
           credentials: { accessKeyId, secretAccessKey },
-          forcePathStyle: true, // Required for MinIO; harmless for AWS S3
+          ...(endpoint ? { forcePathStyle: true } : {}), // path-style is a MinIO/R2 concern
         });
         // bucket auto-created if missing (HeadBucket -> CreateBucket)
       }
@@ -1326,7 +1355,7 @@ Database wiring lives inline in `AppModule` (`src/app.module.ts`) as two named
 // shape of the 'data' connection useFactory in src/app.module.ts
 const dbType = configService.get<'sqlite' | 'postgres'>('dataDatabase.type', 'sqlite');
 const baseConfig = {
-  entities: [/* session, webhook, message, template, engine entities */],
+  entities: [/* session, webhook, message, template, engine, integration, status-store globs */],
   migrations: [__dirname + '/database/migrations/*{.ts,.js}'],
   logging: configService.get<boolean>('dataDatabase.logging', false),
 };
@@ -1348,7 +1377,7 @@ if (dbType === 'postgres') {
 // SQLite (default): migration-managed unless DATABASE_SYNCHRONIZE=true
 const synchronize = configService.get<boolean>('dataDatabase.synchronize', false);
 return {
-  ...baseConfig, name: 'data', type: 'sqlite',
+  ...baseConfig, name: 'data', type: 'better-sqlite3' as const, // DATABASE_TYPE=sqlite -> this driver
   database: configService.get('dataDatabase.database', './data/openwa.sqlite'),
   synchronize,
   migrationsRun: !synchronize,
@@ -1366,43 +1395,27 @@ return {
 
 #### Migration Strategy
 
+There is **no** shared cross-dialect migration base class. Each migration is a plain
+`MigrationInterface` that branches inline on the connection's dialect, and the branch always tests for
+`'postgres'` (never for a SQLite name — the SQLite driver reports `better-sqlite3`, not `sqlite`).
+A Postgres-only migration simply returns early everywhere else:
+
 ```typescript
-// database/migrations/utils/database-aware-migration.ts
+// src/database/migrations/1779235200000-AddUuidDefaultsForPostgres.ts (shape)
+export class AddUuidDefaultsForPostgres1779235200000 implements MigrationInterface {
+  name = 'AddUuidDefaultsForPostgres1779235200000';
 
-/**
- * Helper for writing migrations compatible with SQLite and PostgreSQL
- */
-export abstract class DatabaseAwareMigration {
-  protected isPostgres(queryRunner: QueryRunner): boolean {
-    return queryRunner.connection.options.type === 'postgres';
-  }
-
-  protected isSqlite(queryRunner: QueryRunner): boolean {
-    return queryRunner.connection.options.type === 'sqlite';
-  }
-
-  /**
-   * Generate UUID default based on database type
-   */
-  protected getUuidDefault(queryRunner: QueryRunner): string {
-    if (this.isPostgres(queryRunner)) {
-      return 'gen_random_uuid()';
-    }
-    // SQLite: UUID must be generated at the application level
-    return '';
-  }
-
-  /**
-   * Get timestamp type based on database
-   */
-  protected getTimestampType(queryRunner: QueryRunner): string {
-    if (this.isPostgres(queryRunner)) {
-      return 'TIMESTAMP WITH TIME ZONE';
-    }
-    return 'DATETIME';
+  public async up(queryRunner: QueryRunner): Promise<void> {
+    // No-op on SQLite: TypeORM generates the UUID in the driver layer there, so no DB default
+    // is needed. Only Postgres expects the column to supply it.
+    if (queryRunner.dataSource.options.type !== 'postgres') return;
+    // ... ALTER TABLE ... ALTER COLUMN "id" SET DEFAULT gen_random_uuid()::varchar
   }
 }
 ```
+
+Migrations that must run on both dialects with different SQL take the same check as a branch, e.g.
+`const isPostgres = queryRunner.connection.options.type === 'postgres';`.
 
 ### 3.13.3 Cache Service
 
@@ -1424,13 +1437,14 @@ export class CacheService implements OnModuleDestroy {
   constructor(private readonly configService: ConfigService) {
     // REDIS_ENABLED is the primary switch; cache.enabled is the legacy fallback.
     this.enabled = process.env.REDIS_ENABLED === 'true' || configService.get<boolean>('cache.enabled', false);
-    // Lazy connect: the first isAvailable() call dials Redis (bounded retries).
+    // Lazy connect: the first isAvailable() call dials Redis, then ioredis owns reconnection —
+    // it retries forever with capped backoff (times => Math.min(times * 500, 5000)).
   }
 
   async isAvailable(): Promise<boolean> {
-    if (!this.enabled) return false;        // disabled -> always "no cache"
-    if (!this.redis) await this.tryConnect(); // bounded attempts
-    return this.ping();
+    if (!this.enabled) return false;  // disabled -> always "no cache"
+    this.ensureClient();              // create on first use; ioredis handles (re)connecting
+    return this.ping();               // reflects live state: false during an outage, true once back
   }
 
   // Fail-open reads/writes: unavailable Redis is a no-op, never an error to the caller.
@@ -1472,7 +1486,7 @@ flowchart LR
         E1[PostgreSQL Cluster]
         E2[S3/MinIO]
         E3[Redis Cluster]
-        E4[Horizontal Scaling]
+        E4[Vertical Headroom]
     end
 ```
 

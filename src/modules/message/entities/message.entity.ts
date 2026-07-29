@@ -56,6 +56,14 @@ export class Message {
   @Column({ nullable: true })
   chatName?: string;
 
+  /**
+   * Stable sender identity for a group message: the participant JID who actually posted (`from` is
+   * the group JID). Lets the chat view tell two same-named participants apart. Null on 1:1
+   * messages, outgoing echoes, and legacy rows.
+   */
+  @Column({ nullable: true })
+  author?: string;
+
   @Column()
   from: string;
 
@@ -87,6 +95,11 @@ export class Message {
   @Index()
   status: MessageStatus;
 
+  // Standalone index for the createdAt-only range predicates of the stats aggregates — the
+  // composite above leads with sessionId, so it can't serve them (SQLite needs ANALYZE stats for
+  // a skip-scan; Postgres has none). The explicit name matches the migration that creates it on
+  // synchronize-disabled deployments, so both schema paths converge on one index.
   @CreateDateColumn()
+  @Index('IDX_messages_createdAt')
   createdAt: Date;
 }

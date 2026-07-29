@@ -6,9 +6,16 @@ import { Chat, Client, Message } from 'whatsapp-web.js';
 
 /**
  * A WhatsApp ID (Wid) as serialized by whatsapp-web.js, e.g. `{ _serialized: '120363xxx@g.us' }`.
+ *
+ * WA Web build 2.3000.x (~2026-07-14) renamed this property to the minifier-mangled `$1`, breaking
+ * every `_serialized` read at once (#747). The image build backports upstream's id normalization
+ * (`scripts/patch-wwebjs-201832.js`), which restores `_serialized` on the structures it covers — but
+ * `Reaction` is not one of them, so `$1` is declared here for the callsites that must read it
+ * directly. Both are optional: exactly one is present depending on the WA Web build.
  */
 export interface SerializedWid {
   _serialized?: string;
+  $1?: string;
 }
 
 /**
@@ -21,6 +28,12 @@ export interface GroupMetadataRaw {
   parentGroup?: SerializedWid | string | null;
   linkedParentGroup?: SerializedWid | string | null;
   linkedParent?: SerializedWid | string | null;
+  /** Only admins can post (WA Web group model; written by GroupChat.setMessagesAdminsOnly). */
+  announce?: boolean;
+  /** Only admins can edit group info (written by GroupChat.setInfoAdminsOnly). */
+  restrict?: boolean;
+  /** Disappearing-messages timer in seconds, when WA Web reports one on the group model. */
+  ephemeralDuration?: number;
 }
 
 /**
@@ -39,18 +52,27 @@ export interface GroupChat extends Omit<Chat, 'isReadOnly' | 'getLabels'> {
   isReadOnly?: boolean;
   isAnnounce?: boolean;
   groupMetadata?: GroupMetadataRaw;
-  addParticipants(ids: string[]): Promise<void>;
-  removeParticipants(ids: string[]): Promise<void>;
-  promoteParticipants(ids: string[]): Promise<void>;
-  demoteParticipants(ids: string[]): Promise<void>;
+  addParticipants(
+    ids: string[],
+    options?: Record<string, unknown>,
+  ): Promise<Record<string, { code: number; message: string; isInviteV4Sent: boolean }> | string>;
+  removeParticipants(ids: string[]): Promise<{ status: number }>;
+  promoteParticipants(ids: string[]): Promise<{ status: number }>;
+  demoteParticipants(ids: string[]): Promise<{ status: number }>;
   leave(): Promise<void>;
-  setSubject(subject: string): Promise<void>;
-  setDescription(desc: string): Promise<void>;
+  /** Resolves false when WA Web rejects the change (e.g. no admin rights) — does not throw. */
+  setSubject(subject: string): Promise<boolean>;
+  /** Resolves false when WA Web rejects the change (e.g. no admin rights) — does not throw. */
+  setDescription(desc: string): Promise<boolean>;
   getLabels(): Promise<Array<{ id: string; name: string; hexColor: string }>>;
   addLabel(id: string): Promise<void>;
   removeLabel(id: string): Promise<void>;
   getInviteCode(): Promise<string>;
   revokeInvite(): Promise<string>;
+  /** Resolves false when the account lacks admin rights (does not throw). */
+  setMessagesAdminsOnly(adminsOnly?: boolean): Promise<boolean>;
+  /** Resolves false when the account lacks admin rights (does not throw). */
+  setInfoAdminsOnly(adminsOnly?: boolean): Promise<boolean>;
 }
 
 /**
@@ -77,8 +99,10 @@ export interface BusinessClient extends Omit<
   getLabels(): Promise<Array<{ id: string; name: string; hexColor: string }>>;
   getLabelById(id: string): Promise<{ id: string; name: string; hexColor: string } | null>;
   getChannels(): Promise<WwjsChannelData[]>;
-  subscribeToChannel(inviteCode: string): Promise<WwjsChannelData>;
-  unsubscribeFromChannel(id: string): Promise<void>;
+  /** Takes a channel ID (`…@newsletter`), NOT an invite code; resolves true only on success. */
+  subscribeToChannel(channelId: string): Promise<boolean>;
+  /** Resolves true only when the unsubscription completed. */
+  unsubscribeFromChannel(id: string, options?: Record<string, unknown>): Promise<boolean>;
 }
 
 /**
@@ -98,7 +122,8 @@ export interface WwjsChannelData {
  * Channel message data.
  */
 export interface WwjsChannelMessage {
-  id: { _serialized: string } | string;
+  /** `SerializedWid`, not `{ _serialized: string }`: the latter makes the `$1` rename unreadable. */
+  id: SerializedWid | string;
   body?: string;
   type?: string;
   timestamp?: number;

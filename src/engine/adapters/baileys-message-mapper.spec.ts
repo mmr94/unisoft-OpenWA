@@ -138,6 +138,10 @@ describe('buildIncomingMessageFromBaileys', () => {
     expect(r.fromMe).toBe(false);
   });
 
+  it('stamps kind from the chat JID', () => {
+    expect(buildIncomingMessageFromBaileys({ ...base, remoteJid: 'abc@newsletter' }).kind).toBe('channel');
+  });
+
   it('inverts from/to for an outgoing (fromMe) message', () => {
     const r = buildIncomingMessageFromBaileys({ ...base, fromMe: true });
     expect(r.from).toBe('628999@s.whatsapp.net'); // self
@@ -193,6 +197,37 @@ describe('buildIncomingMessageFromBaileys', () => {
   it('flags a status broadcast', () => {
     const r = buildIncomingMessageFromBaileys({ ...base, remoteJid: 'status@broadcast' });
     expect(r.isStatusBroadcast).toBe(true);
+  });
+
+  it('exposes the status poster from participant as author (status@broadcast is not a group)', () => {
+    const r = buildIncomingMessageFromBaileys({
+      ...base,
+      remoteJid: 'status@broadcast',
+      participant: '628111@s.whatsapp.net',
+    });
+    expect(r.isStatusBroadcast).toBe(true);
+    expect(r.isGroup).toBe(false);
+    // Without this, buildIncomingStatus can only resolve the poster to the status@broadcast
+    // pseudo-JID itself and drops the status entirely.
+    expect(r.author).toBe('628111@s.whatsapp.net');
+  });
+
+  it('converts extended-text status styling: backgroundArgb -> #RRGGBB, font passed through', () => {
+    const r = buildIncomingMessageFromBaileys({
+      ...base,
+      remoteJid: 'status@broadcast',
+      participant: '628111@s.whatsapp.net',
+      backgroundArgb: 0xff25d366, // ARGB, alpha in the high byte
+      font: 2,
+    });
+    expect(r.backgroundColor).toBe('#25d366');
+    expect(r.font).toBe(2);
+  });
+
+  it('leaves styling undefined when the message carries none', () => {
+    const r = buildIncomingMessageFromBaileys({ ...base });
+    expect(r.backgroundColor).toBeUndefined();
+    expect(r.font).toBeUndefined();
   });
 
   it('carries the push name onto contact when present', () => {

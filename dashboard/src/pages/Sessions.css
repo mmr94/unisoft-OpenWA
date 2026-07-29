@@ -9,34 +9,7 @@
   width: 100%;
 }
 
-.sessions-page .header-content {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 1rem;
-  width: 100%;
-}
-
 /* H1 inherited from global */
-
-.sessions-page .btn-primary {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.75rem 1.25rem;
-  background: var(--primary);
-  color: white;
-  border: none;
-  border-radius: var(--radius);
-  font-size: 0.9375rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.2s;
-}
-
-.sessions-page .btn-primary:hover {
-  background: var(--primary-hover);
-}
 
 .sessions-page .filters-bar {
   display: flex;
@@ -178,7 +151,7 @@
 }
 
 .sessions-page .info-value.error-text {
-  color: var(--color-danger, #dc2626);
+  color: var(--error);
   font-weight: 500;
   max-width: 60%;
   text-align: right;
@@ -261,12 +234,6 @@
     flex: 1;
   }
 
-  .sessions-page .header-content {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 1rem;
-  }
-
   .sessions-page .btn-primary {
     width: 100%;
     justify-content: center;
@@ -321,6 +288,11 @@
   width: 90%;
   max-width: 480px;
   animation: slideUp 0.3s ease;
+  /* Match the global modal: cap height + flex column so the body scrolls with header/footer pinned —
+     long content (QR + instructions) no longer pushes actions off-screen. */
+  display: flex;
+  flex-direction: column;
+  max-height: 90vh;
   overflow: hidden;
 }
 
@@ -364,6 +336,9 @@
 
 .sessions-page .modal-body {
   padding: 1.5rem;
+  /* Scroll the body (not the whole card) so the pinned header/footer stay visible. */
+  overflow-y: auto;
+  flex: 1 1 auto;
 }
 
 .sessions-page .modal-body > label {
@@ -425,39 +400,6 @@
 }
 
 /* Secondary Button */
-.sessions-page .btn-secondary {
-  padding: 0.75rem 1.25rem;
-  background: var(--bg-light);
-  color: var(--text-secondary);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  font-size: 0.9375rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.sessions-page .btn-secondary:hover {
-  background: var(--bg-white);
-  border-color: var(--text-muted);
-  color: var(--text-primary);
-}
-
-.sessions-page .btn-danger {
-  padding: 0.75rem 1.25rem;
-  background: #dc2626;
-  color: white;
-  border: none;
-  border-radius: var(--radius);
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.sessions-page .btn-danger:hover {
-  background: #b91c1c;
-}
-
 .sessions-page .confirm-modal {
   max-width: 400px;
 }
@@ -692,7 +634,8 @@
 }
 
 .sessions-page .status-pill.initializing,
-.sessions-page .status-pill.connecting {
+.sessions-page .status-pill.connecting,
+.sessions-page .status-pill.authenticating {
   background: rgba(234, 179, 8, 0.1);
   color: var(--warning);
 }
@@ -702,12 +645,21 @@
   color: var(--info);
 }
 
+/* Same amber token as the transient states above — a literal here was the only pill not on a theme
+   variable, and it lost contrast on the dark card. The heavier tint is what separates "needs a human"
+   from the in-progress amber, since the two must not read alike. */
+.sessions-page .status-pill.action_required {
+  background: rgba(245, 158, 11, 0.22);
+  color: var(--warning);
+}
+
 .sessions-page .status-pill.ready {
   background: rgba(34, 197, 94, 0.1);
   color: var(--success);
 }
 
-.sessions-page .status-pill.disconnected {
+.sessions-page .status-pill.disconnected,
+.sessions-page .status-pill.failed {
   background: rgba(239, 68, 68, 0.1);
   color: var(--error);
 }

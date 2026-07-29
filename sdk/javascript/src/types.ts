@@ -16,6 +16,9 @@
 /** A WhatsApp JID, e.g. `628123456789@c.us` (user) or `120363…@g.us` (group). */
 export type Jid = string;
 
+/** Chat/message kind discriminator. */
+export type ChatKind = 'individual' | 'group' | 'channel' | 'status' | 'broadcast' | 'unknown';
+
 /** Session lifecycle status. */
 export type SessionStatus =
   | 'created'
@@ -24,6 +27,7 @@ export type SessionStatus =
   | 'authenticating'
   | 'ready'
   | 'disconnected'
+  | 'action_required'
   | 'failed';
 
 /** Minimal success envelope returned by some state-changing endpoints. */
@@ -44,7 +48,7 @@ export interface SessionResponse {
   lastActive?: string | null;
   createdAt: string;
   updatedAt: string;
-  /** Only present when `status === 'failed'`. */
+  /** Only present when `status === 'failed'` (terminal failure) or `status === 'action_required'` (operator must intervene). */
   lastError?: string | null;
 }
 
@@ -95,6 +99,8 @@ export interface SendTextRequest {
   chatId: Jid;
   /** Max 4096 chars. */
   text: string;
+  /** WIDs to @mention (e.g. `["62811@c.us"]`). The text must also contain the `@<number>` token. */
+  mentions?: string[];
 }
 
 export interface SendMediaRequest {
@@ -108,7 +114,20 @@ export interface SendMediaRequest {
   filename?: string;
   /** Max 1024 chars. */
   caption?: string;
+}
+
+export interface SendAudioRequest extends SendMediaRequest {
   /** Audio only: send as a WhatsApp voice note (PTT). Server defaults mimetype to audio/ogg; codecs=opus. */
+  ptt?: boolean;
+}
+
+/** Nested media payload accepted by bulk sends; chatId lives on the parent and caption on content. */
+export interface BulkMediaRequest {
+  url?: string;
+  base64?: string;
+  mimetype?: string;
+  filename?: string;
+  /** Only the audio member consumes this flag. */
   ptt?: boolean;
 }
 
@@ -152,6 +171,13 @@ export interface DeleteMessageRequest {
   forEveryone?: boolean;
 }
 
+export interface EditMessageRequest {
+  chatId: Jid;
+  messageId: string;
+  /** New text body; max 4096 chars (same cap as a send). Own messages only — 404 if not found. */
+  body: string;
+}
+
 export interface SendTemplateRequest {
   chatId: Jid;
   /** Provide exactly one of `templateId` or `templateName`. */
@@ -160,6 +186,16 @@ export interface SendTemplateRequest {
   templateName?: string;
   /** Template variables (server DTO field is `vars`). */
   vars?: Record<string, string>;
+}
+
+export interface SendPollRequest {
+  chatId: Jid;
+  /** Poll question / title (max 255 chars). */
+  name: string;
+  /** Options to vote on (WhatsApp allows between 2 and 12). */
+  options: string[];
+  /** Allow voters to pick several options (default single choice). */
+  allowMultipleAnswers?: boolean;
 }
 
 export interface ListMessagesQuery {
@@ -216,6 +252,7 @@ export interface ChatHistoryMessage {
   fromMe: boolean;
   isGroup: boolean;
   isStatusBroadcast?: boolean;
+  kind?: ChatKind;
   /** For group messages, the participant who sent it (`from` is the group JID). */
   author?: Jid;
   mentionedIds?: Jid[];
@@ -258,10 +295,10 @@ export type BulkMessageType = 'text' | 'image' | 'video' | 'audio' | 'document';
 
 export interface BulkMessageContent {
   text?: string;
-  image?: SendMediaRequest;
-  video?: SendMediaRequest;
-  audio?: SendMediaRequest;
-  document?: SendMediaRequest;
+  image?: BulkMediaRequest;
+  video?: BulkMediaRequest;
+  audio?: BulkMediaRequest;
+  document?: BulkMediaRequest;
   caption?: string;
 }
 
@@ -346,6 +383,11 @@ export interface ProfilePictureResponse {
   url: string | null;
 }
 
+/** Batch profile-picture lookup: a map of contact id → picture URL (null when the lookup failed). */
+export interface ProfilePicturesResponse {
+  pictures: Record<string, string | null>;
+}
+
 export interface ContactPhoneResponse {
   contactId: Jid;
   phone: string | null;
@@ -409,6 +451,55 @@ export interface InviteCodeResponse {
   message?: string;
 }
 
+export interface JoinGroupRequest {
+  /** Group invite code (the token from a `https://chat.whatsapp.com/<code>` link); max 128 chars. */
+  inviteCode: string;
+}
+
+export interface JoinGroupResponse {
+  success: boolean;
+  groupId: Jid;
+}
+
+/** Group settings as returned by `GET /sessions/:id/groups/:groupId/settings`. */
+export interface GroupSettingsResponse {
+  /** Only admins can send messages (announce group). */
+  announce?: boolean;
+  /** Only admins can edit group info (locked group). */
+  locked?: boolean;
+  /** Disappearing-messages timer in seconds; 0 disables. Known values: 86400 (24h), 604800 (7d), 7776000 (90d). */
+  ephemeralSeconds?: number;
+}
+
+/**
+ * Body for `PUT /sessions/:id/groups/:groupId/settings`. At least one field must be
+ * present (the server answers 400 on an empty body); `ephemeralSeconds` is rejected
+ * with 501 on the whatsapp-web.js engine.
+ */
+export type UpdateGroupSettingsRequest = GroupSettingsResponse;
+
+// ── Profile (the session's own account) ───────────────────────────
+
+export interface SetProfileNameRequest {
+  /** New display name (WhatsApp limit: 25 characters). */
+  name: string;
+}
+
+export interface SetProfileStatusRequest {
+  /** New about/status text (may be empty to clear it; WhatsApp limit: 139 characters). */
+  status: string;
+}
+
+/** Provide `url` OR `base64` (with `mimetype`). Mirrors the media acceptance pattern of sends. */
+export interface SetProfilePictureRequest {
+  /** Image URL (http/https); mutually exclusive with `base64`. */
+  url?: string;
+  /** Base64 encoded image data; requires `mimetype`. */
+  base64?: string;
+  /** Image MIME type (required when using `base64`). */
+  mimetype?: string;
+}
+
 // ── Webhook ───────────────────────────────────────────────────────
 
 /** Events a webhook may subscribe to. Use `*` to receive all. */
@@ -419,20 +510,29 @@ export type WebhookEvent =
   | 'message.failed'
   | 'message.revoked'
   | 'message.reaction'
+  | 'message.edited'
   | 'session.status'
   | 'session.qr'
   | 'session.authenticated'
   | 'session.disconnected'
-  // Reserved: accepted on subscribe but not dispatched yet.
+  | 'session.reconnect_loop'
   | 'group.join'
   | 'group.leave'
   | 'group.update'
+  | 'call.received'
+  | 'status.received'
   | '*';
 
 export interface WebhookFilterCondition {
   field: string;
   operator: string;
-  value: string[];
+  /**
+   * Polymorphic per field kind: a single string (text fields), a string array
+   * (id/idArray/enum fields), or a boolean (boolean fields).
+   */
+  value: string | string[] | boolean;
+  /** Only meaningful for text fields (`contains`/`equals`). Defaults to false. */
+  caseSensitive?: boolean;
 }
 
 export interface WebhookFilters {
@@ -483,6 +583,7 @@ export interface ChatSummary {
   /** Preview text of the last message (the server returns a plain string, not an object). */
   lastMessage?: string;
   timestamp?: string | number;
+  kind?: ChatKind;
 }
 
 export interface MarkChatRequest {
@@ -503,15 +604,28 @@ export interface DeleteChatRequest {
 // ── Status / Stories ──────────────────────────────────────────────
 
 /**
- * Weak shape returned by the GET status endpoints (`list`/`fromContact`).
- * The server payload there is loose/different; fields are all optional.
+ * One status/story from the GET status endpoints (`list`/`fromContact`), which answer a
+ * `{ statuses: [...] }` envelope. Mirrors the backend `Status` — the engine payload is returned
+ * as-is, with no DTO in between.
  */
 export interface StatusRecord {
-  id?: string;
-  statusId?: string;
-  type?: string;
-  body?: string | null;
-  timestamp?: string | number;
+  id: string;
+  /** Whose story this is. */
+  contact: {
+    id: Jid;
+    name?: string;
+    pushName?: string;
+  };
+  type: 'text' | 'image' | 'video';
+  /** Text body for a text status, caption for an image/video one. */
+  caption?: string;
+  mediaUrl?: string;
+  backgroundColor?: string;
+  font?: number;
+  /** ISO 8601 timestamp of the post. */
+  timestamp: string;
+  /** ISO 8601 expiry — 24h after `timestamp`. */
+  expiresAt: string;
 }
 
 /**
@@ -528,8 +642,8 @@ export interface StatusResult {
 
 export interface SendTextStatusRequest {
   text: string;
-  /** Recipient JIDs the status is addressed to (required by the server; empty → 400). */
-  recipients: string[];
+  /** Recipient JIDs. Required on the Baileys engine (absent/empty → 400); omit on whatsapp-web.js, which broadcasts instead. */
+  recipients?: string[];
   /** Hex background color, e.g. `#25D366`. */
   backgroundColor?: string;
   /** Font index supported by WhatsApp status. */
@@ -547,16 +661,16 @@ export interface StatusMediaInput {
 /** Server expects a nested `{ image: { url|base64 } }` body, not flat media fields. */
 export interface SendImageStatusRequest {
   image: StatusMediaInput;
-  /** Recipient JIDs the status is addressed to (required by the server; empty → 400). */
-  recipients: string[];
+  /** Recipient JIDs. Required on the Baileys engine (absent/empty → 400); omit on whatsapp-web.js, which broadcasts instead. */
+  recipients?: string[];
   caption?: string;
 }
 
 /** Server expects a nested `{ video: { url|base64 } }` body, not flat media fields. */
 export interface SendVideoStatusRequest {
   video: StatusMediaInput;
-  /** Recipient JIDs the status is addressed to (required by the server; empty → 400). */
-  recipients: string[];
+  /** Recipient JIDs. Required on the Baileys engine (absent/empty → 400); omit on whatsapp-web.js, which broadcasts instead. */
+  recipients?: string[];
   caption?: string;
 }
 
@@ -611,11 +725,12 @@ export type UpdateTemplateRequest = Partial<CreateTemplateRequest>;
 
 // ── Label (WhatsApp Business) ─────────────────────────────────────
 
+/** Mirrors the backend `Label` — returned by the engine as-is, with no DTO in between. */
 export interface LabelRecord {
   id: string;
   name: string;
-  color?: string;
-  colorHex?: string;
+  /** Label colour as a hex string, e.g. `#25D366`. */
+  hexColor: string;
 }
 
 export interface AddLabelRequest {
@@ -624,13 +739,33 @@ export interface AddLabelRequest {
 
 // ── Channel / Newsletter ──────────────────────────────────────────
 
+/** Mirrors the backend `Channel` — returned by the engine as-is, with no DTO in between. */
 export interface ChannelRecord {
   id: Jid;
-  name?: string;
-  description?: string | null;
+  name: string;
+  description?: string;
+  /** Invite code from the channel link. */
+  inviteCode?: string;
   subscriberCount?: number;
-  pictureUrl?: string | null;
-  role?: string;
+  /** Channel picture URL. Populated by Baileys; whatsapp-web.js omits it. */
+  picture?: string;
+  verified?: boolean;
+  /** Channel creation time as reported by the engine. Populated by Baileys; whatsapp-web.js omits it. */
+  createdAt?: number;
+}
+
+/**
+ * A message read live from a channel by `channels.messages()`. This is the engine payload
+ * (backend `ChannelMessage`), NOT the persisted {@link MessageRecord} — that endpoint reads
+ * WhatsApp directly and never touches the message store.
+ */
+export interface ChannelMessageRecord {
+  id: string;
+  body: string;
+  /** Unix timestamp in seconds. */
+  timestamp: number;
+  hasMedia: boolean;
+  mediaUrl?: string;
 }
 
 export interface ChannelMessageQuery {

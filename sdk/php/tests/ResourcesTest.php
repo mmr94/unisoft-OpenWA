@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpenWA\Tests;
 
+use OpenWA\Exceptions\OpenWANotFoundException;
 use PHPUnit\Framework\TestCase;
 
 class ResourcesTest extends TestCase
@@ -13,11 +14,12 @@ class ResourcesTest extends TestCase
     public function testSessionLifecyclePaths(): void
     {
         $backend = new MockBackend();
-        // Queue responses in CALL order: list, get, create, start, stop, forceKill, delete.
+        // Queue responses in CALL order: list, get, create, start, stop, logout, forceKill, delete.
         $backend->on(200, []);
         $backend->on(200, ['id' => 's1', 'name' => 'n', 'status' => 'ready']);
         $backend->on(201, ['id' => 's1', 'name' => 'n', 'status' => 'created']);
         $backend->on(200, ['id' => 's1', 'status' => 'initializing']);
+        $backend->on(200, ['id' => 's1', 'status' => 'disconnected']);
         $backend->on(200, ['id' => 's1', 'status' => 'disconnected']);
         $backend->on(200, ['id' => 's1', 'status' => 'disconnected']);
         $backend->on(204);
@@ -30,6 +32,8 @@ class ResourcesTest extends TestCase
         $client->sessions->start('s1');
         $this->assertStringContainsString('/sessions/s1/start', $backend->lastCall()['path']);
         $client->sessions->stop('s1');
+        $client->sessions->logout('s1');
+        $this->assertStringContainsString('/sessions/s1/logout', $backend->lastCall()['path']);
         $client->sessions->forceKill('s1');
         $this->assertStringContainsString('/sessions/s1/force-kill', $backend->lastCall()['path']);
         $client->sessions->delete('s1');
@@ -106,6 +110,26 @@ class ResourcesTest extends TestCase
         $this->assertStringContainsString('/revoke', $backend->calls()[4]['url']);
     }
 
+    public function testGroupJoinAndSettings(): void
+    {
+        $backend = new MockBackend();
+        $backend->on(200, ['success' => true, 'groupId' => 'g1@g.us']);
+        $backend->on(200, ['announce' => true, 'locked' => false]);
+        $backend->on(200, ['success' => true, 'message' => 'Group settings updated']);
+        $client = $backend->makeClient();
+        $joined = $client->groups->joinGroup('s', 'AbCdEf123');
+        $this->assertSame('POST', $backend->calls()[0]['method']);
+        $this->assertSame('/api/sessions/s/groups/join', $backend->calls()[0]['path']);
+        $this->assertSame(['inviteCode' => 'AbCdEf123'], $backend->calls()[0]['body']);
+        $this->assertSame('g1@g.us', $joined['groupId']);
+        $settings = $client->groups->getGroupSettings('s', 'g1@g.us');
+        $this->assertSame('/api/sessions/s/groups/g1@g.us/settings', $backend->calls()[1]['path']);
+        $this->assertTrue($settings['announce']);
+        $client->groups->updateGroupSettings('s', 'g1@g.us', ['announce' => true, 'ephemeralSeconds' => 604800]);
+        $this->assertSame('PUT', $backend->calls()[2]['method']);
+        $this->assertSame(['announce' => true, 'ephemeralSeconds' => 604800], $backend->calls()[2]['body']);
+    }
+
     // ── Contacts ──────────────────────────────────────────────────────
 
     public function testContactPaths(): void
@@ -138,6 +162,18 @@ class ResourcesTest extends TestCase
         $this->assertSame('DELETE', $backend->calls()[1]['method']);
     }
 
+    public function testProfilePicturesBatchResolvesIdsQuery(): void
+    {
+        $backend = (new MockBackend())->on(200, ['pictures' => ['a@c.us' => 'http://p/a', 'b@c.us' => null]]);
+        $client = $backend->makeClient();
+        $res = $client->contacts->profilePictures('s', ['a@c.us', 'b@c.us']);
+        $call = $backend->lastCall();
+        $this->assertSame('GET', $call['method']);
+        $this->assertSame('/api/sessions/s/contacts/profile-pictures', $call['path']);
+        $this->assertSame('ids=a%40c.us%2Cb%40c.us', $call['query']);
+        $this->assertSame(['a@c.us' => 'http://p/a', 'b@c.us' => null], $res['pictures']);
+    }
+
     // ── Webhooks ──────────────────────────────────────────────────────
 
     public function testWebhookCrudTest(): void
@@ -160,6 +196,26 @@ class ResourcesTest extends TestCase
         $client->webhooks->delete('s', 'w1');
         $client->webhooks->test('s', 'w1');
         $this->assertStringContainsString('/webhooks/w1/test', $backend->calls()[5]['url']);
+    }
+
+    public function testWebhookCreateForwardsPolymorphicFilterValuesVerbatim(): void
+    {
+        $backend = (new MockBackend())->on(201, ['id' => 'w1']);
+        $client = $backend->makeClient();
+        // The filter value is polymorphic on the wire: string (text fields),
+        // string list (id/enum fields), bool (boolean fields) + caseSensitive.
+        $filters = [
+            'conditions' => [
+                ['field' => 'sender', 'operator' => 'is', 'value' => ['123@c.us']],
+                ['field' => 'body', 'operator' => 'contains', 'value' => 'invoice', 'caseSensitive' => true],
+                ['field' => 'isGroup', 'operator' => 'is', 'value' => false],
+            ],
+        ];
+        $client->webhooks->create('s', ['url' => 'u', 'events' => ['message.received'], 'filters' => $filters]);
+        $this->assertSame(
+            ['url' => 'u', 'events' => ['message.received'], 'filters' => $filters],
+            $backend->lastCall()['body']
+        );
     }
 
     // ── Chats & Health ────────────────────────────────────────────────
@@ -198,6 +254,29 @@ class ResourcesTest extends TestCase
         $this->assertSame(['image' => ['url' => 'http://img'], 'recipients' => ['a@c.us'], 'caption' => 'c'], $backend->lastCall()['body']);
         $client->status->sendVideo('s', ['video' => ['url' => 'http://vid'], 'recipients' => ['a@c.us']]);
         $this->assertSame(['video' => ['url' => 'http://vid'], 'recipients' => ['a@c.us']], $backend->lastCall()['body']);
+    }
+
+    public function testStatusMediaReturnsStoredBytes(): void
+    {
+        $backend = (new MockBackend())->onRaw(200, 'PNG_BYTES', ['Content-Type' => 'image/png']);
+        $client = $backend->makeClient();
+        $media = $client->status->media('s', 'w1');
+        $call = $backend->lastCall();
+        $this->assertSame('GET', $call['method']);
+        $this->assertSame('/api/sessions/s/status/w1/media', $call['path']);
+        $this->assertSame('PNG_BYTES', $media['data']);
+        $this->assertSame('image/png', $media['contentType']);
+    }
+
+    public function testStatusMedia404MapsToNotFoundException(): void
+    {
+        $backend = (new MockBackend())->on(404, [
+            'statusCode' => 404,
+            'message' => 'Status media not found or expired',
+            'error' => 'Not Found',
+        ]);
+        $this->expectException(OpenWANotFoundException::class);
+        $backend->makeClient()->status->media('s', 'w1');
     }
 
     public function testHealthAndAuth(): void

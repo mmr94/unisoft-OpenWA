@@ -1,8 +1,18 @@
 import { DataSource } from 'typeorm';
 import { loadCliEnv } from './load-cli-env';
+import { sqliteDataMainPathCollision } from '../config/env.validation';
 
 // Load environment variables with the app's precedence (mirrors data-source.ts / main.ts).
 loadCliEnv();
+
+// Same guard as data-source.ts: the TypeORM CLI never runs ConfigModule's validate(), so the
+// SQLite main/data file collision check from env.validation is re-applied here — a shared broken
+// env (DATABASE_NAME resolving to the main file) must refuse BOTH migration entry points, not just
+// the data one.
+const sqlitePathCollision = sqliteDataMainPathCollision(process.env);
+if (sqlitePathCollision) {
+  throw new Error(sqlitePathCollision);
+}
 
 /**
  * Standalone TypeORM CLI DataSource for the MAIN connection (auth + audit).
@@ -19,7 +29,7 @@ loadCliEnv();
  * Usage: `npm run migration:run:main` (dev) / `migration:run:main:prod` (compiled).
  */
 const mainDataSource = new DataSource({
-  type: 'sqlite',
+  type: 'better-sqlite3',
   // Mirrors the runtime main path (configuration.ts) — MAIN_DATABASE_NAME overrides the default
   // ./data/main.sqlite (e.g. e2e points it at a temp file), so the CLI and the app never target
   // different main databases.

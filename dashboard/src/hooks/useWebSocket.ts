@@ -41,15 +41,46 @@ interface MessageReactionEvent {
   timestamp: string;
 }
 
+interface MessageEditedEvent {
+  sessionId: string;
+  messageId: string;
+  chatId: string;
+  body: string;
+  timestamp: number;
+}
+
 interface MessageRevokedEvent {
   sessionId: string;
   id: string;
+  /**
+   * Id of the ORIGINAL deleted message. Optional: whatsapp-web.js can only resolve it when the
+   * original is still in its local store, and Baileys sets it identical to `id`.
+   */
+  revokedId?: string;
   chatId: string;
   from: string;
   to: string;
   body: string;
   type: string;
   timestamp: number;
+}
+
+/** A freshly ingested contact status (story) — the dashboard uses it purely as a refetch signal. */
+interface StatusReceivedEvent {
+  sessionId: string;
+  timestamp: string;
+}
+
+/** Ack frame answering a client `subscribe` request (`{type: 'subscribed'}`). */
+interface SubscribedEvent {
+  sessionId: string;
+  events: string[];
+}
+
+/** Error frame answering a client request (`{type: 'error'}`), e.g. FORBIDDEN_SESSION. */
+interface ServerErrorEvent {
+  code: string;
+  message: string;
 }
 
 interface WebSocketEvents {
@@ -59,17 +90,38 @@ interface WebSocketEvents {
   onMessageAck?: (event: MessageAckEvent) => void;
   onMessageReaction?: (event: MessageReactionEvent) => void;
   onMessageRevoked?: (event: MessageRevokedEvent) => void;
+  onMessageEdited?: (event: MessageEditedEvent) => void;
+  onStatusReceived?: (event: StatusReceivedEvent) => void;
+  onSubscribed?: (event: SubscribedEvent) => void;
+  onServerError?: (event: ServerErrorEvent) => void;
 }
 
 // Shape of the server -> client event envelope produced by the NestJS gateway.
+// `type` is the 'event' literal so the frame union below narrows on it.
 interface ServerEventEnvelope {
-  type: string;
+  type: 'event';
   timestamp: string;
   payload?: {
     event: string;
     sessionId: string;
     data: Record<string, unknown>;
   };
+}
+
+// The gateway also answers client requests (subscribe/unsubscribe/ping) with ack frames
+// (`subscribed` / `unsubscribed` / `pong`) and error frames (`error`) on the same 'message'
+// channel. Routing them to the UI matters: a scoped key's rejected wildcard subscribe must be
+// visible so the caller can fall back to per-session rooms instead of waiting forever.
+interface ServerAckFrame {
+  type: 'subscribed' | 'unsubscribed' | 'pong';
+  sessionId?: string;
+  events?: string[];
+}
+
+interface ServerErrorFrame {
+  type: 'error';
+  code?: string;
+  message?: string;
 }
 
 // Use current origin for WebSocket (goes through nginx proxy in Docker)
@@ -81,8 +133,11 @@ warnIfInsecureHttpUrl(SOCKET_URL, 'VITE_WS_URL');
 export function useWebSocket(events: WebSocketEvents = {}) {
   const socketRef = useRef<Socket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
-  // True once Socket.IO exhausts its reconnection attempts and permanently gives up — lets the
-  // UI show a "connection lost" indicator + a manual retry instead of silently going stale.
+  // True when the connection is dead until the user retries: Socket.IO either exhausted its
+  // reconnection attempts, or the server itself closed the socket (rate limit, auth rejection,
+  // key eviction — a server-initiated close sets skipReconnect, so no auto-reconnect runs and
+  // `reconnect_failed` never fires). Lets the UI show a "connection lost" indicator + a manual
+  // retry instead of silently going stale.
   const [connectionFailed, setConnectionFailed] = useState(false);
 
   const connect = useCallback(() => {
@@ -116,8 +171,16 @@ export function useWebSocket(events: WebSocketEvents = {}) {
       setConnectionFailed(false);
     });
 
-    socketRef.current.on('disconnect', () => {
+    socketRef.current.on('disconnect', reason => {
       setIsConnected(false);
+      // A server-initiated close (handshake rate limit, auth rejection, key eviction) sets
+      // Socket.IO's skipReconnect: no auto-reconnect runs, so `reconnect_failed` never fires
+      // and without this the tab would silently stop receiving events. Surface the same
+      // recoverable failure state — the banner's manual retry opens a fresh socket, which
+      // skipReconnect does not block.
+      if (reason === 'io server disconnect') {
+        setConnectionFailed(true);
+      }
     });
 
     socketRef.current.on('connect_error', error => {
@@ -177,8 +240,21 @@ export function useWebSocket(events: WebSocketEvents = {}) {
 
     const socket = socketRef.current;
 
-    const handleIncomingMessage = (msg: ServerEventEnvelope) => {
-      if (!msg || msg.type !== 'event' || !msg.payload) return;
+    const handleIncomingMessage = (msg: ServerEventEnvelope | ServerAckFrame | ServerErrorFrame) => {
+      if (!msg || typeof msg.type !== 'string') return;
+
+      if (msg.type === 'error') {
+        events.onServerError?.({ code: String(msg.code ?? ''), message: String(msg.message ?? '') });
+        return;
+      }
+      if (msg.type === 'subscribed') {
+        events.onSubscribed?.({
+          sessionId: String(msg.sessionId ?? ''),
+          events: Array.isArray(msg.events) ? msg.events : [],
+        });
+        return;
+      }
+      if (msg.type !== 'event' || !msg.payload) return;
 
       const { event, sessionId, data } = msg.payload;
 
@@ -192,6 +268,9 @@ export function useWebSocket(events: WebSocketEvents = {}) {
         case 'message.received':
         case 'message.sent':
           events.onMessage?.({ sessionId, message: data, timestamp: msg.timestamp });
+          break;
+        case 'status.received':
+          events.onStatusReceived?.({ sessionId, timestamp: msg.timestamp });
           break;
         case 'message.ack':
           events.onMessageAck?.({
@@ -218,11 +297,33 @@ export function useWebSocket(events: WebSocketEvents = {}) {
           events.onMessageRevoked?.({
             sessionId,
             id: String(data.id),
+            // Not String()-coerced like its neighbours: the field is optional on the wire, and
+            // String(undefined) would yield the truthy literal "undefined" and defeat the fallback.
+            revokedId: typeof data.revokedId === 'string' ? data.revokedId : undefined,
             chatId: String(data.chatId),
             from: String(data.from),
             to: String(data.to),
             body: String(data.body ?? ''),
             type: String(data.type),
+            timestamp: Number(data.timestamp),
+          });
+          break;
+        case 'message.edited':
+          // Keep optional/malformed wire fields from becoming the truthy strings "undefined"/"null"
+          // and accidentally matching an unrelated cached row.
+          if (
+            typeof data.messageId !== 'string' ||
+            !data.messageId ||
+            typeof data.chatId !== 'string' ||
+            typeof data.body !== 'string'
+          ) {
+            break;
+          }
+          events.onMessageEdited?.({
+            sessionId,
+            messageId: data.messageId,
+            chatId: data.chatId,
+            body: data.body,
             timestamp: Number(data.timestamp),
           });
           break;

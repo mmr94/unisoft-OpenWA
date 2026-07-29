@@ -14,7 +14,7 @@ FROM --platform=$BUILDPLATFORM docker.io/node:22-slim AS builder
 WORKDIR /app
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     make \
     g++ \
@@ -22,6 +22,12 @@ RUN apt-get update && apt-get install -y \
 
 # Copy package files
 COPY package*.json ./
+
+# The postinstall hook is a real file (scripts/postinstall.js), and `npm ci` fails outright when
+# a lifecycle script is missing — copy it BEFORE the install. dashboard/ and the backport patcher
+# are deliberately still absent at this point, so the hook cleanly no-ops here (dashboard deps are
+# installed explicitly below; the patcher only matters for the production stage).
+COPY scripts/postinstall.js ./scripts/
 
 # Install all dependencies INCLUDING devDependencies — the build needs them (`nest` from
 # @nestjs/cli, plus `vite`/`typescript` for the dashboard). `--include=dev` is REQUIRED, not
@@ -40,7 +46,10 @@ COPY . .
 # deps - install them explicitly here (npm ci, reproducible from dashboard/package-lock.json).
 # `--include=dev` for the same reason as above: the dashboard build needs vite/typescript
 # (devDependencies), which a NODE_ENV=production build env would otherwise omit.
-RUN npm run build && npm run dashboard:ci -- --include=dev && npm run dashboard:build
+# Drop the incremental-build cache afterwards: it is pinned inside dist/ (so nest's deleteOutDir
+# wipes it with the output), and the production stage copies dist/ wholesale — it would otherwise
+# ship dead compiler metadata in every image.
+RUN npm run build && npm run dashboard:ci -- --include=dev && npm run dashboard:build && rm -f dist/*.tsbuildinfo
 
 # ===== Stage 2: Production =====
 FROM docker.io/node:22-slim AS production
@@ -50,9 +59,17 @@ FROM docker.io/node:22-slim AS production
 # to avoid the Debian chromium package's K8s SIGTRAP under strict non-root/seccomp;
 # arm64 installs Debian's chromium instead (it ships a native arm64 build). Both
 # resolve to the same /usr/local/bin/puppeteer-chrome symlink below.
+#
+# chromium-sandbox is listed EXPLICITLY (not left to Recommends) so --no-install-recommends still
+# trims every other Recommends but keeps the setuid sandbox binary available. Our default forces
+# --no-sandbox (configuration.ts) so it goes unused, but a user who overrides PUPPETEER_ARGS to drop
+# --no-sandbox would otherwise get a chromium that can't launch. Verified on real arm64 hardware:
+# with --no-install-recommends the package is dropped, and chromium launches fine under --no-sandbox.
 ARG TARGETARCH
-RUN apt-get update && apt-get install -y \
-    $([ "$TARGETARCH" = arm64 ] && echo chromium) \
+# sqlite3 ships the CLI so an in-container scripts/backup.sh run takes online-consistent SQLite
+# snapshots (.backup) instead of plain-copying a live database (which can archive a torn file).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    $([ "$TARGETARCH" = arm64 ] && echo "chromium chromium-sandbox") \
     fonts-liberation \
     libappindicator3-1 \
     libasound2 \
@@ -72,8 +89,10 @@ RUN apt-get update && apt-get install -y \
     xdg-utils \
     dumb-init \
     gosu \
+    patch \
     curl \
     procps \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Puppeteer to skip automatic download during npm install (we download it explicitly below)
@@ -87,8 +106,25 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install production dependencies only
-RUN npm ci --omit=dev && npm cache clean --force
+# Backport upstream whatsapp-web.js#201832 (id._serialized -> id.$1 normalization,
+# broken by WA Web 2.3000.x ~2026-07-14) into the installed dep at build time.
+# The patcher self-disables once whatsapp-web.js ships the fix upstream.
+# scripts/postinstall.js rides along: `npm ci` below runs the hook, which fails
+# when the file is missing. With the patcher present the hook applies it in
+# --best-effort mode; the explicit fatal run right after is the real gate.
+COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch ./scripts/
+
+# Install production dependencies only, then apply the backport patcher (needs `patch`).
+RUN npm ci --omit=dev && node scripts/patch-wwebjs-201832.js && npm cache clean --force
+
+# Replace the npm the base image bundles. npm is not on the request path — the entrypoint runs
+# `node dist/main` — but it stays in the image because the operator runbooks drive it
+# (`docker exec openwa npm run cli …`, `npm run export`), and its own bundled dependency tree is
+# what the release image scan reports. node:22-slim currently ships npm 10.9.8, whose bundle
+# carries a critical node-tar advisory plus sigstore/picomatch ones; npm 12 fixes all three.
+# Deliberately AFTER `npm ci`, so the application tree is still resolved by the npm the lockfile
+# was generated with and only the global CLI is swapped.
+RUN npm install -g npm@12 && npm cache clean --force
 
 # amd64: download Chrome for Testing via Puppeteer and symlink it.
 # arm64: use Debian's chromium installed above (CfT has no linux-arm64 build).
@@ -141,5 +177,11 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 # dumb-init is PID 1 and handles signal forwarding.
 # It execs docker-entrypoint.sh (as root), which fixes volume ownership and
 # then drops to the openwa user via gosu before starting the node process.
+#
+# NOTE — no `USER openwa` directive on purpose (Trivy DS-0002 will flag it, ignore).
+# The Node process does NOT run as root: docker-entrypoint.sh:30 is
+# `exec gosu openwa "$@"` after the chowns on lines 7 and 25. Adding `USER openwa`
+# here would run the entrypoint as openwa and break the chown-before-drop pattern
+# that makes named-volume mounts work on first boot (#254, #259).
 ENTRYPOINT ["dumb-init", "--", "/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "dist/main"]

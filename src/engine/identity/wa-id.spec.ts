@@ -1,4 +1,4 @@
-import { isChannelJid, parseWaId, toNeutralJid, userPart } from './wa-id';
+import { chatKind, isChannelJid, parseWaId, toNeutralJid, userPart } from './wa-id';
 
 describe('wa-id', () => {
   describe('userPart', () => {
@@ -72,6 +72,23 @@ describe('wa-id', () => {
 
     it('passes an unrecognized format through unchanged', () => {
       expect(toNeutralJid('weird-thing')).toBe('weird-thing');
+    });
+  });
+
+  describe('chatKind', () => {
+    it.each([
+      ['628111@c.us', 'individual'],
+      ['628111@s.whatsapp.net', 'individual'],
+      ['628111:12@s.whatsapp.net', 'individual'],
+      ['4707@lid', 'individual'],
+      ['12036@g.us', 'group'],
+      ['abc@newsletter', 'channel'],
+      ['status@broadcast', 'status'],
+      ['12036@broadcast', 'broadcast'],
+      ['not-a-jid', 'unknown'],
+      ['', 'unknown'],
+    ])('classifies %s as %s', (jid, expected) => {
+      expect(chatKind(jid)).toBe(expected);
     });
   });
 });

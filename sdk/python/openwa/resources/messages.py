@@ -14,6 +14,7 @@ from ..types import (
     BulkMessageResponse,
     ChatHistoryMessage,
     DeleteMessageRequest,
+    EditMessageRequest,
     ForwardMessageRequest,
     ListMessagesQuery,
     MessageHistoryQuery,
@@ -25,7 +26,9 @@ from ..types import (
     SendBulkRequest,
     SendContactRequest,
     SendLocationRequest,
+    SendAudioRequest,
     SendMediaRequest,
+    SendPollRequest,
     SendTemplateRequest,
     SendTextRequest,
     SuccessResult,
@@ -51,7 +54,7 @@ class MessagesResource:
     def send_video(self, session_id: str, body: SendMediaRequest) -> MessageResponse:
         return self._send_media(session_id, "send-video", body)
 
-    def send_audio(self, session_id: str, body: SendMediaRequest) -> MessageResponse:
+    def send_audio(self, session_id: str, body: SendAudioRequest) -> MessageResponse:
         return self._send_media(session_id, "send-audio", body)
 
     def send_document(self, session_id: str, body: SendMediaRequest) -> MessageResponse:
@@ -72,6 +75,10 @@ class MessagesResource:
     def send_template(self, session_id: str, body: SendTemplateRequest) -> MessageResponse:
         return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/messages/send-template", body=body)
 
+    def send_poll(self, session_id: str, body: SendPollRequest) -> MessageResponse:
+        """Send a native WhatsApp poll (2–12 options)."""
+        return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/messages/send-poll", body=body)
+
     def reply(self, session_id: str, body: ReplyMessageRequest) -> MessageResponse:
         return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/messages/reply", body=body)
 
@@ -83,6 +90,10 @@ class MessagesResource:
 
     def delete(self, session_id: str, body: DeleteMessageRequest) -> SuccessResult:
         return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/messages/delete", body=body)
+
+    def edit_message(self, session_id: str, body: EditMessageRequest) -> MessageResponse:
+        """Edit the text of a message sent by this account. 404 when the message is not found."""
+        return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/messages/edit", body=body)
 
     def history(
         self, session_id: str, chat_id: str, query: MessageHistoryQuery | None = None

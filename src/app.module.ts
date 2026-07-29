@@ -5,8 +5,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ThrottlerModule } from '@nestjs/throttler';
-import Redis from 'ioredis';
 import { RedisThrottlerStorage } from './common/throttler/redis-throttler.storage';
+import { createThrottlerRedisClient } from './common/throttler/throttler-redis.client';
 import configuration from './config/configuration';
 import { validateEnv } from './config/env.validation';
 import { SessionModule } from './modules/session/session.module';
@@ -23,6 +23,8 @@ import { InfraModule } from './modules/infra/infra.module';
 import { EventsModule } from './modules/events/events.module';
 import { ContactModule } from './modules/contact/contact.module';
 import { GroupModule } from './modules/group/group.module';
+import { ProfileModule } from './modules/profile/profile.module';
+import { CallModule } from './modules/call/call.module';
 import { LabelModule } from './modules/label/label.module';
 import { ChannelModule } from './modules/channel/channel.module';
 import { CacheModule } from './common/cache';
@@ -30,6 +32,7 @@ import { StorageModule } from './common/storage/storage.module';
 import { StatsModule } from './modules/stats/stats.module';
 import { MetricsModule } from './modules/metrics/metrics.module';
 import { StatusModule } from './modules/status/status.module';
+import { StatusStoreModule } from './modules/status-store/status-store.module';
 import { CatalogModule } from './modules/catalog/catalog.module';
 import { HooksModule } from './core/hooks';
 import { PluginsModule } from './core/plugins';
@@ -114,7 +117,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
         const synchronize = configService.get<boolean>('database.synchronize', true);
         return {
           name: 'main',
-          type: 'sqlite' as const,
+          type: 'better-sqlite3' as const,
           database: configService.get<string>('database.database', './data/main.sqlite'),
           entities: [
             __dirname + '/modules/auth/**/*.entity{.ts,.js}',
@@ -145,6 +148,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
             __dirname + '/modules/template/**/*.entity{.ts,.js}',
             __dirname + '/engine/**/*.entity{.ts,.js}',
             __dirname + '/modules/integration/**/*.entity{.ts,.js}',
+            __dirname + '/modules/status-store/**/*.entity{.ts,.js}',
           ],
           migrations: [__dirname + '/database/migrations/*{.ts,.js}'],
           logging: configService.get<boolean>('dataDatabase.logging', false),
@@ -205,7 +209,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
         return {
           ...baseConfig,
           name: 'data',
-          type: 'sqlite' as const,
+          type: 'better-sqlite3' as const,
           database: configService.get<string>('dataDatabase.database', './data/openwa.sqlite'),
           synchronize,
           migrationsRun: !synchronize,
@@ -237,19 +241,12 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
             limit: configService.get<number>('api.rateLimit.longLimit', 1000),
           },
         ];
-        // Fail-open on Redis error (see RedisThrottlerStorage), so a Redis outage never blocks the API.
+        // Fail-open on Redis error (see RedisThrottlerStorage), so a Redis outage never blocks the
+        // API. The client is built fail-fast (see throttler-redis.client.ts) so that fail-open
+        // engages immediately instead of after a queue/timeout stall per request.
         const redisStorage =
           process.env.REDIS_ENABLED === 'true'
-            ? new RedisThrottlerStorage(
-                new Redis({
-                  host: configService.get<string>('redis.host', 'localhost'),
-                  port: configService.get<number>('redis.port', 6379),
-                  username: configService.get<string>('redis.username'),
-                  password: configService.get<string>('redis.password'),
-                  connectTimeout: configService.get<number>('redis.connectTimeoutMs', 5000),
-                  maxRetriesPerRequest: 3,
-                }),
-              )
+            ? new RedisThrottlerStorage(createThrottlerRedisClient(configService))
             : undefined;
         return { throttlers, ...(redisStorage ? { storage: redisStorage } : {}) };
       },
@@ -275,11 +272,14 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
     InfraModule,
     ContactModule,
     GroupModule,
+    ProfileModule, // Own-profile API (name / status / picture)
+    CallModule, // Incoming-call API (reject a ringing call)
     LabelModule, // Phase 3: Labels Management
     ChannelModule, // Phase 3: Channels/Newsletter
     StatsModule, // Phase 3: Statistics Dashboard
     MetricsModule, // Prometheus /api/metrics
     StatusModule, // Phase 3: Status/Stories API
+    StatusStoreModule, // Phase 3: inbound status/story TTL store (24h purge + media persistence)
     CatalogModule, // Phase 3: Catalog API (WhatsApp Business)
     PluginsApiModule, // Phase 5: Plugins API
     AgentToolsModule, // Agent-invocable tool registry (protocol-neutral)

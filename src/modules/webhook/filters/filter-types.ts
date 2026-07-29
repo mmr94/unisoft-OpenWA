@@ -111,7 +111,9 @@ export const FILTER_FIELDS: Record<string, FieldDefinition[]> = {
       field: 'hasMedia',
       kind: 'boolean',
       operators: BOOLEAN_OPERATORS,
-      resolve: data => data.media != null,
+      // Edit events carry an explicit marker rather than a media blob; preserve the blob-based
+      // behaviour for received/sent messages while making the common message filter meaningful.
+      resolve: data => data.hasMedia === true || data.media != null,
     },
     {
       field: 'mentions',

@@ -14,6 +14,30 @@ describe('MessagesResource — exact paths', () => {
     expect(t.lastCall!.body).toEqual({ chatId: 'a@c.us', text: 'hi' });
   });
 
+  it('sendText forwards mentions verbatim', async () => {
+    const t = new MockTransport().on('POST', /send-text$/, { body: { messageId: 'm1', timestamp: 1 } });
+    await client(t).messages.sendText('s1', { chatId: 'g@g.us', text: 'hi @628123', mentions: ['628123@c.us'] });
+    expect(t.lastCall!.body).toEqual({ chatId: 'g@g.us', text: 'hi @628123', mentions: ['628123@c.us'] });
+  });
+
+  it('sendPoll posts to /messages/send-poll', async () => {
+    const t = new MockTransport().on('POST', /send-poll$/, { body: { messageId: 'm2', timestamp: 2 } });
+    const res = await client(t).messages.sendPoll('s1', {
+      chatId: 'a@c.us',
+      name: 'Where?',
+      options: ['Park', 'Beach'],
+      allowMultipleAnswers: true,
+    });
+    expect(t.lastCall!.url).toBe('http://x/api/sessions/s1/messages/send-poll');
+    expect(t.lastCall!.body).toEqual({
+      chatId: 'a@c.us',
+      name: 'Where?',
+      options: ['Park', 'Beach'],
+      allowMultipleAnswers: true,
+    });
+    expect(res.messageId).toBe('m2');
+  });
+
   it('sendImage posts to /messages/send-image', async () => {
     const t = new MockTransport().on('POST', /send-image$/, { body: { messageId: 'm', timestamp: 2 } });
     await client(t).messages.sendImage('s', { chatId: 'a@c.us', url: 'http://img' });
@@ -85,6 +109,15 @@ describe('MessagesResource — exact paths', () => {
     expect(t.lastCall!.url).toContain('/messages/react');
     await c.messages.delete('s', { chatId: 'a@c.us', messageId: 'm' });
     expect(t.lastCall!.url).toContain('/messages/delete');
+  });
+
+  it('editMessage posts to /messages/edit and returns the MessageResponse shape', async () => {
+    const t = new MockTransport().on('POST', /\/messages\/edit$/, { body: { messageId: 'm1', timestamp: 4 } });
+    const res = await client(t).messages.editMessage('s', { chatId: 'a@c.us', messageId: 'm1', body: 'edited' });
+    expect(t.lastCall!.url).toBe('http://x/api/sessions/s/messages/edit');
+    expect(t.lastCall!.body).toEqual({ chatId: 'a@c.us', messageId: 'm1', body: 'edited' });
+    expect(res.messageId).toBe('m1');
+    expect(res.timestamp).toBe(4);
   });
 
   it('history puts chatId in the path', async () => {

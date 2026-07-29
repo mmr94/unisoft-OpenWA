@@ -6,23 +6,47 @@ jest.mock('archiver', () => ({ TarArchive: jest.fn() }));
 process.env.ALLOW_DEV_API_KEY = 'true';
 process.env.BASE_URL = 'https://api.example.com';
 
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from '../src/app.module';
+import { applyGlobalValidation } from '../src/config/app-validation';
 import { PluginLoaderService } from '../src/core/plugins/plugin-loader.service';
+import { AuthService } from '../src/modules/auth/auth.service';
+import { ApiKeyRole } from '../src/modules/auth/entities/api-key.entity';
 
-// A stub ingress-capable plugin so the capability check passes without a real plugin on disk.
+// A stub ingress-capable plugin so the capability check passes without a real plugin on disk. The
+// configSchema carries a NESTED secret field so the masking tests can prove a `secret:true` config
+// value is redacted at depth — including on the one-shot create/regenerate reveal responses.
 const INGRESS_PLUGIN = {
-  manifest: { id: 'chatwoot', ingress: [{ route: 'chatwoot' }], permissions: ['webhook:ingress', 'conversation:send'] },
+  manifest: {
+    id: 'chatwoot',
+    ingress: [{ route: 'chatwoot' }],
+    permissions: ['webhook:ingress', 'conversation:send'],
+    configSchema: {
+      type: 'object',
+      properties: {
+        baseUrl: { type: 'string' },
+        credentials: {
+          type: 'object',
+          properties: {
+            apiToken: { type: 'string', secret: true },
+            region: { type: 'string' },
+          },
+        },
+      },
+    },
+  },
 };
 const NON_INGRESS_PLUGIN = { manifest: { id: 'plain', permissions: [] } };
 
 interface InstanceViewBody {
   secret: string;
+  verifyToken: string | null;
   enabled: boolean;
   sessionScope: string | null;
+  config: { baseUrl?: string; credentials?: { apiToken?: string; region?: string } } | null;
   ingressUrls: Array<{ route: string; url: string }>;
 }
 
@@ -49,8 +73,7 @@ describe('IntegrationInstanceController (e2e)', () => {
       })
       .compile();
     app = moduleRef.createNestApplication();
-    app.setGlobalPrefix('api');
-    app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
+    applyGlobalValidation(app);
     await app.init();
   });
 
@@ -131,6 +154,52 @@ describe('IntegrationInstanceController (e2e)', () => {
     expect((one.body as InstanceViewBody).secret).toBe('***');
   });
 
+  it('reveals ONLY the ingress secret + verifyToken on create — nested secret config stays masked', async () => {
+    const create = await request(app.getHttpServer())
+      .post(`${base}/chatwoot/instances`)
+      .set('X-API-Key', key)
+      .send({
+        instanceId: 'nested1',
+        verifyToken: 'vt-plain-123',
+        config: {
+          baseUrl: 'https://chatwoot.example',
+          credentials: { apiToken: 'tok-e2e-live', region: 'us' },
+        },
+      })
+      .expect(201);
+    const body = create.body as InstanceViewBody;
+    // The two documented "revealed once" fields are plaintext...
+    expect(body.secret).toMatch(/^[0-9a-f]{64}$/);
+    expect(body.verifyToken).toBe('vt-plain-123');
+    // ...while a secret-flagged config field is masked even on this reveal response, at any depth.
+    expect(body.config?.baseUrl).toBe('https://chatwoot.example');
+    expect(body.config?.credentials?.apiToken).toBe('***');
+    expect(body.config?.credentials?.region).toBe('us');
+    expect(JSON.stringify(body)).not.toContain('tok-e2e-live');
+
+    const one = await request(app.getHttpServer())
+      .get(`${base}/chatwoot/instances/nested1`)
+      .set('X-API-Key', key)
+      .expect(200);
+    const read = one.body as InstanceViewBody;
+    expect(read.secret).toBe('***');
+    expect(read.verifyToken).toBe('***');
+    expect(read.config?.credentials?.apiToken).toBe('***');
+    expect(read.config?.baseUrl).toBe('https://chatwoot.example');
+  });
+
+  it('keeps nested secret config masked on the regenerate-secret reveal', async () => {
+    const regen = await request(app.getHttpServer())
+      .post(`${base}/chatwoot/instances/nested1/regenerate-secret`)
+      .set('X-API-Key', key)
+      .expect(200);
+    const body = regen.body as InstanceViewBody;
+    expect(body.secret).toMatch(/^[0-9a-f]{64}$/);
+    expect(body.verifyToken).toBe('vt-plain-123');
+    expect(body.config?.credentials?.apiToken).toBe('***');
+    expect(JSON.stringify(body)).not.toContain('tok-e2e-live');
+  });
+
   it('patches enabled + sessionScope and returns a masked view', async () => {
     const patched = await request(app.getHttpServer())
       .patch(`${base}/chatwoot/instances/acct1`)
@@ -162,5 +231,113 @@ describe('IntegrationInstanceController (e2e)', () => {
   it('deletes the instance (204) and audits it', async () => {
     await request(app.getHttpServer()).delete(`${base}/chatwoot/instances/acct1`).set('X-API-Key', key).expect(204);
     await request(app.getHttpServer()).get(`${base}/chatwoot/instances/acct1`).set('X-API-Key', key).expect(404);
+  });
+
+  /**
+   * sessionScope travels in the request body / persisted row, which the ApiKeyGuard's route-param
+   * fence never sees — so the controllers themselves confine a session-scoped ADMIN key to
+   * instances bound inside its allowedSessions. Out-of-scope instances must look exactly like
+   * missing ones (404), and an all-sessions (omitted) scope must be uncreatable/unreachable.
+   */
+  describe('session-scoped API key fence', () => {
+    let scopedKey: string; // ADMIN, allowedSessions: ['sess-1']
+
+    beforeAll(async () => {
+      const authService = app.get(AuthService);
+      scopedKey = (
+        await authService.createApiKey({ name: 'e2e-scoped-int', role: ApiKeyRole.ADMIN, allowedSessions: ['sess-1'] })
+      ).rawKey;
+      // Fixtures created with the unrestricted key: one instance inside the fence, one outside, one global.
+      const mk = (instanceId: string, body: Record<string, unknown>) =>
+        request(app.getHttpServer())
+          .post(`${base}/chatwoot/instances`)
+          .set('X-API-Key', key)
+          .send({ instanceId, ...body });
+      await mk('own1', { sessionScope: 'sess-1' }).expect(201);
+      await mk('other1', { sessionScope: 'sess-2' }).expect(201);
+      await mk('global1', {}).expect(201);
+    });
+
+    it('allows creating an instance bound to its own session', async () => {
+      await request(app.getHttpServer())
+        .post(`${base}/chatwoot/instances`)
+        .set('X-API-Key', scopedKey)
+        .send({ instanceId: 'own2', sessionScope: 'sess-1' })
+        .expect(201);
+    });
+
+    it('rejects create with a sessionScope outside the fence — or omitted (all sessions)', async () => {
+      await request(app.getHttpServer())
+        .post(`${base}/chatwoot/instances`)
+        .set('X-API-Key', scopedKey)
+        .send({ instanceId: 'x1', sessionScope: 'sess-2' })
+        .expect(403);
+      await request(app.getHttpServer())
+        .post(`${base}/chatwoot/instances`)
+        .set('X-API-Key', scopedKey)
+        .send({ instanceId: 'x2' })
+        .expect(403);
+    });
+
+    it('lists only instances bound inside the fence', async () => {
+      const res = await request(app.getHttpServer())
+        .get(`${base}/chatwoot/instances`)
+        .set('X-API-Key', scopedKey)
+        .expect(200);
+      const ids = (res.body as Array<{ instanceId: string }>).map(i => i.instanceId);
+      expect(ids).toContain('own1');
+      expect(ids).toContain('own2');
+      expect(ids).not.toContain('other1');
+      expect(ids).not.toContain('global1');
+    });
+
+    it('answers 404 on getOne/regenerate/delete for instances outside the fence', async () => {
+      await request(app.getHttpServer())
+        .get(`${base}/chatwoot/instances/other1`)
+        .set('X-API-Key', scopedKey)
+        .expect(404);
+      await request(app.getHttpServer())
+        .get(`${base}/chatwoot/instances/global1`)
+        .set('X-API-Key', scopedKey)
+        .expect(404);
+      await request(app.getHttpServer())
+        .post(`${base}/chatwoot/instances/other1/regenerate-secret`)
+        .set('X-API-Key', scopedKey)
+        .expect(404);
+      await request(app.getHttpServer())
+        .delete(`${base}/chatwoot/instances/other1`)
+        .set('X-API-Key', scopedKey)
+        .expect(404);
+    });
+
+    it('answers 404 when patching an out-of-scope instance, 403 when moving an in-scope one out', async () => {
+      await request(app.getHttpServer())
+        .patch(`${base}/chatwoot/instances/other1`)
+        .set('X-API-Key', scopedKey)
+        .send({ enabled: false })
+        .expect(404);
+      await request(app.getHttpServer())
+        .patch(`${base}/chatwoot/instances/own1`)
+        .set('X-API-Key', scopedKey)
+        .send({ sessionScope: 'sess-2' })
+        .expect(403);
+      // …while an in-scope patch that leaves sessionScope alone still works.
+      await request(app.getHttpServer())
+        .patch(`${base}/chatwoot/instances/own1`)
+        .set('X-API-Key', scopedKey)
+        .send({ enabled: false })
+        .expect(200);
+    });
+
+    it('answers 404 when redriving an out-of-scope instance, but redrives its own', async () => {
+      await request(app.getHttpServer())
+        .post('/api/integration/instances/chatwoot/other1/redrive')
+        .set('X-API-Key', scopedKey)
+        .expect(404);
+      await request(app.getHttpServer())
+        .post('/api/integration/instances/chatwoot/own1/redrive')
+        .set('X-API-Key', scopedKey)
+        .expect(201);
+    });
   });
 });

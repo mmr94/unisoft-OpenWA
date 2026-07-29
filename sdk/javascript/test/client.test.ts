@@ -102,7 +102,23 @@ describe('OpenWAClient', () => {
 
   it('exposes all expected resource properties', () => {
     const c = client(new MockTransport());
-    for (const r of ['sessions', 'messages', 'contacts', 'groups', 'webhooks', 'chats', 'status', 'health']) {
+    for (const r of [
+      'sessions',
+      'messages',
+      'contacts',
+      'groups',
+      'webhooks',
+      'chats',
+      'status',
+      'health',
+      'labels',
+      'channels',
+      'catalog',
+      'templates',
+      'search',
+      'profile',
+      'calls',
+    ]) {
       expect(c).toHaveProperty(r);
     }
   });
@@ -156,6 +172,25 @@ describe('OpenWAClient', () => {
       throw e;
     };
     const c = new OpenWAClient({ baseUrl: 'http://x', apiKey: 'k', fetch: abortingFetch });
+    await expect(c.sessions.list()).rejects.toBeInstanceOf(OpenWATimeoutError);
+  });
+
+  it('keeps the timeout armed while reading a stalled response body', async () => {
+    const stalledBodyFetch: FetchLike = async (_url, init) => {
+      const signal = init?.signal;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          signal?.addEventListener('abort', () => {
+            const error = new Error('body aborted');
+            error.name = 'AbortError';
+            controller.error(error);
+          });
+        },
+      });
+      return new Response(body, { status: 200 });
+    };
+    const c = new OpenWAClient({ baseUrl: 'http://x', apiKey: 'k', timeoutMs: 5, fetch: stalledBodyFetch });
+
     await expect(c.sessions.list()).rejects.toBeInstanceOf(OpenWATimeoutError);
   });
 

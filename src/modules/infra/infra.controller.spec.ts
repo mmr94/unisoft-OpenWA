@@ -23,11 +23,16 @@ jest.mock('fs', () => {
     chmodSync: jest.fn(),
     existsSync: jest.fn().mockReturnValue(false),
     readFileSync: jest.fn().mockReturnValue(''),
+    createReadStream: jest.fn(() => jest.requireActual<typeof import('stream')>('stream').Readable.from([])),
   };
 });
 
 import { DataSource, QueryFailedError } from 'typeorm';
+import { ConflictException } from '@nestjs/common';
+import { plainToInstance } from 'class-transformer';
+import { validate } from 'class-validator';
 import { InfraController } from './infra.controller';
+import { SaveConfigDto } from './dto/save-config.dto';
 import { REQUIRED_ROLE_KEY } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
 import { Session, SessionStatus } from '../session/entities/session.entity';
@@ -42,6 +47,9 @@ import { ConversationMapping } from '../integration/entities/conversation-mappin
 import { IngressEvent } from '../integration/entities/ingress-event.entity';
 import { WebhookDeliveryFailure } from '../webhook/entities/webhook-delivery-failure.entity';
 import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
+import { StatusUpdate } from '../status-store/entities/status-update.entity';
+import { AuditAction } from '../audit/entities/audit-log.entity';
+import { recordOsEnvKeys } from '../../config/env-precedence';
 
 describe('InfraController access control (Vuln 2)', () => {
   const reflector = new Reflector();
@@ -65,6 +73,10 @@ describe('InfraController access control (Vuln 2)', () => {
   ] as const;
 
   it.each(adminOnly)('%s requires the ADMIN role', method => {
+    // The handler is only ever a lookup key for reflector metadata — it is never invoked, so there is
+    // no `this` to lose. unbound-method (tightened in typescript-eslint 8.65) cannot tell the two
+    // apart, and the cast below does not satisfy it either.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
     const handler = InfraController.prototype[method as keyof InfraController] as unknown as (
       ...args: unknown[]
     ) => unknown;
@@ -95,6 +107,25 @@ describe('InfraController.importStorage filePath validation (Vuln 3)', () => {
       BadRequestException,
     );
     expect(storage.importFromStream).not.toHaveBeenCalled();
+  });
+
+  it('guards and opens the same cwd-resolved path returned by storage export', async () => {
+    const cwdSpy = jest.spyOn(process, 'cwd').mockReturnValue('/srv/openwa');
+    (fs.existsSync as jest.Mock).mockImplementation((p: string) => p === '/srv/openwa/data/exports/export.tar.gz');
+    (fs.createReadStream as jest.Mock).mockClear();
+    const storage = {
+      importFromStream: jest.fn().mockResolvedValue(3),
+      getCurrentStorageType: jest.fn(() => 'local'),
+    };
+    try {
+      const result = await buildController(storage).importStorage({ filePath: 'data/exports/export.tar.gz' });
+      expect(fs.createReadStream).toHaveBeenCalledWith('/srv/openwa/data/exports/export.tar.gz');
+      expect(storage.importFromStream).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({ imported: true, count: 3, storageType: 'local' });
+    } finally {
+      cwdSpy.mockRestore();
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
+    }
   });
 });
 
@@ -193,18 +224,20 @@ describe('InfraController.saveConfig SSL reject-unauthorized', () => {
   }
 
   it('writes DATABASE_SSL_REJECT_UNAUTHORIZED=false for self-signed managed Postgres', () => {
-    const env = writtenEnv({ database: { type: 'postgres', sslEnabled: true, sslRejectUnauthorized: false } });
+    const env = writtenEnv({
+      database: { type: 'postgres', sslEnabled: true, sslRejectUnauthorized: false, password: 'unit-test-pw' },
+    });
     expect(env).toContain('DATABASE_SSL=true');
     expect(env).toContain('DATABASE_SSL_REJECT_UNAUTHORIZED=false');
   });
 
   it('defaults DATABASE_SSL_REJECT_UNAUTHORIZED=true when SSL is enabled without an explicit flag', () => {
-    const env = writtenEnv({ database: { type: 'postgres', sslEnabled: true } });
+    const env = writtenEnv({ database: { type: 'postgres', sslEnabled: true, password: 'unit-test-pw' } });
     expect(env).toContain('DATABASE_SSL_REJECT_UNAUTHORIZED=true');
   });
 
   it('omits DATABASE_SSL_REJECT_UNAUTHORIZED when SSL is disabled', () => {
-    const env = writtenEnv({ database: { type: 'postgres', sslEnabled: false } });
+    const env = writtenEnv({ database: { type: 'postgres', sslEnabled: false, password: 'unit-test-pw' } });
     expect(env).not.toContain('DATABASE_SSL_REJECT_UNAUTHORIZED');
   });
 });
@@ -234,13 +267,22 @@ describe('InfraController PostgreSQL schema (POSTGRES_SCHEMA)', () => {
   }
 
   it('writes POSTGRES_SCHEMA for external Postgres', () => {
-    const env = written({ database: { type: 'postgres', builtIn: false, host: 'db', schema: 'openwa' } });
+    const env = written({
+      database: { type: 'postgres', builtIn: false, host: 'db', schema: 'openwa', password: 'unit-test-pw' },
+    });
     expect(env).toContain('POSTGRES_SCHEMA=openwa');
   });
 
-  it('defaults POSTGRES_SCHEMA to public for external Postgres when no schema is provided', () => {
-    const env = written({ database: { type: 'postgres', builtIn: false, host: 'db' } });
-    expect(env).toContain('POSTGRES_SCHEMA=public');
+  it('leaves POSTGRES_SCHEMA untouched when the payload omits it (the runtime default is public)', () => {
+    // Per-key merge: an absent field must not reset the stored value. With nothing stored, the
+    // key stays out of the file and configuration.ts's own 'public' default applies at boot.
+    const fresh = written({ database: { type: 'postgres', builtIn: false, host: 'db', password: 'unit-test-pw' } });
+    expect(fresh).not.toContain('POSTGRES_SCHEMA=');
+    const preserved = written(
+      { database: { type: 'postgres', builtIn: false, host: 'db', password: 'unit-test-pw' } },
+      'DATABASE_TYPE=postgres\nPOSTGRES_SCHEMA=openwa\n',
+    );
+    expect(preserved).toContain('POSTGRES_SCHEMA=openwa');
   });
 
   it('pins POSTGRES_SCHEMA=public for the built-in Postgres container', () => {
@@ -467,6 +509,751 @@ describe('InfraController.saveConfig engine selection (persist ENGINE_TYPE — I
   });
 });
 
+describe('InfraController.saveConfig byte-identical regression (full dashboard payload)', () => {
+  // Pins the legitimate behavior: a FULL dashboard save (every section, every field — the exact
+  // shape Infrastructure.tsx posts) must produce exactly the same .env.generated bytes as before
+  // the per-key merge change. The literal key maps below were derived from the previous
+  // implementation's output; any drift in written keys or values fails this gate.
+  const engineFactory = {
+    getAvailableEngines: () => [{ id: 'whatsapp-web.js' }, { id: 'baileys' }],
+  };
+  const newController = () =>
+    new InfraController(
+      {} as never,
+      {} as never,
+      {} as never,
+      engineFactory as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+  const NOW = '2026-01-02T03:04:05.000Z';
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date(NOW));
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
+  });
+
+  function expectedEnv(keys: Record<string, string>): string {
+    const body = Object.keys(keys)
+      .sort()
+      .map(k => `${k}=${keys[k]}`);
+    return [
+      '# OpenWA Configuration',
+      `# Generated at ${NOW}`,
+      '# Managed via Dashboard > Infrastructure. Values in process env or project .env take precedence.',
+      '',
+      ...body,
+      '',
+    ].join('\n');
+  }
+
+  function saveAndGetContent(config: unknown, existing: string): string {
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    (fs.readFileSync as jest.Mock).mockReturnValue(existing);
+    (fs.writeFileSync as jest.Mock).mockClear();
+    const result = newController().saveConfig(config as never);
+    expect(result.saved).toBe(true);
+    return ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
+  }
+
+  it('all-built-in full save is byte-identical', () => {
+    const existing = [
+      'DATABASE_TYPE=postgres',
+      'POSTGRES_BUILTIN=true',
+      'DATABASE_HOST=postgres',
+      'DATABASE_PORT=5432',
+      'DATABASE_USERNAME=openwa',
+      'DATABASE_PASSWORD=openwa',
+      'DATABASE_NAME=openwa',
+      'POSTGRES_SCHEMA=public',
+      'DATABASE_POOL_SIZE=10',
+      'DATABASE_SSL=false',
+      'REDIS_ENABLED=true',
+      'REDIS_BUILTIN=true',
+      'REDIS_HOST=redis',
+      'REDIS_PORT=6379',
+      'QUEUE_ENABLED=true',
+      'STORAGE_TYPE=s3',
+      'MINIO_BUILTIN=true',
+      'S3_ENDPOINT=http://minio:9000',
+      'S3_ACCESS_KEY_ID=minioadmin',
+      'S3_SECRET_ACCESS_KEY=minioadmin',
+      'S3_BUCKET=openwa',
+      'S3_REGION=us-east-1',
+      'ENGINE_TYPE=whatsapp-web.js',
+      'PUPPETEER_HEADLESS=true',
+      'SESSION_DATA_PATH=./data/sessions',
+      'PUPPETEER_ARGS=--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu',
+      'WEBHOOK_TIMEOUT=5000',
+      '',
+    ].join('\n');
+    // The exact payload the dashboard posts for that saved state (secrets come back empty:
+    // "unchanged"). The built-in credentials are exempt from the production secret guard.
+    const payload = {
+      database: {
+        type: 'postgres',
+        builtIn: true,
+        host: 'postgres',
+        port: '5432',
+        username: 'openwa',
+        password: '',
+        database: 'openwa',
+        schema: 'public',
+        poolSize: 10,
+        sslEnabled: false,
+        sslRejectUnauthorized: true,
+      },
+      redis: { enabled: true, builtIn: true, host: 'redis', port: '6379', password: '' },
+      queue: { enabled: true },
+      storage: {
+        type: 's3',
+        builtIn: true,
+        localPath: '',
+        s3Bucket: 'openwa',
+        s3Region: 'us-east-1',
+        s3AccessKey: '',
+        s3SecretKey: '',
+        s3Endpoint: 'http://minio:9000',
+      },
+      engine: {
+        type: 'whatsapp-web.js',
+        headless: true,
+        sessionDataPath: './data/sessions',
+        browserArgs: '--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu',
+      },
+    };
+
+    const content = saveAndGetContent(payload, existing);
+
+    expect(content).toBe(
+      expectedEnv({
+        DATABASE_HOST: 'postgres',
+        DATABASE_NAME: 'openwa',
+        DATABASE_PASSWORD: 'openwa',
+        DATABASE_POOL_SIZE: '10',
+        DATABASE_PORT: '5432',
+        DATABASE_SSL: 'false',
+        DATABASE_TYPE: 'postgres',
+        DATABASE_USERNAME: 'openwa',
+        ENGINE_TYPE: 'whatsapp-web.js',
+        MINIO_BUILTIN: 'true',
+        POSTGRES_BUILTIN: 'true',
+        POSTGRES_SCHEMA: 'public',
+        PUPPETEER_ARGS: '--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu',
+        PUPPETEER_HEADLESS: 'true',
+        QUEUE_ENABLED: 'true',
+        REDIS_BUILTIN: 'true',
+        REDIS_ENABLED: 'true',
+        REDIS_HOST: 'redis',
+        REDIS_PORT: '6379',
+        S3_ACCESS_KEY_ID: 'minioadmin',
+        S3_BUCKET: 'openwa',
+        S3_ENDPOINT: 'http://minio:9000',
+        S3_REGION: 'us-east-1',
+        S3_SECRET_ACCESS_KEY: 'minioadmin',
+        SESSION_DATA_PATH: './data/sessions',
+        STORAGE_TYPE: 's3',
+        WEBHOOK_TIMEOUT: '5000',
+      }),
+    );
+  });
+
+  it('all-external full save is byte-identical (secrets preserved on empty submission)', () => {
+    const existing = [
+      'DATABASE_TYPE=postgres',
+      'POSTGRES_BUILTIN=false',
+      'DATABASE_HOST=db.example.com',
+      'DATABASE_PORT=5433',
+      'DATABASE_USERNAME=openwauser',
+      'DATABASE_PASSWORD=Str0ng!Passw0rd',
+      'DATABASE_NAME=openwa',
+      'POSTGRES_SCHEMA=openwa',
+      'DATABASE_POOL_SIZE=20',
+      'DATABASE_SSL=true',
+      'DATABASE_SSL_REJECT_UNAUTHORIZED=false',
+      'REDIS_ENABLED=true',
+      'REDIS_BUILTIN=false',
+      'REDIS_HOST=redis.example.com',
+      'REDIS_PORT=6380',
+      'REDIS_PASSWORD=r3dis-secret',
+      'QUEUE_ENABLED=false',
+      'STORAGE_TYPE=s3',
+      'MINIO_BUILTIN=false',
+      'S3_ENDPOINT=https://s3.eu-west-1.amazonaws.com',
+      'S3_ACCESS_KEY_ID=AKIAEXAMPLE123',
+      'S3_SECRET_ACCESS_KEY=s3-super-secret',
+      'S3_BUCKET=mybucket',
+      'S3_REGION=eu-west-1',
+      'ENGINE_TYPE=baileys',
+      'PUPPETEER_HEADLESS=false',
+      'SESSION_DATA_PATH=/var/lib/openwa/sessions',
+      'PUPPETEER_ARGS=--no-sandbox',
+      '',
+    ].join('\n');
+    const payload = {
+      database: {
+        type: 'postgres',
+        builtIn: false,
+        host: 'db.example.com',
+        port: '5433',
+        username: 'openwauser',
+        password: '',
+        database: 'openwa',
+        schema: 'openwa',
+        poolSize: 20,
+        sslEnabled: true,
+        sslRejectUnauthorized: false,
+      },
+      redis: { enabled: true, builtIn: false, host: 'redis.example.com', port: '6380', password: '' },
+      queue: { enabled: false },
+      storage: {
+        type: 's3',
+        builtIn: false,
+        localPath: '',
+        s3Bucket: 'mybucket',
+        s3Region: 'eu-west-1',
+        s3AccessKey: '',
+        s3SecretKey: '',
+        s3Endpoint: 'https://s3.eu-west-1.amazonaws.com',
+      },
+      engine: {
+        type: 'baileys',
+        headless: false,
+        sessionDataPath: '/var/lib/openwa/sessions',
+        browserArgs: '--no-sandbox',
+      },
+    };
+
+    const content = saveAndGetContent(payload, existing);
+
+    expect(content).toBe(
+      expectedEnv({
+        DATABASE_HOST: 'db.example.com',
+        DATABASE_NAME: 'openwa',
+        DATABASE_PASSWORD: 'Str0ng!Passw0rd',
+        DATABASE_POOL_SIZE: '20',
+        DATABASE_PORT: '5433',
+        DATABASE_SSL: 'true',
+        DATABASE_SSL_REJECT_UNAUTHORIZED: 'false',
+        DATABASE_TYPE: 'postgres',
+        DATABASE_USERNAME: 'openwauser',
+        ENGINE_TYPE: 'baileys',
+        MINIO_BUILTIN: 'false',
+        POSTGRES_BUILTIN: 'false',
+        POSTGRES_SCHEMA: 'openwa',
+        PUPPETEER_ARGS: '--no-sandbox',
+        PUPPETEER_HEADLESS: 'false',
+        QUEUE_ENABLED: 'false',
+        REDIS_BUILTIN: 'false',
+        REDIS_ENABLED: 'true',
+        REDIS_HOST: 'redis.example.com',
+        REDIS_PASSWORD: 'r3dis-secret',
+        REDIS_PORT: '6380',
+        S3_ACCESS_KEY_ID: 'AKIAEXAMPLE123',
+        S3_BUCKET: 'mybucket',
+        S3_ENDPOINT: 'https://s3.eu-west-1.amazonaws.com',
+        S3_REGION: 'eu-west-1',
+        S3_SECRET_ACCESS_KEY: 's3-super-secret',
+        SESSION_DATA_PATH: '/var/lib/openwa/sessions',
+        STORAGE_TYPE: 's3',
+      }),
+    );
+  });
+});
+
+describe('InfraController.saveConfig per-key merge (partial payloads)', () => {
+  const newController = () =>
+    new InfraController(
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+  function written(config: unknown, existing?: string): string {
+    (fs.existsSync as jest.Mock).mockReturnValue(existing !== undefined);
+    (fs.readFileSync as jest.Mock).mockReturnValue(existing ?? '');
+    (fs.writeFileSync as jest.Mock).mockClear();
+    newController().saveConfig(config as never);
+    const content = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
+    return content;
+  }
+
+  it('a queue-only save does not touch the redis section', () => {
+    const env = written(
+      { queue: { enabled: true } },
+      'REDIS_ENABLED=true\nREDIS_BUILTIN=true\nREDIS_HOST=redis\nREDIS_PORT=6379\nQUEUE_ENABLED=false\n',
+    );
+    expect(env).toContain('QUEUE_ENABLED=true');
+    expect(env).toContain('REDIS_ENABLED=true');
+    expect(env).toContain('REDIS_BUILTIN=true');
+    expect(env).toContain('REDIS_HOST=redis');
+    expect(env).toContain('REDIS_PORT=6379');
+  });
+
+  it('a redis-only save does not touch the queue section or force the redis flags', () => {
+    const env = written(
+      { redis: { host: 'redis2.example.com' } },
+      'REDIS_ENABLED=true\nREDIS_BUILTIN=false\nREDIS_HOST=redis1.example.com\nQUEUE_ENABLED=true\n',
+    );
+    expect(env).toContain('REDIS_HOST=redis2.example.com');
+    expect(env).toContain('REDIS_ENABLED=true');
+    expect(env).toContain('REDIS_BUILTIN=false');
+    expect(env).toContain('QUEUE_ENABLED=true');
+  });
+
+  it('a partial database save keeps unmentioned keys (pool size, schema, stored password)', () => {
+    const existing =
+      'DATABASE_TYPE=postgres\nPOSTGRES_BUILTIN=false\nDATABASE_HOST=old.example.com\nDATABASE_PASSWORD=keepme\nDATABASE_POOL_SIZE=25\nPOSTGRES_SCHEMA=openwa\n';
+    const env = written({ database: { type: 'postgres', host: 'new.example.com' } }, existing);
+    expect(env).toContain('DATABASE_HOST=new.example.com');
+    expect(env).toContain('DATABASE_POOL_SIZE=25');
+    expect(env).toContain('POSTGRES_SCHEMA=openwa');
+    expect(env).toContain('DATABASE_PASSWORD=keepme');
+  });
+
+  it('a partial storage save keeps the stored S3 region instead of resetting it to the default', () => {
+    const existing =
+      'STORAGE_TYPE=s3\nMINIO_BUILTIN=false\nS3_BUCKET=old-bucket\nS3_REGION=eu-west-1\nS3_ACCESS_KEY_ID=ak-strong\nS3_SECRET_ACCESS_KEY=sk-strong\n';
+    const env = written({ storage: { type: 's3', s3Bucket: 'new-bucket' } }, existing);
+    expect(env).toContain('S3_BUCKET=new-bucket');
+    expect(env).toContain('S3_REGION=eu-west-1');
+    expect(env).toContain('S3_ACCESS_KEY_ID=ak-strong');
+  });
+
+  it('a partial engine save keeps the stored session path and browser args', () => {
+    const env = written(
+      { engine: { headless: false } },
+      'SESSION_DATA_PATH=./old-path\nPUPPETEER_ARGS=--custom-flag\n',
+    );
+    expect(env).toContain('PUPPETEER_HEADLESS=false');
+    expect(env).toContain('SESSION_DATA_PATH=./old-path');
+    expect(env).toContain('PUPPETEER_ARGS=--custom-flag');
+  });
+});
+
+describe('InfraController.saveConfig built-in/external mode flips and the save-time secret guard', () => {
+  const newController = () =>
+    new InfraController(
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+  function written(config: unknown, existing?: string): string {
+    (fs.existsSync as jest.Mock).mockReturnValue(existing !== undefined);
+    (fs.readFileSync as jest.Mock).mockReturnValue(existing ?? '');
+    (fs.writeFileSync as jest.Mock).mockClear();
+    newController().saveConfig(config as never);
+    const content = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
+    return content;
+  }
+
+  function expectRejected(config: unknown, existing: string | undefined, match: RegExp): void {
+    (fs.existsSync as jest.Mock).mockReturnValue(existing !== undefined);
+    (fs.readFileSync as jest.Mock).mockReturnValue(existing ?? '');
+    (fs.writeFileSync as jest.Mock).mockClear();
+    expect(() => newController().saveConfig(config as never)).toThrow(match);
+    // A rejected save must leave the previous file untouched.
+    expect(fs.writeFileSync as jest.Mock).not.toHaveBeenCalled();
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
+  }
+
+  const BUILTIN_POSTGRES_ENV =
+    'DATABASE_TYPE=postgres\nPOSTGRES_BUILTIN=true\nDATABASE_HOST=postgres\nDATABASE_PORT=5432\nDATABASE_USERNAME=openwa\nDATABASE_PASSWORD=openwa\nDATABASE_NAME=openwa\nPOSTGRES_SCHEMA=public\n';
+  const BUILTIN_MINIO_ENV =
+    'STORAGE_TYPE=s3\nMINIO_BUILTIN=true\nS3_ENDPOINT=http://minio:9000\nS3_ACCESS_KEY_ID=minioadmin\nS3_SECRET_ACCESS_KEY=minioadmin\nS3_BUCKET=openwa\nS3_REGION=us-east-1\n';
+
+  it('flipping Postgres built-in -> external with a fresh password drops the bundled password', () => {
+    const env = written(
+      {
+        database: {
+          type: 'postgres',
+          builtIn: false,
+          host: 'db.example.com',
+          username: 'app',
+          password: 'Sup3rSecret!',
+          database: 'appdb',
+        },
+      },
+      BUILTIN_POSTGRES_ENV,
+    );
+    expect(env).toContain('POSTGRES_BUILTIN=false');
+    expect(env).toContain('DATABASE_HOST=db.example.com');
+    expect(env).toContain('DATABASE_PASSWORD=Sup3rSecret!');
+    // No trace of the bundled 'openwa' credential may survive the flip.
+    expect(env).not.toContain('openwa');
+  });
+
+  it('rejects flipping Postgres built-in -> external without a fresh password instead of crash-looping', () => {
+    // Without the mode-flip drop + save-time guard this saved the bundled 'openwa' password into
+    // the external config; the production boot guard then refused to start and the dashboard died
+    // with it. The save itself must now fail with a 400 naming the variable.
+    expectRejected(
+      { database: { type: 'postgres', builtIn: false, host: 'db.example.com', username: 'app', database: 'appdb' } },
+      BUILTIN_POSTGRES_ENV,
+      /DATABASE_PASSWORD/,
+    );
+  });
+
+  it('rejects a blank-password external Postgres on a fresh setup (the sibling blank-password case)', () => {
+    expectRejected(
+      { database: { type: 'postgres', builtIn: false, host: 'db.example.com', password: '' } },
+      undefined,
+      /DATABASE_PASSWORD/,
+    );
+  });
+
+  it('rejects an external Postgres using a known-default password', () => {
+    expectRejected(
+      { database: { type: 'postgres', builtIn: false, host: 'db.example.com', password: 'password' } },
+      undefined,
+      /DATABASE_PASSWORD/,
+    );
+  });
+
+  it('the rejection is a 400 BadRequestException, not a masked {saved:false} 200', () => {
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.writeFileSync as jest.Mock).mockClear();
+    expect(() =>
+      newController().saveConfig({ database: { type: 'postgres', builtIn: false, host: 'db' } } as never),
+    ).toThrow(BadRequestException);
+  });
+
+  it('flipping storage built-in -> external with fresh credentials drops the bundled ones', () => {
+    const env = written(
+      {
+        storage: {
+          type: 's3',
+          builtIn: false,
+          s3Bucket: 'prod-bucket',
+          s3Region: 'ap-southeast-1',
+          s3AccessKey: 'AKIANEWEXAMPLE',
+          s3SecretKey: 'brand-new-secret',
+          s3Endpoint: 'https://s3.ap-southeast-1.amazonaws.com',
+        },
+      },
+      BUILTIN_MINIO_ENV,
+    );
+    expect(env).toContain('MINIO_BUILTIN=false');
+    expect(env).toContain('S3_ACCESS_KEY_ID=AKIANEWEXAMPLE');
+    expect(env).toContain('S3_SECRET_ACCESS_KEY=brand-new-secret');
+    expect(env).toContain('S3_ENDPOINT=https://s3.ap-southeast-1.amazonaws.com');
+    expect(env).not.toContain('minioadmin');
+    expect(env).not.toContain('http://minio:9000');
+  });
+
+  it('flipping storage built-in -> external (AWS) with a blank endpoint drops the stale MinIO endpoint', () => {
+    const env = written(
+      {
+        storage: {
+          type: 's3',
+          builtIn: false,
+          s3Bucket: 'prod-bucket',
+          s3AccessKey: 'AKIANEWEXAMPLE',
+          s3SecretKey: 'brand-new-secret',
+          s3Endpoint: '',
+        },
+      },
+      BUILTIN_MINIO_ENV,
+    );
+    expect(env).not.toContain('S3_ENDPOINT=');
+    expect(env).toContain('S3_ACCESS_KEY_ID=AKIANEWEXAMPLE');
+  });
+
+  it('rejects flipping storage built-in -> external without fresh credentials', () => {
+    expectRejected(
+      {
+        storage: {
+          type: 's3',
+          builtIn: false,
+          s3Bucket: 'prod-bucket',
+          s3AccessKey: '',
+          s3SecretKey: '',
+          s3Endpoint: '',
+        },
+      },
+      BUILTIN_MINIO_ENV,
+      /S3_ACCESS_KEY, S3_SECRET_KEY/,
+    );
+  });
+
+  it('rejects external S3 using the known-default minioadmin credentials', () => {
+    expectRejected(
+      {
+        storage: {
+          type: 's3',
+          builtIn: false,
+          s3Bucket: 'b',
+          s3AccessKey: 'minioadmin',
+          s3SecretKey: 'minioadmin',
+          s3Endpoint: 'https://minio.example.com',
+        },
+      },
+      undefined,
+      /S3_ACCESS_KEY, S3_SECRET_KEY/,
+    );
+  });
+
+  it('flipping Redis external -> built-in drops the stale external password', () => {
+    const env = written(
+      { redis: { enabled: true, builtIn: true } },
+      'REDIS_ENABLED=true\nREDIS_BUILTIN=false\nREDIS_HOST=redis.example.com\nREDIS_PORT=6379\nREDIS_PASSWORD=hunter2\n',
+    );
+    expect(env).toContain('REDIS_BUILTIN=true');
+    expect(env).toContain('REDIS_HOST=redis');
+    // The bundled Redis runs without auth; a carried-over password would make the client AUTH
+    // against a passwordless server on the next boot.
+    expect(env).not.toContain('REDIS_PASSWORD=');
+  });
+
+  it('rejects a placeholder Redis password at save time', () => {
+    expectRejected(
+      { redis: { enabled: true, builtIn: false, host: 'redis.example.com', password: 'password' } },
+      undefined,
+      /REDIS_PASSWORD/,
+    );
+  });
+
+  it('still saves built-in modes: the bundled credentials stay exempt from the guard', () => {
+    const env = written({
+      database: { type: 'postgres', builtIn: true },
+      storage: { type: 's3', builtIn: true },
+    });
+    expect(env).toContain('DATABASE_PASSWORD=openwa');
+    expect(env).toContain('POSTGRES_BUILTIN=true');
+    expect(env).toContain('S3_ACCESS_KEY_ID=minioadmin');
+    expect(env).toContain('MINIO_BUILTIN=true');
+  });
+
+  it('an absent builtIn field inherits built-in mode without clobbering a stored custom password', () => {
+    // Secrets are never echoed back to the form, so an absent password field means "unchanged".
+    // Merely inheriting the built-in mode must not re-stamp the bundled 'openwa' over a custom
+    // password (e.g. an operator who re-keyed the bundled container via POSTGRES_PASSWORD).
+    const env = written(
+      { database: { type: 'postgres', poolSize: 25 } },
+      'DATABASE_TYPE=postgres\nPOSTGRES_BUILTIN=true\nDATABASE_HOST=postgres\nDATABASE_PORT=5432\nDATABASE_USERNAME=openwa\nDATABASE_PASSWORD=CustomPw123!\nDATABASE_NAME=openwa\nPOSTGRES_SCHEMA=public\n',
+    );
+    expect(env).toContain('POSTGRES_BUILTIN=true');
+    expect(env).toContain('DATABASE_PASSWORD=CustomPw123!');
+    expect(env).toContain('DATABASE_POOL_SIZE=25');
+  });
+
+  it('an explicit password wins while the built-in mode is only inherited', () => {
+    const env = written(
+      { database: { type: 'postgres', password: 'NewPw456!' } },
+      'DATABASE_TYPE=postgres\nPOSTGRES_BUILTIN=true\nDATABASE_HOST=postgres\nDATABASE_PASSWORD=openwa\nDATABASE_NAME=openwa\n',
+    );
+    expect(env).toContain('DATABASE_PASSWORD=NewPw456!');
+    expect(env).not.toContain('DATABASE_PASSWORD=openwa');
+  });
+
+  it('an explicit builtIn:true keeps a re-keyed bundled password (the dashboard always sends builtIn)', () => {
+    // Infrastructure.tsx sends `database.builtIn` on every save and never echoes the password back,
+    // so treating "explicit builtIn:true + no password" as a reset re-wrote a re-keyed container's
+    // credential on each save, breaking the next boot's DB auth.
+    const env = written(
+      { database: { type: 'postgres', builtIn: true } },
+      'DATABASE_TYPE=postgres\nPOSTGRES_BUILTIN=true\nDATABASE_HOST=postgres\nDATABASE_PASSWORD=CustomPw123!\nDATABASE_NAME=openwa\n',
+    );
+    expect(env).toContain('DATABASE_PASSWORD=CustomPw123!');
+  });
+
+  it('does not carry an EXTERNAL password into the bundled container when switching to built-in', () => {
+    // The stored secret belongs to the external DB; the bundled container is seeded with 'openwa'
+    // unless the operator re-keys it, so switching modes must reset rather than inherit.
+    const env = written(
+      { database: { type: 'postgres', builtIn: true } },
+      'DATABASE_TYPE=postgres\nPOSTGRES_BUILTIN=false\nDATABASE_HOST=db.example.com\nDATABASE_PASSWORD=ExternalPw!\nDATABASE_NAME=appdb\n',
+    );
+    expect(env).toContain('DATABASE_PASSWORD=openwa');
+    expect(env).not.toContain('ExternalPw!');
+  });
+
+  // The guard must evaluate what the next boot would SEE: load-env.ts loads with dotenv
+  // override:false, so a value in the container environment (compose `environment:`) wins over the
+  // saved file. Snapshot + clear every guard-relevant key so these tests are hermetic.
+  describe('process-environment precedence', () => {
+    const GUARD_ENV_KEYS = [
+      'DATABASE_TYPE',
+      'DATABASE_PASSWORD',
+      'POSTGRES_BUILTIN',
+      'DATABASE_HOST',
+      'STORAGE_TYPE',
+      'S3_ACCESS_KEY_ID',
+      'S3_SECRET_ACCESS_KEY',
+      'S3_ENDPOINT',
+      'MINIO_BUILTIN',
+      'REDIS_PASSWORD',
+    ];
+    let savedEnv: Array<[string, string | undefined]>;
+    beforeEach(() => {
+      savedEnv = GUARD_ENV_KEYS.map(k => [k, process.env[k]]);
+      for (const k of GUARD_ENV_KEYS) delete process.env[k];
+    });
+    afterEach(() => {
+      for (const [k, v] of savedEnv) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    });
+
+    it('accepts an external Postgres whose strong password comes from the process environment', () => {
+      // The compose deployment the guard used to refuse on EVERY save: the file still holds the
+      // bundled built-in credentials, but boot would see the env password, not the file's.
+      process.env.DATABASE_PASSWORD = 'Sup3rSecret!';
+      const env = written(
+        {
+          database: { type: 'postgres', builtIn: false, host: 'db.example.com', username: 'app', database: 'appdb' },
+        },
+        BUILTIN_POSTGRES_ENV,
+      );
+      expect(env).toContain('POSTGRES_BUILTIN=false');
+      expect(env).toContain('DATABASE_HOST=db.example.com');
+      // The stale bundled password is still dropped from the file — the environment supplies it.
+      expect(env).not.toContain('DATABASE_PASSWORD');
+    });
+
+    it('a blank process-env forward counts as unset, so a weak merged config is still rejected', () => {
+      // Compose renders `- DATABASE_PASSWORD=${DATABASE_PASSWORD:-}` as an empty value when the
+      // operator sets nothing; boot clears that blank (clearBlankEnv) and falls to the file. The
+      // guard does the same — a blank forward can neither mask a weak file value nor supply one.
+      process.env.DATABASE_PASSWORD = '';
+      expectRejected(
+        {
+          database: { type: 'postgres', builtIn: false, host: 'db.example.com', username: 'app', database: 'appdb' },
+        },
+        BUILTIN_POSTGRES_ENV,
+        /DATABASE_PASSWORD/,
+      );
+    });
+
+    it('a weak process-env value wins over a strong saved one and is still rejected', () => {
+      // Precedence cuts both ways: boot would see the env value, so a weak env password must not be
+      // rescued by a strong one sitting in the file.
+      process.env.DATABASE_PASSWORD = 'password';
+      expectRejected(
+        { queue: { enabled: true } },
+        'DATABASE_TYPE=postgres\nPOSTGRES_BUILTIN=false\nDATABASE_HOST=db.example.com\nDATABASE_PASSWORD=Str0ngSaved!\n',
+        /DATABASE_PASSWORD/,
+      );
+    });
+
+    // The cases above delete every guard key from process.env, which cannot happen in production:
+    // load-env merges data/.env.generated INTO process.env at boot, so the file's own values are
+    // sitting there while this save runs. Reading them back as if they were an orchestrator
+    // override makes the guard validate the config being REPLACED.
+    describe('saved-file values echoed in process.env are not mistaken for host overrides', () => {
+      afterEach(() => {
+        // Restore the permissive snapshot the rest of the file assumes.
+        recordOsEnvKeys(process.env);
+      });
+
+      it('refuses a built-in -> external flip that keeps the bundled password (boot would crash-loop)', () => {
+        recordOsEnvKeys({}); // the host supplied nothing; everything below came from the file
+        process.env.DATABASE_TYPE = 'postgres';
+        process.env.POSTGRES_BUILTIN = 'true';
+        process.env.DATABASE_HOST = 'postgres';
+        process.env.DATABASE_PASSWORD = 'openwa';
+        expectRejected(
+          {
+            database: { type: 'postgres', builtIn: false, host: 'db.example.com', username: 'app', database: 'appdb' },
+          },
+          BUILTIN_POSTGRES_ENV,
+          /DATABASE_PASSWORD/,
+        );
+      });
+
+      it('still honors a genuine host override of the same key', () => {
+        recordOsEnvKeys({ DATABASE_PASSWORD: 'Sup3rSecret!' });
+        process.env.DATABASE_PASSWORD = 'Sup3rSecret!';
+        const env = written(
+          {
+            database: { type: 'postgres', builtIn: false, host: 'db.example.com', username: 'app', database: 'appdb' },
+          },
+          BUILTIN_POSTGRES_ENV,
+        );
+        expect(env).toContain('DATABASE_HOST=db.example.com');
+      });
+    });
+  });
+});
+
+describe('InfraController.saveConfig persists strictly-coerced form booleans', () => {
+  const newController = () =>
+    new InfraController(
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+  it("persists 'false' for every boolean field when the body arrives form-encoded", async () => {
+    // The global urlencoded parser delivers scalars as strings and the ValidationPipe runs with
+    // enableImplicitConversion, which used to turn every non-empty string — including 'false' —
+    // into `true`. SaveConfigDto's @ToStrictBoolean fields must map 'false' to a real false so the
+    // file gets 'false', not a silently-enabled feature on the next boot.
+    const formPayload = {
+      database: {
+        type: 'postgres',
+        builtIn: 'false',
+        host: 'db.example.com',
+        password: 'unit-test-pw',
+        sslEnabled: 'true',
+        sslRejectUnauthorized: 'false',
+      },
+      redis: { enabled: 'false', builtIn: 'false' },
+      queue: { enabled: 'false' },
+      storage: { type: 's3', builtIn: 'false', s3Bucket: 'b', s3AccessKey: 'ak-strong', s3SecretKey: 'sk-strong' },
+      engine: { headless: 'false' },
+    };
+    // Mirror the real pipe: implicit conversion on, whitelist validation (src/config/app-validation.ts).
+    const instance = plainToInstance(SaveConfigDto, formPayload, { enableImplicitConversion: true });
+    const errors = await validate(instance, { whitelist: true, forbidNonWhitelisted: true });
+    expect(errors).toHaveLength(0);
+
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.writeFileSync as jest.Mock).mockClear();
+    newController().saveConfig(instance);
+    const env = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
+
+    expect(env).toContain('POSTGRES_BUILTIN=false');
+    expect(env).toContain('DATABASE_SSL=true');
+    expect(env).toContain('DATABASE_SSL_REJECT_UNAUTHORIZED=false');
+    expect(env).toContain('REDIS_ENABLED=false');
+    expect(env).toContain('REDIS_BUILTIN=false');
+    expect(env).toContain('QUEUE_ENABLED=false');
+    expect(env).toContain('MINIO_BUILTIN=false');
+    expect(env).toContain('PUPPETEER_HEADLESS=false');
+  });
+});
+
 describe('InfraController.importData round-trips export-data (no silent message/batch loss)', () => {
   let ds: DataSource;
   let controller: InfraController;
@@ -478,7 +1265,7 @@ describe('InfraController.importData round-trips export-data (no silent message/
 
   beforeEach(async () => {
     ds = new DataSource({
-      type: 'sqlite',
+      type: 'better-sqlite3',
       database: ':memory:',
       entities: [
         Session,
@@ -525,6 +1312,7 @@ describe('InfraController.importData round-trips export-data (no silent message/
         sessionId: 's1',
         waMessageId: 'WA1',
         chatId: 'c1@s.whatsapp.net',
+        chatName: 'Support Chat',
         from: 'a@s.whatsapp.net',
         to: 'b@s.whatsapp.net',
         body: 'hello',
@@ -569,6 +1357,7 @@ describe('InfraController.importData round-trips export-data (no silent message/
     const m = await ds.getRepository(Message).findOneByOrFail({ id: 'm1' });
     expect(m.body).toBe('hello');
     expect(m.waMessageId).toBe('WA1');
+    expect(m.chatName).toBe('Support Chat');
     expect(m.from).toBe('a@s.whatsapp.net');
     expect(m.to).toBe('b@s.whatsapp.net');
     expect(m.metadata).toEqual({ ack: 2 });
@@ -624,6 +1413,99 @@ describe('InfraController.importData round-trips export-data (no silent message/
     const dlf = await ds.getRepository(IntegrationDeliveryFailure).findOneByOrFail({ deliveryId: 'd1' });
     expect(dlf.lastError).toBe('boom');
     expect(dlf.payload).toEqual({ foo: 'bar' });
+  });
+
+  it('round-trips the ingress dispatch-lifecycle columns so a restored pending event still replays', async () => {
+    await seedSession('s1');
+    const ingressRepo = ds.getRepository(IngressEvent);
+    // A pending event (still carrying its payload, awaiting reconciler replay) and a retired one
+    // (dispatch outcome recorded, payload slimmed to NULL).
+    await ingressRepo.save(
+      ingressRepo.create({
+        id: 'ie-pending',
+        instanceId: 'acct1',
+        pluginId: 'chatwoot',
+        providerDeliveryId: 'dlv-1',
+        route: 'chatwoot/acct1',
+        payload: { headers: {}, query: {}, body: '{}', rawBody: '{}' },
+        payloadHash: 'abc123',
+        sessionId: 's1',
+        dispatchState: 'pending',
+        dispatchAttempts: 2,
+        lastDispatchAt: new Date('2026-01-02T03:04:05.000Z'),
+      }),
+    );
+    await ingressRepo.save(
+      ingressRepo.create({
+        id: 'ie-retired',
+        instanceId: 'acct1',
+        pluginId: 'chatwoot',
+        providerDeliveryId: 'dlv-2',
+        route: 'chatwoot/acct1',
+        payload: null,
+        payloadHash: 'def456',
+        sessionId: 's1',
+        dispatchState: 'dispatched',
+        dispatchAttempts: 1,
+        lastDispatchAt: new Date('2026-01-02T03:04:05.000Z'),
+      }),
+    );
+
+    const dump = await controller.exportData();
+    expect(dump.counts.ingressEvents).toBe(2);
+
+    await ingressRepo.clear();
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    expect(res.counts.ingressEvents).toBe(2);
+
+    // A restored 'pending' row that lost its dispatchState would read as NULL ("not watched"): the
+    // reconciler would never replay it while the dedup key still blocked the provider's retry.
+    const pending = await ingressRepo.findOneByOrFail({ id: 'ie-pending' });
+    expect(pending.dispatchState).toBe('pending');
+    expect(pending.dispatchAttempts).toBe(2);
+    expect(pending.lastDispatchAt).toEqual(new Date('2026-01-02T03:04:05.000Z'));
+    expect(pending.payloadHash).toBe('abc123');
+    expect(pending.payload).toEqual({ headers: {}, query: {}, body: '{}', rawBody: '{}' });
+
+    const retired = await ingressRepo.findOneByOrFail({ id: 'ie-retired' });
+    expect(retired.dispatchState).toBe('dispatched');
+    expect(retired.payloadHash).toBe('def456');
+    // A retired payload must stay NULL — re-materializing it as '{}' would make the slimmed dedup
+    // row read as a pending event with an empty body.
+    expect(retired.payload).toBeNull();
+  });
+
+  it('imports a pre-lifecycle backup (no dispatch columns) as not-watched legacy rows', async () => {
+    await seedSession('s1');
+    const res = await controller.importData({
+      tables: {
+        ingressEvents: [
+          {
+            id: 'ie-legacy',
+            instanceId: 'acct1',
+            pluginId: 'chatwoot',
+            providerDeliveryId: 'dlv-9',
+            route: 'chatwoot/acct1',
+            payload: { headers: {}, query: {}, body: '{}', rawBody: '{}' },
+            sessionId: 's1',
+            createdAt: '2026-01-01T00:00:00.000Z',
+          },
+        ] as never,
+      },
+    });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    // Columns absent from an older backup import as NULL/0 — the same "not watched" reading legacy
+    // rows have by design (the reconciler never sweeps them, so an upgrade can't mass-replay history).
+    const legacy = await ds.getRepository(IngressEvent).findOneByOrFail({ id: 'ie-legacy' });
+    expect(legacy.dispatchState).toBeNull();
+    expect(legacy.dispatchAttempts).toBe(0);
+    expect(legacy.lastDispatchAt).toBeNull();
+    expect(legacy.payloadHash).toBeNull();
   });
 
   it('rolls back and reports imported:false when a row fails — existing data is preserved', async () => {
@@ -758,7 +1640,7 @@ describe('InfraController.import/export preserves every data-DB table', () => {
 
   beforeEach(async () => {
     ds = new DataSource({
-      type: 'sqlite',
+      type: 'better-sqlite3',
       database: ':memory:',
       entities: [Session, Webhook, Message, MessageBatch, Template, BaileysStoredMessage, LidMapping],
       synchronize: true,
@@ -807,6 +1689,37 @@ describe('InfraController.import/export preserves every data-DB table', () => {
     expect(await lidRepo.count()).toBe(2);
     expect((await lidRepo.findOneByOrFail({ lid: '111' })).phone).toBe('628111');
     expect((await lidRepo.findOneByOrFail({ lid: '222' })).phone).toBeNull();
+  });
+
+  // The messages import column list must carry every later-added column; `author` (the group
+  // sender identity) was the one that drifted — a restored backup silently lost all attribution.
+  it('restores the group-sender author column on a backup→restore', async () => {
+    await seedSession('s1');
+    const msgRepo = ds.getRepository(Message);
+    await msgRepo.save(
+      msgRepo.create({
+        sessionId: 's1',
+        waMessageId: 'WA-A1',
+        chatId: '120363@g.us',
+        chatName: 'Alice',
+        author: '628111@c.us',
+        from: '120363@g.us',
+        to: 'me@c.us',
+        body: 'hello',
+        type: 'text',
+        direction: MessageDirection.INCOMING,
+        status: MessageStatus.DELIVERED,
+        timestamp: 1700000000,
+      }),
+    );
+
+    const dump = await controller.exportData();
+    await msgRepo.clear();
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    const restored = await msgRepo.findOneByOrFail({ waMessageId: 'WA-A1' });
+    expect(restored.author).toBe('628111@c.us');
   });
 
   // DELETE FROM sessions cascades to templates + baileys_stored_messages (both FK ON DELETE CASCADE),
@@ -1054,6 +1967,103 @@ describe('InfraController.exportStorage keeps the export import-able and sweeps 
   });
 });
 
+describe('InfraController.sweepStaleExportArchives (boot orphan sweep)', () => {
+  function buildController() {
+    return new InfraController(
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+  }
+
+  // A name in exactly the shape exportStorage writes: storage-export-<epochMs>-<uuid>.tar.gz.
+  const archiveName = (epochMs: number): string =>
+    `storage-export-${epochMs}-3b241101-e2bb-4255-8caf-4136c566a962.tar.gz`;
+
+  const exists = (p: string): Promise<boolean> =>
+    fs.promises
+      .access(p)
+      .then(() => true)
+      .catch(() => false);
+
+  let dir: string | undefined;
+  let cwdSpy: jest.SpyInstance | undefined;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-exports-'));
+  });
+
+  afterEach(() => {
+    cwdSpy?.mockRestore();
+    cwdSpy = undefined;
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
+    delete process.env.STORAGE_EXPORT_SWEEP_MAX_AGE_MS;
+  });
+
+  const touch = async (name: string): Promise<string> => {
+    const p = path.join(dir!, name);
+    await fs.promises.writeFile(p, 'archive-bytes');
+    return p;
+  };
+
+  it('deletes export archives older than the default 24h but keeps young archives and non-export files', async () => {
+    const stale = await touch(archiveName(Date.now() - 25 * 60 * 60 * 1000));
+    const young = await touch(archiveName(Date.now() - 60 * 1000));
+    const operatorImportCandidate = await touch('to-import.tar.gz');
+    // Near-miss names are NOT ours: no uuid / wrong extension / different prefix.
+    const noUuid = await touch(`storage-export-${Date.now() - 48 * 60 * 60 * 1000}.tar.gz`);
+    const wrongExt = await touch(archiveName(Date.now() - 48 * 60 * 60 * 1000).replace(/\.tar\.gz$/, '.zip'));
+    const otherPrefix = await touch(`backup-${Date.now() - 48 * 60 * 60 * 1000}.tar.gz`);
+
+    await buildController().sweepStaleExportArchives(dir);
+
+    expect(await exists(stale)).toBe(false);
+    expect(await exists(young)).toBe(true);
+    expect(await exists(operatorImportCandidate)).toBe(true);
+    expect(await exists(noUuid)).toBe(true);
+    expect(await exists(wrongExt)).toBe(true);
+    expect(await exists(otherPrefix)).toBe(true);
+  });
+
+  it('takes the max age from STORAGE_EXPORT_SWEEP_MAX_AGE_MS', async () => {
+    const oneHourOld = archiveName(Date.now() - 60 * 60 * 1000);
+
+    // A 30-minute cap sweeps a 1-hour-old archive...
+    process.env.STORAGE_EXPORT_SWEEP_MAX_AGE_MS = '1800000';
+    const swept = await touch(oneHourOld);
+    await buildController().sweepStaleExportArchives(dir);
+    expect(await exists(swept)).toBe(false);
+
+    // ...while a 2-hour cap keeps it.
+    process.env.STORAGE_EXPORT_SWEEP_MAX_AGE_MS = '7200000';
+    const kept = await touch(oneHourOld);
+    await buildController().sweepStaleExportArchives(dir);
+    expect(await exists(kept)).toBe(true);
+  });
+
+  it('resolves quietly when the exports directory does not exist yet', async () => {
+    await expect(buildController().sweepStaleExportArchives(path.join(dir!, 'never-created'))).resolves.toBeUndefined();
+  });
+
+  it('runs the sweep against <cwd>/data/exports at application bootstrap', async () => {
+    cwdSpy = jest.spyOn(process, 'cwd').mockReturnValue(dir!);
+    const exportDir = path.join(dir!, 'data', 'exports');
+    await fs.promises.mkdir(exportDir, { recursive: true });
+    const stale = path.join(exportDir, archiveName(Date.now() - 25 * 60 * 60 * 1000));
+    await fs.promises.writeFile(stale, 'archive-bytes');
+
+    await buildController().onApplicationBootstrap();
+
+    expect(await exists(stale)).toBe(false);
+  });
+});
+
 describe('InfraController.requestRestart constrains teardown to managed profiles', () => {
   const buildController = (dockerService: Record<string, unknown>) =>
     new InfraController(
@@ -1067,20 +2077,620 @@ describe('InfraController.requestRestart constrains teardown to managed profiles
       { shutdown: jest.fn() } as never, // shutdownService
     );
 
-  it('removes only allowlisted profiles, never an unknown or empty entry', async () => {
-    const removeService = jest.fn().mockResolvedValue(true);
+  it('tears down only allowlisted profiles, never an unknown or empty entry', async () => {
+    const stopManagedService = jest.fn().mockResolvedValue(true);
     const controller = buildController({
       isDockerAvailable: () => true,
-      removeService,
+      stopManagedService,
       orchestrateProfiles: jest.fn().mockResolvedValue({}),
     });
 
     // '' (matches any container by substring) and 'evil' must be dropped; only managed profiles act.
     await controller.requestRestart({ profilesToRemove: ['', 'evil', 'postgres', 'redis'] });
 
-    const removed = removeService.mock.calls.map(call => String((call as unknown[])[0])).sort();
-    expect(removed).toEqual(['postgres', 'redis']);
-    expect(removed).not.toContain('');
-    expect(removed).not.toContain('evil');
+    const torn = stopManagedService.mock.calls.map(call => String((call as unknown[])[0])).sort();
+    expect(torn).toEqual(['postgres', 'redis']);
+    expect(torn).not.toContain('');
+    expect(torn).not.toContain('evil');
+  });
+
+  it('reports teardown as stopped-not-removed, with honest per-profile errors', async () => {
+    const stopManagedService = jest
+      .fn()
+      .mockResolvedValueOnce(true) // postgres stops cleanly
+      .mockResolvedValueOnce(false); // redis fails
+    const controller = buildController({
+      isDockerAvailable: () => true,
+      stopManagedService,
+      orchestrateProfiles: jest.fn().mockResolvedValue({}),
+    });
+
+    const result = await controller.requestRestart({ profilesToRemove: ['postgres', 'redis'] });
+
+    // Teardown is stop-only (containers are retained, never deleted) — the payload must say so.
+    expect(result.removal).toEqual({
+      stopped: ['postgres'],
+      errors: ['Failed to stop redis'],
+    });
+    expect(JSON.stringify(result.removal)).not.toContain('removed');
+  });
+});
+
+// C002: the infra module exposed sensitive ADMIN operations (credential config write, restart/Docker
+// orchestration, full-DB + storage export/import) with no audit trail. Each now emits an AuditAction.
+describe('InfraController C002 audit trail (light-dependency handlers)', () => {
+  const makeAudit = (): { logInfo: jest.Mock } => ({ logInfo: jest.fn().mockResolvedValue(null) });
+
+  // Positional constructor: (config, mainDs, dataDs, engineFactory, dockerService, cacheService,
+  // storageService, shutdownService, webhookQueue?, auditService?). auditService is the last @Optional arg.
+  const build = (
+    audit: { logInfo: jest.Mock },
+    overrides: Partial<{
+      config: unknown;
+      dataDs: unknown;
+      engineFactory: unknown;
+      dockerService: unknown;
+      storageService: unknown;
+      shutdownService: unknown;
+    }> = {},
+  ): InfraController =>
+    new InfraController(
+      (overrides.config ?? {}) as never,
+      {} as never,
+      (overrides.dataDs ?? {}) as never,
+      (overrides.engineFactory ?? {}) as never,
+      (overrides.dockerService ?? {}) as never,
+      {} as never,
+      (overrides.storageService ?? {}) as never,
+      (overrides.shutdownService ?? {}) as never,
+      undefined as never,
+      audit as never,
+    );
+
+  it('saveConfig emits INFRA_CONFIG_SAVED without leaking secret values into the metadata', () => {
+    const audit = makeAudit();
+    build(audit).saveConfig({ database: { type: 'postgres', host: 'db', password: 'topsecret' } } as never);
+    expect(audit.logInfo).toHaveBeenCalledTimes(1);
+    const calls = audit.logInfo.mock.calls as Array<[AuditAction, { metadata: { sections: string[] } }]>;
+    const [action, ctx] = calls[0];
+    expect(action).toBe(AuditAction.INFRA_CONFIG_SAVED);
+    expect(ctx.metadata.sections).toContain('database');
+    // Only section names + profiles are recorded — never a secret value.
+    expect(JSON.stringify(ctx)).not.toContain('topsecret');
+  });
+
+  it('saveConfig does NOT emit when the payload is rejected (unknown engine)', () => {
+    const audit = makeAudit();
+    const controller = build(audit, { engineFactory: { getAvailableEngines: () => [{ id: 'baileys' }] } });
+    expect(() => controller.saveConfig({ engine: { type: 'bogus' } })).toThrow(BadRequestException);
+    expect(audit.logInfo).not.toHaveBeenCalled();
+  });
+
+  it('requestRestart emits INFRA_RESTART_REQUESTED with the requested profiles', async () => {
+    const audit = makeAudit();
+    const controller = build(audit, {
+      config: { get: () => undefined },
+      dockerService: { isDockerAvailable: () => false },
+      shutdownService: { shutdown: jest.fn() },
+    });
+    await controller.requestRestart({ profiles: ['postgres'], profilesToRemove: [] });
+    const calls = audit.logInfo.mock.calls as Array<[AuditAction, { metadata: { profiles: string[] } }]>;
+    expect(calls[0][0]).toBe(AuditAction.INFRA_RESTART_REQUESTED);
+    expect(calls[0][1].metadata.profiles).toEqual(['postgres']);
+  });
+
+  it('exportData emits INFRA_DATA_EXPORTED with per-table counts', async () => {
+    const audit = makeAudit();
+    const controller = build(audit, {
+      config: { get: (k: string, d?: unknown) => (k === 'dataDatabase.type' ? 'sqlite' : d) },
+      dataDs: { query: jest.fn().mockResolvedValue([]) },
+    });
+    await controller.exportData();
+    const calls = audit.logInfo.mock.calls as Array<[AuditAction, { metadata: { counts: { sessions: number } } }]>;
+    expect(calls[0][0]).toBe(AuditAction.INFRA_DATA_EXPORTED);
+    expect(calls[0][1].metadata.counts.sessions).toBe(0);
+  });
+
+  it('importStorage emits INFRA_STORAGE_IMPORTED with the imported file count', async () => {
+    const audit = makeAudit();
+    const cwdSpy = jest.spyOn(process, 'cwd').mockReturnValue('/srv/openwa');
+    (fs.existsSync as jest.Mock).mockImplementation((p: string) => p === '/srv/openwa/data/exports/x.tar.gz');
+    try {
+      const storageService = { importFromStream: jest.fn().mockResolvedValue(5), getCurrentStorageType: () => 'local' };
+      await build(audit, { storageService }).importStorage({ filePath: 'data/exports/x.tar.gz' });
+      const calls = audit.logInfo.mock.calls as Array<
+        [AuditAction, { metadata: { count: number; storageType: string } }]
+      >;
+      expect(calls[0][0]).toBe(AuditAction.INFRA_STORAGE_IMPORTED);
+      expect(calls[0][1].metadata).toEqual({ count: 5, storageType: 'local' });
+    } finally {
+      cwdSpy.mockRestore();
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
+    }
+  });
+
+  it('exportStorage emits INFRA_STORAGE_EXPORTED', async () => {
+    const audit = makeAudit();
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-audit-'));
+    const cwdSpy = jest.spyOn(process, 'cwd').mockReturnValue(cwd);
+    process.env.STORAGE_EXPORT_TTL_MS = '30';
+    try {
+      const storageService = { createExportStream: jest.fn().mockResolvedValue(Readable.from([Buffer.from('x')])) };
+      await build(audit, { storageService }).exportStorage();
+      const calls = audit.logInfo.mock.calls as Array<[AuditAction, { metadata: { download: string } }]>;
+      expect(calls[0][0]).toBe(AuditAction.INFRA_STORAGE_EXPORTED);
+      expect(typeof calls[0][1].metadata.download).toBe('string');
+    } finally {
+      cwdSpy.mockRestore();
+      fs.rmSync(cwd, { recursive: true, force: true });
+      delete process.env.STORAGE_EXPORT_TTL_MS;
+    }
+  });
+});
+
+describe('InfraController C002 audit trail — import emits only on a committed restore', () => {
+  let ds: DataSource;
+  const cfg = { get: (key: string, def?: unknown) => (key === 'dataDatabase.type' ? 'sqlite' : def) };
+  const build = (audit: { logInfo: jest.Mock }): InfraController =>
+    new InfraController(
+      cfg as never,
+      {} as never,
+      ds,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      undefined as never,
+      audit as never,
+    );
+
+  beforeEach(async () => {
+    ds = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [
+        Session,
+        Webhook,
+        Message,
+        MessageBatch,
+        PluginInstance,
+        ConversationMapping,
+        IngressEvent,
+        WebhookDeliveryFailure,
+        IntegrationDeliveryFailure,
+      ],
+      synchronize: true,
+    });
+    await ds.initialize();
+  });
+
+  afterEach(async () => {
+    await ds.destroy();
+  });
+
+  const seedSession = (id: string) =>
+    ds.getRepository(Session).save(
+      ds.getRepository(Session).create({
+        id,
+        name: `session-${id}`,
+        status: SessionStatus.READY,
+        phone: null,
+        pushName: null,
+        config: {},
+        proxyUrl: null,
+        proxyType: null,
+        connectedAt: null,
+        lastActiveAt: null,
+      }),
+    );
+
+  it('emits INFRA_DATA_EXPORTED then INFRA_DATA_IMPORTED across a successful round-trip', async () => {
+    await seedSession('s1');
+    const audit = { logInfo: jest.fn().mockResolvedValue(null) };
+    const controller = build(audit);
+    const dump = await controller.exportData();
+    const res = await controller.importData({ tables: dump.tables });
+    expect(res.imported).toBe(true);
+    const actions = (audit.logInfo.mock.calls as Array<[AuditAction, unknown]>).map(c => c[0]);
+    expect(actions).toContain(AuditAction.INFRA_DATA_EXPORTED);
+    expect(actions).toContain(AuditAction.INFRA_DATA_IMPORTED);
+  });
+
+  it('does NOT emit INFRA_DATA_IMPORTED when an empty backup is refused (no data changed)', async () => {
+    await seedSession('s1');
+    const audit = { logInfo: jest.fn().mockResolvedValue(null) };
+    const res = await build(audit).importData({ tables: {} });
+    expect(res.imported).toBe(false);
+    const actions = (audit.logInfo.mock.calls as Array<[AuditAction, unknown]>).map(c => c[0]);
+    expect(actions).not.toContain(AuditAction.INFRA_DATA_IMPORTED);
+  });
+});
+
+describe('InfraController.exportData optional-table strictness', () => {
+  const cfg = { get: (key: string, def?: unknown) => (key === 'dataDatabase.type' ? 'sqlite' : def) };
+  const build = (query: jest.Mock) =>
+    new InfraController(
+      cfg as never,
+      {} as never,
+      { query } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+  it('rethrows a non-missing-table error (lock/IO/timeout) instead of reporting a partial export as complete', async () => {
+    // A lock on ONE optional table must fail the whole export: silently exporting without that table
+    // produces a backup the import then treats as authoritative, DELETing the table's existing rows.
+    const query = jest.fn((sql: string) =>
+      sql === 'SELECT * FROM messages'
+        ? Promise.reject(new Error('SQLITE_BUSY: database is locked'))
+        : Promise.resolve([]),
+    );
+    await expect(build(query).exportData()).rejects.toThrow(/database is locked/);
+  });
+
+  it('tolerates a genuinely absent optional table — and marks it in skippedTables', async () => {
+    const missing = Object.assign(new Error('no such table: messages'), { name: 'SqliteError' });
+    const query = jest.fn((sql: string) =>
+      sql === 'SELECT * FROM messages' ? Promise.reject(missing) : Promise.resolve([]),
+    );
+    const dump = await build(query).exportData();
+    expect(dump.counts.messages).toBe(0);
+    expect(dump.tables.messages).toEqual([]);
+    expect(dump.skippedTables).toContain('messages');
+    // Every other table still exported (all empty here, none skipped).
+    expect(dump.skippedTables).toEqual(['messages']);
+  });
+
+  it('strips the Postgres generated body_ts tsvector from exported message rows', async () => {
+    // Postgres' STORED generated FTS column rides along in `SELECT *`; it is an index artifact, not
+    // payload, and must not be serialized into a (dialect-neutral) backup.
+    const messageRow = {
+      id: 'm1',
+      sessionId: 's1',
+      waMessageId: 'WA1',
+      chatId: 'c1',
+      chatName: null,
+      author: null,
+      from: 'a',
+      to: 'b',
+      body: 'hello',
+      type: 'text',
+      direction: 'incoming',
+      timestamp: 1700000000,
+      metadata: null,
+      status: 'delivered',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      body_ts: "'hello'",
+    };
+    const query = jest.fn((sql: string) => Promise.resolve(sql === 'SELECT * FROM messages' ? [messageRow] : []));
+    const dump = await build(query).exportData();
+    expect(dump.tables.messages).toHaveLength(1);
+    expect(dump.tables.messages[0]).not.toHaveProperty('body_ts');
+    expect(dump.tables.messages[0].body).toBe('hello');
+  });
+});
+
+describe('InfraController.importData status_updates + runtime reconciliation', () => {
+  let ds: DataSource;
+  const cfg = { get: (key: string, def?: unknown) => (key === 'dataDatabase.type' ? 'sqlite' : def) };
+
+  // Positional constructor: (config, mainDs, dataDs, engineFactory, dockerService, cacheService,
+  // storageService, shutdownService, webhookQueue?, auditService?, sessionService?, lidMappingStore?).
+  const build = (opts: { sessionService?: unknown; lidMappingStore?: unknown } = {}) =>
+    new InfraController(
+      cfg as never,
+      {} as never,
+      ds,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      undefined as never,
+      undefined,
+      opts.sessionService as never,
+      opts.lidMappingStore as never,
+    );
+
+  beforeEach(async () => {
+    ds = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [
+        Session,
+        Webhook,
+        Message,
+        MessageBatch,
+        Template,
+        BaileysStoredMessage,
+        LidMapping,
+        PluginInstance,
+        ConversationMapping,
+        IngressEvent,
+        WebhookDeliveryFailure,
+        IntegrationDeliveryFailure,
+        StatusUpdate,
+      ],
+      synchronize: true,
+    });
+    await ds.initialize();
+  });
+
+  afterEach(async () => {
+    await ds.destroy();
+  });
+
+  const seedSession = (id: string) =>
+    ds.getRepository(Session).save(
+      ds.getRepository(Session).create({
+        id,
+        name: `session-${id}`,
+        status: SessionStatus.READY,
+        phone: null,
+        pushName: null,
+        config: {},
+        proxyUrl: null,
+        proxyType: null,
+        connectedAt: null,
+        lastActiveAt: null,
+      }),
+    );
+
+  it('exports and restores status_updates (the table the docs promise is covered)', async () => {
+    await seedSession('s1');
+    const statusRepo = ds.getRepository(StatusUpdate);
+    await statusRepo.save(
+      statusRepo.create({
+        id: 'su1',
+        sessionId: 's1',
+        contactJid: '628111@c.us',
+        contactName: 'Alice',
+        contactPushName: 'alice',
+        waStatusId: 'false_status@broadcast_ABC',
+        type: 'text',
+        caption: 'on vacation',
+        mediaOmitted: true,
+        omitReason: 'over_cap',
+        backgroundColor: '#FF0000',
+        font: 2,
+        postedAt: 1750000000000,
+        expiresAt: 1750086400000,
+      }),
+    );
+
+    const controller = build();
+    const dump = await controller.exportData();
+    expect(dump.counts.statusUpdates).toBe(1);
+    expect(dump.skippedTables).toEqual([]);
+
+    await statusRepo.clear();
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    expect(res.counts.statusUpdates).toBe(1);
+    const restored = await statusRepo.findOneByOrFail({ id: 'su1' });
+    expect(restored.waStatusId).toBe('false_status@broadcast_ABC');
+    expect(restored.caption).toBe('on vacation');
+    expect(restored.mediaOmitted).toBe(true); // boolean survives the 0/1 round-trip
+    expect(restored.omitReason).toBe('over_cap');
+    expect(restored.font).toBe(2);
+    expect(restored.postedAt).toBe(1750000000000);
+    expect(restored.expiresAt).toBe(1750086400000);
+  });
+
+  it('tolerates body_ts on imported message rows (backup made before the strip)', async () => {
+    await seedSession('s1');
+    const res = await build().importData({
+      tables: {
+        sessions: [
+          {
+            id: 's1',
+            name: 'session-s1',
+            status: 'ready',
+            config: '{}',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          },
+        ] as never,
+        messages: [
+          {
+            id: 'm1',
+            sessionId: 's1',
+            waMessageId: 'WA1',
+            chatId: 'c1',
+            from: 'a',
+            to: 'b',
+            body: 'hello',
+            type: 'text',
+            direction: 'incoming',
+            status: 'delivered',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            body_ts: "'hello'", // legacy Postgres export artifact — must be ignored, not fail
+          },
+        ] as never,
+      },
+    });
+    expect(res.imported).toBe(true);
+    expect(res.warnings).toEqual([]);
+    expect((await ds.getRepository(Message).findOneByOrFail({ id: 'm1' })).body).toBe('hello');
+  });
+
+  it('reloads the in-memory lid mappings after a committed restore', async () => {
+    await seedSession('s1');
+    const lidMappingStore = { reload: jest.fn().mockResolvedValue(undefined) };
+    const controller = build({ lidMappingStore });
+    const dump = await controller.exportData();
+    const res = await controller.importData({ tables: dump.tables });
+    expect(res.imported).toBe(true);
+    expect(lidMappingStore.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT reload lid mappings when the import is refused (nothing committed)', async () => {
+    await seedSession('s1');
+    const lidMappingStore = { reload: jest.fn().mockResolvedValue(undefined) };
+    const res = await build({ lidMappingStore }).importData({ tables: {} });
+    expect(res.imported).toBe(false);
+    expect(lidMappingStore.reload).not.toHaveBeenCalled();
+  });
+
+  it('409s when a live engine would be orphaned by the replace — unless force=true', async () => {
+    await seedSession('s1');
+    const controller = build({ sessionService: { getActiveSessionIds: () => ['ghost'] } });
+    const dump = await controller.exportData(); // backup contains only s1, not the running 'ghost'
+
+    // Without force: 409 Conflict, and the destructive replace never started.
+    const err = await controller.importData({ tables: dump.tables }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConflictException);
+    expect((err as ConflictException).getStatus()).toBe(409);
+    expect((err as ConflictException).message).toContain('ghost');
+    expect(await ds.getRepository(Session).count()).toBe(1); // nothing deleted
+
+    // With force: the restore proceeds and the response tells the operator a restart is required
+    // to stop the orphaned engine.
+    const res = await controller.importData({ tables: dump.tables, force: true });
+    expect(res.imported).toBe(true);
+    expect(res.restartRequired).toBe(true);
+    expect(res.orphanedEngines).toEqual(['ghost']);
+  });
+
+  it('reports restartRequired:false when no live engine is orphaned', async () => {
+    await seedSession('s1');
+    const controller = build({ sessionService: { getActiveSessionIds: () => ['s1'] } });
+    const dump = await controller.exportData();
+    const res = await controller.importData({ tables: dump.tables });
+    expect(res.imported).toBe(true);
+    expect(res.restartRequired).toBe(false);
+    expect(res.orphanedEngines).toEqual([]);
+  });
+
+  it('stopOrphans=true stops the orphan engines inside the request and keeps restartRequired:false', async () => {
+    await seedSession('s1');
+    const stopOrphanEngines = jest.fn().mockResolvedValue({ stopped: ['ghost'], notRunning: [], failed: [] });
+    const controller = build({
+      sessionService: { getActiveSessionIds: () => ['ghost'], stopOrphanEngines },
+    });
+    const dump = await controller.exportData(); // backup contains only s1, not 'ghost'
+
+    const res = await controller.importData({ tables: dump.tables, stopOrphans: true });
+
+    // The orphan engines were stopped (called once with exactly the orphan ids) and the import
+    // proceeded without requiring a restart — the whole point of stopOrphans vs force.
+    expect(stopOrphanEngines).toHaveBeenCalledWith(['ghost']);
+    expect(stopOrphanEngines).toHaveBeenCalledTimes(1);
+    expect(res.imported).toBe(true);
+    expect(res.restartRequired).toBe(false);
+    expect(res.stoppedOrphanEngines).toEqual(['ghost']);
+    expect(res.failedOrphanEngines).toEqual([]);
+    expect(res.orphanedEngines).toEqual(['ghost']);
+  });
+
+  it('stopOrphans=true surfaces a teardown failure as restartRequired:true + a warning (Map reconciled regardless)', async () => {
+    await seedSession('s1');
+    const stopOrphanEngines = jest.fn().mockResolvedValue({ stopped: ['g1'], notRunning: [], failed: ['g2'] });
+    const controller = build({
+      sessionService: { getActiveSessionIds: () => ['g1', 'g2'], stopOrphanEngines },
+    });
+    const dump = await controller.exportData();
+
+    const res = await controller.importData({ tables: dump.tables, stopOrphans: true });
+
+    expect(res.imported).toBe(true);
+    expect(res.restartRequired).toBe(true);
+    expect(res.failedOrphanEngines).toEqual(['g2']);
+    expect(res.stoppedOrphanEngines).toEqual(['g1']);
+    expect(res.notices.some(w => w.includes('g2') && w.includes('restart'))).toBe(true);
+  });
+
+  it('stopOrphans=true reports notRunning orphans (still initializing) as a warning', async () => {
+    await seedSession('s1');
+    const stopOrphanEngines = jest.fn().mockResolvedValue({ stopped: ['g1'], notRunning: ['g-init'], failed: [] });
+    const controller = build({
+      sessionService: { getActiveSessionIds: () => ['g1', 'g-init'], stopOrphanEngines },
+    });
+    const dump = await controller.exportData();
+
+    const res = await controller.importData({ tables: dump.tables, stopOrphans: true });
+
+    expect(res.imported).toBe(true);
+    expect(res.restartRequired).toBe(false);
+    expect(res.notices.some(w => w.includes('g-init') && w.includes('initializing'))).toBe(true);
+  });
+
+  it('stopOrphans=true is a no-op when there is no sessionService wired', async () => {
+    // Some stripped-down module shapes may not import SessionModule; the controller must not throw
+    // when stopOrphans is requested but the service is unavailable — it falls back to refuse/force.
+    await seedSession('s1');
+    const controller = build({}); // no sessionService
+    const dump = await controller.exportData();
+
+    // Without sessionService there are no active ids to detect, so no orphan, no 409 — the import
+    // proceeds normally. (This matches the @Optional() wiring; the gate only engages when the
+    // service is present.)
+    const res = await controller.importData({ tables: dump.tables, stopOrphans: true });
+    expect(res.imported).toBe(true);
+    expect(res.stoppedOrphanEngines).toEqual([]);
+  });
+});
+
+describe('InfraController storage stream failures surface as request errors, not process crashes', () => {
+  it('importStorage maps an archive/stream failure to a 400 with the real reason', async () => {
+    const cwdSpy = jest.spyOn(process, 'cwd').mockReturnValue('/srv/openwa');
+    (fs.existsSync as jest.Mock).mockImplementation((p: string) => p === '/srv/openwa/data/exports/bad.tar.gz');
+    try {
+      const storage = {
+        importFromStream: jest.fn().mockRejectedValue(new Error('incorrect header check')),
+        getCurrentStorageType: () => 'local',
+      };
+      const controller = new InfraController(
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        storage as never,
+        {} as never,
+      );
+      const err = await controller.importStorage({ filePath: 'data/exports/bad.tar.gz' }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(BadRequestException);
+      expect((err as BadRequestException).message).toContain('incorrect header check');
+    } finally {
+      cwdSpy.mockRestore();
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
+    }
+  });
+
+  it('exportStorage rejects (and the process lives) when the export source stream errors', async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-export-err-'));
+    const cwdSpy = jest.spyOn(process, 'cwd').mockReturnValue(cwd);
+    try {
+      // pipe() never forwards source errors: without a listener on the source this would be an
+      // unhandled 'error' event and kill the process instead of failing the request.
+      const errStream = new Readable({
+        read() {
+          this.destroy(new Error('archive boom'));
+        },
+      });
+      const storage = { createExportStream: jest.fn().mockResolvedValue(errStream) };
+      const controller = new InfraController(
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        storage as never,
+        {} as never,
+      );
+      await expect(controller.exportStorage()).rejects.toThrow(/archive boom/);
+    } finally {
+      cwdSpy.mockRestore();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });

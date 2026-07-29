@@ -23,7 +23,8 @@
  * @packageDocumentation
  */
 
-import { request, encodeSegment, warnIfInsecureHttpUrl, type ClientConfig, type FetchLike, type RequestOptions } from './http.js';
+import { request, requestBytes, encodeSegment, warnIfInsecureHttpUrl, type BinaryResponse, type ClientConfig, type FetchLike, type RequestOptions } from './http.js';
+import { CallsResource } from './resources/calls.js';
 import { CatalogResource } from './resources/catalog.js';
 import { ChannelsResource } from './resources/channels.js';
 import { ChatsResource } from './resources/chats.js';
@@ -32,6 +33,7 @@ import { GroupsResource } from './resources/groups.js';
 import { HealthResource } from './resources/health.js';
 import { LabelsResource } from './resources/labels.js';
 import { MessagesResource } from './resources/messages.js';
+import { ProfileResource } from './resources/profile.js';
 import { SearchResource } from './resources/search.js';
 import { SessionsResource } from './resources/sessions.js';
 import { StatusResource } from './resources/status.js';
@@ -85,6 +87,8 @@ export class OpenWAClient {
   readonly catalog = new CatalogResource(this);
   readonly templates = new TemplatesResource(this);
   readonly search = new SearchResource(this);
+  readonly profile = new ProfileResource(this);
+  readonly calls = new CallsResource(this);
 
   // ── Auth ─────────────────────────────────────────────────────────
 
@@ -100,10 +104,14 @@ export class OpenWAClient {
     return request<T>(this.config, options);
   }
 
+  /** Issue a raw request expecting a non-JSON (binary) body. (Public for advanced use.) */
+  requestBytes(options: RequestOptions): Promise<BinaryResponse> {
+    return requestBytes(this.config, options);
+  }
+
   /**
-   * Shared media-send helper used by the image/video/audio/document/sticker
-   * methods, which all share the {@link SendMediaRequest} shape and only differ
-   * by their path segment.
+   * Shared transport helper for image/video/audio/document/sticker sends. Public resource methods
+   * expose the narrower per-route request types (including audio-only `ptt`).
    */
   sendMedia(sessionId: string, segment: string, body: SendMediaRequest): Promise<MessageResponse> {
     return this.request<MessageResponse>({

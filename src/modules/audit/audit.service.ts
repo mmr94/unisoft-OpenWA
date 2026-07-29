@@ -1,10 +1,11 @@
 import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Between, LessThan } from 'typeorm';
+import { Repository, Between, LessThan, In } from 'typeorm';
 import { AuditLog, AuditAction, AuditSeverity } from './entities/audit-log.entity';
 import { ApiKey } from '../auth/entities/api-key.entity';
 import { createLogger } from '../../common/services/logger.service';
-import { getRequestId } from '../../common/services/request-context';
+import { getRequestId, getRequestActor } from '../../common/services/request-context';
+import { resolveSessionScope } from '../../common/security/session-scope';
 
 /** Upper bound on a single audit-log page, so a large `limit` can't load the whole table at once. */
 export const MAX_AUDIT_PAGE_SIZE = 200;
@@ -81,16 +82,25 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
     // Stamp the active request id into metadata so an audit row traces back to the same request as
     // the log lines. Absent outside a request scope (so no metadata blob is created for worker/cron).
     const requestId = getRequestId();
+    // Auto-attribute the row to the resolved API key + client IP from the per-request async context
+    // when the call site didn't pass them explicitly. Most call sites fire from deep services that
+    // legitimately don't have the key in scope; without this the apiKey/ipAddress columns are always
+    // blank, defeating the audit trail. Explicit context values still win (e.g. a worker that stamps
+    // a system key, or the AUTH_FAILED case which only has an IP).
+    const actor = getRequestActor();
+    const apiKeyId = context.apiKey?.id ?? actor?.apiKeyId;
+    const apiKeyName = context.apiKey?.name ?? actor?.apiKeyName;
+    const ipAddress = context.ipAddress ?? actor?.ipAddress;
     const metadata =
       context.metadata || requestId ? { ...(context.metadata ?? {}), ...(requestId ? { requestId } : {}) } : null;
     const auditLog = this.auditRepository.create({
       action,
       severity,
-      apiKeyId: context.apiKey?.id || null,
-      apiKeyName: context.apiKey?.name || null,
+      apiKeyId: apiKeyId || null,
+      apiKeyName: apiKeyName || null,
       sessionId: context.sessionId || null,
       sessionName: context.sessionName || null,
-      ipAddress: context.ipAddress || null,
+      ipAddress: ipAddress || null,
       userAgent: context.userAgent || null,
       method: context.method || null,
       path: context.path || null,
@@ -125,7 +135,10 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
     return this.log(action, context, AuditSeverity.ERROR);
   }
 
-  async findAll(options: AuditQueryOptions = {}): Promise<{
+  async findAll(
+    options: AuditQueryOptions = {},
+    allowedSessions?: string[] | null,
+  ): Promise<{
     data: AuditLog[];
     total: number;
   }> {
@@ -133,7 +146,14 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
 
     if (options.action) where.action = options.action;
     if (options.apiKeyId) where.apiKeyId = options.apiKeyId;
-    if (options.sessionId) where.sessionId = options.sessionId;
+    // The calling key's allowedSessions is authoritative; the query sessionId may only narrow within it.
+    // Without this, a session-scoped ADMIN key reads every tenant's rows (no param => where.sessionId
+    // unset => all), because the ApiKeyGuard fence only inspects route params, not the query string.
+    const sessionScope = resolveSessionScope(allowedSessions, options.sessionId);
+    if (sessionScope !== null) {
+      if (sessionScope.length === 0) return { data: [], total: 0 }; // requested session outside the key's scope
+      where.sessionId = In(sessionScope);
+    }
     if (options.severity) where.severity = options.severity;
 
     if (options.startDate && options.endDate) {

@@ -18,7 +18,7 @@ import { NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
 import { fetch as undiciFetch } from 'undici';
-import { WebhookService, WebhookPayload } from './webhook.service';
+import { WebhookService, WebhookPayload, WebhookJobData } from './webhook.service';
 import { Webhook } from './entities/webhook.entity';
 import { WebhookDeliveryFailure } from './entities/webhook-delivery-failure.entity';
 import { WebhookFilters } from './filters/filter-types';
@@ -27,6 +27,7 @@ import { HookManager } from '../../core/hooks';
 import { QUEUE_NAMES } from '../queue/queue-names';
 import { Session } from '../session/entities/session.entity';
 import { getWebhookDeliveryFailuresTotal } from '../../common/metrics/webhook-delivery-metrics';
+import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
 
 function createMockWebhook(overrides: Partial<Webhook> = {}): Webhook {
   return {
@@ -64,6 +65,7 @@ describe('WebhookService', () => {
       save: jest.fn(),
       remove: jest.fn(),
       update: jest.fn(),
+      count: jest.fn().mockResolvedValue(0),
     };
 
     failureRepository = {
@@ -185,6 +187,59 @@ describe('WebhookService', () => {
         else process.env.WEBHOOK_SSRF_PROTECT = origProtect;
       }
     });
+
+    // ── per-session fan-out cap ───────────────────────────
+
+    it('rejects a NEW webhook with 400 once the session is at the per-session cap (default 16)', async () => {
+      (repository.count as jest.Mock).mockResolvedValue(16);
+
+      await expect(service.create('sess-1', { url: 'https://example.com/webhook' })).rejects.toMatchObject({
+        status: 400,
+      });
+      await expect(service.create('sess-1', { url: 'https://example.com/webhook' })).rejects.toThrow(
+        /Webhook limit reached/,
+      );
+      // Refused BEFORE persisting — and grandfathered rows are never deleted to make room.
+      expect(repository.create).not.toHaveBeenCalled();
+      expect(repository.save).not.toHaveBeenCalled();
+      expect(repository.remove).not.toHaveBeenCalled();
+    });
+
+    it('creates the webhook while the session is under the cap', async () => {
+      (repository.count as jest.Mock).mockResolvedValue(15);
+      const webhook = createMockWebhook();
+      (repository.create as jest.Mock).mockReturnValue(webhook);
+      (repository.save as jest.Mock).mockResolvedValue(webhook);
+
+      await expect(service.create('sess-1', { url: 'https://example.com/webhook' })).resolves.toBeDefined();
+      expect(repository.count).toHaveBeenCalledWith({ where: { sessionId: 'sess-1' } });
+    });
+
+    it('honors a custom WEBHOOK_MAX_PER_SESSION', async () => {
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | boolean | number => {
+        if (key === 'webhook.maxPerSession') return 2;
+        return def as T;
+      });
+      (repository.count as jest.Mock).mockResolvedValue(2);
+
+      await expect(service.create('sess-1', { url: 'https://example.com/webhook' })).rejects.toMatchObject({
+        status: 400,
+      });
+    });
+
+    it('WEBHOOK_MAX_PER_SESSION=0 disables the cap (legacy unlimited behavior)', async () => {
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | boolean | number => {
+        if (key === 'webhook.maxPerSession') return 0;
+        return def as T;
+      });
+      (repository.count as jest.Mock).mockResolvedValue(9999);
+      const webhook = createMockWebhook();
+      (repository.create as jest.Mock).mockReturnValue(webhook);
+      (repository.save as jest.Mock).mockResolvedValue(webhook);
+
+      await expect(service.create('sess-1', { url: 'https://example.com/webhook' })).resolves.toBeDefined();
+      expect(repository.count).not.toHaveBeenCalled(); // no count query when the cap is off
+    });
   });
 
   // ── findBySession / findAll / findOne ──────────────────────────────
@@ -302,6 +357,52 @@ describe('WebhookService', () => {
         if (prev === undefined) delete process.env.WEBHOOK_FAILURE_RETENTION_DAYS;
         else process.env.WEBHOOK_FAILURE_RETENTION_DAYS = prev;
       }
+    });
+  });
+
+  // The drain bound at shutdown must cover the per-delivery timeout, or a delivery that takes nearly
+  // the full timeout is abandoned at shutdown. The defaults already cross (drain 5s < timeout 10s),
+  // so the warning is the only signal an operator gets that their config silently truncates deliveries.
+  describe('onModuleInit drain-vs-timeout warning', () => {
+    const drainSpy = () =>
+      jest.spyOn((service as unknown as { logger: { warn: jest.Mock; error: jest.Mock } }).logger, 'warn');
+
+    const withConfig = (drainMs: number, timeoutMs: number, fn: () => void): void => {
+      const orig = configService.get as jest.Mock;
+      const impl = orig.getMockImplementation() as ((key: string, def?: unknown) => unknown) | undefined;
+      orig.mockImplementation((key: string, def?: unknown) => {
+        if (key === 'webhook.shutdownDrainMs') return drainMs;
+        if (key === 'webhook.timeout') return timeoutMs;
+        // Preserve the other keys the service reads at startup (queue.enabled etc.) by delegating
+        // to the original implementation for anything we did not override.
+        if (impl) return impl(key, def);
+        return def;
+      });
+      try {
+        fn();
+      } finally {
+        if (impl) orig.mockImplementation(impl);
+      }
+    };
+
+    it('warns when WEBHOOK_SHUTDOWN_DRAIN_MS < WEBHOOK_TIMEOUT (the default-derived cross)', () => {
+      const warn = drainSpy();
+      withConfig(5000, 10000, () => service.onModuleInit());
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain('WEBHOOK_SHUTDOWN_DRAIN_MS');
+      expect(warn.mock.calls[0][0]).toContain('WEBHOOK_TIMEOUT');
+    });
+
+    it('does not warn when WEBHOOK_SHUTDOWN_DRAIN_MS >= WEBHOOK_TIMEOUT (drain covers the delivery)', () => {
+      const warn = drainSpy();
+      withConfig(15000, 10000, () => service.onModuleInit());
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('does not warn when either value is non-finite (let the per-call site handle a bad config)', () => {
+      const warn = drainSpy();
+      withConfig(Number.NaN, 10000, () => service.onModuleInit());
+      expect(warn).not.toHaveBeenCalled();
     });
   });
 
@@ -429,6 +530,34 @@ describe('WebhookService', () => {
       expect(mockFetch).toHaveBeenCalledTimes(5);
     });
 
+    it('records a durable failure when the bounded dispatch queue is full', async () => {
+      const wA = createMockWebhook({ id: 'wh-a', url: 'https://a.example/hook', events: ['message.received'] });
+      const wB = createMockWebhook({ id: 'wh-b', url: 'https://b.example/hook', events: ['message.received'] });
+      (repository.find as jest.Mock).mockResolvedValue([wA, wB]);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      (hookManager.execute as jest.Mock).mockImplementation((_event: string, data: unknown) =>
+        Promise.resolve({ continue: true, data }),
+      );
+      (service as unknown as { dispatchLimiter: ConcurrencyLimiter }).dispatchLimiter = new ConcurrencyLimiter(1, 0);
+
+      let release: (value: unknown) => void = () => undefined;
+      mockFetch.mockImplementation(() => new Promise(resolve => (release = resolve)));
+
+      const pending = service.dispatch('sess-1', 'message.received', { from: 'x@c.us' });
+      for (let i = 0; i < 20 && mockFetch.mock.calls.length === 0; i++) await new Promise(r => setImmediate(r));
+      release({ ok: true, status: 200 });
+      await pending;
+
+      expect(failureRepository.insert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          webhookId: 'wh-b',
+          attempts: 0,
+          lastError: 'ConcurrencyLimiter queue full',
+        }),
+      );
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
     it('salts each sibling webhook with a distinct idempotency key so one receiver cannot dedupe out another', async () => {
       const wA = createMockWebhook({ id: 'wh-a', url: 'https://a.example/hook', events: ['message.received'] });
       const wB = createMockWebhook({ id: 'wh-b', url: 'https://b.example/hook', events: ['message.received'] });
@@ -472,6 +601,20 @@ describe('WebhookService', () => {
       expect(body.data).toEqual({ from: '628123456789@c.us' });
     });
 
+    it('falls back to the original payload when a before-hook returns null data', async () => {
+      const webhook = createMockWebhook({ events: ['message.received'] });
+      (repository.find as jest.Mock).mockResolvedValue([webhook]);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: null });
+
+      await service.dispatch('sess-1', 'message.received', { from: '628123456789@c.us' });
+
+      const callArgs = mockFetch.mock.calls[0] as [unknown, { body: string }];
+      const body = JSON.parse(callArgs[1].body) as WebhookPayload;
+      expect(body.event).toBe('message.received');
+      expect(body.data).toEqual({ from: '628123456789@c.us' });
+    });
+
     it('keeps the server-canonical idempotency/delivery ids on the signed body, overriding a tampering plugin', async () => {
       const webhook = createMockWebhook({ events: ['message.received'] });
       (repository.find as jest.Mock).mockResolvedValue([webhook]);
@@ -498,6 +641,194 @@ describe('WebhookService', () => {
       expect(body.deliveryId).toBe(headers['X-OpenWA-Delivery-Id']);
       expect(body.idempotencyKey).not.toBe('PLUGIN-FORGED');
       expect(body.deliveryId).not.toBe('PLUGIN-FORGED');
+    });
+
+    it('re-asserts event/sessionId/timestamp on the signed body after a tampering webhook:before hook', async () => {
+      const webhook = createMockWebhook({ events: ['message.received'], secret: 'sek' });
+      (repository.find as jest.Mock).mockResolvedValue([webhook]);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      // The plugin rewrites every remaining identity field; other hook events pass through. The
+      // canonical timestamp is captured from the payload the hook was given.
+      let canonicalTimestamp = '';
+      (hookManager.execute as jest.Mock).mockImplementation((event: string, ctx: { payload?: WebhookPayload }) => {
+        if (event === 'webhook:before' && ctx.payload) {
+          canonicalTimestamp = ctx.payload.timestamp;
+          return Promise.resolve({
+            continue: true,
+            data: {
+              payload: {
+                ...ctx.payload,
+                event: 'forged.event',
+                sessionId: 'other-session',
+                timestamp: '1999-01-01T00:00:00.000Z',
+              },
+            },
+          });
+        }
+        return Promise.resolve({ continue: true, data: {} });
+      });
+
+      await service.dispatch('sess-1', 'message.received', { from: '628123456789@c.us' });
+
+      const call = mockFetch.mock.calls[0] as [unknown, { headers: Record<string, string>; body: string }];
+      const headers = call[1].headers;
+      const body = JSON.parse(call[1].body) as WebhookPayload;
+      expect(body.event).toBe('message.received');
+      expect(body.sessionId).toBe('sess-1');
+      expect(body.timestamp).toBe(canonicalTimestamp);
+      // Body and headers tell the same story, and the signature covers the exact bytes sent — a
+      // forged identity field would have diverged body from header/signature.
+      expect(headers['X-OpenWA-Event']).toBe(body.event);
+      const expected = `sha256=${crypto.createHmac('sha256', 'sek').update(call[1].body).digest('hex')}`;
+      expect(headers['X-OpenWA-Signature']).toBe(expected);
+    });
+
+    it('records (never sends) a hook-mutated payload that exceeds the payload size cap', async () => {
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | boolean | number => {
+        if (key === 'queue.enabled') return false;
+        if (key === 'webhook.maxPayloadBytes') return 1024;
+        return def as T;
+      });
+      const webhook = createMockWebhook({ events: ['message.received'] });
+      (repository.find as jest.Mock).mockResolvedValue([webhook]);
+      (hookManager.execute as jest.Mock).mockImplementation((event: string, ctx: { payload?: WebhookPayload }) =>
+        event === 'webhook:before' && ctx.payload
+          ? Promise.resolve({
+              continue: true,
+              data: { payload: { ...ctx.payload, data: { big: 'x'.repeat(64 * 1024) } } },
+            })
+          : Promise.resolve({ continue: true, data: {} }),
+      );
+
+      await service.dispatch('sess-1', 'message.received', { from: 'x@c.us' });
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(failureRepository.insert).toHaveBeenCalledTimes(1);
+      expect(failureRepository.insert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          webhookId: webhook.id,
+          attempts: 0,
+          lastStatusCode: null,
+        }),
+      );
+      const oversizeInsert = (failureRepository.insert as jest.Mock).mock.calls as Array<[{ lastError: string }]>;
+      expect(oversizeInsert[0][0].lastError).toContain('exceeding the 1024-byte cap');
+      expect(hookManager.execute).toHaveBeenCalledWith('webhook:error', expect.anything(), expect.anything());
+    });
+
+    it('replaces over-threshold inline media with the omitted marker before fan-out (input not mutated)', async () => {
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | boolean | number => {
+        if (key === 'queue.enabled') return false;
+        if (key === 'webhook.mediaInlineMaxBytes') return 1024;
+        return def as T;
+      });
+      const webhook = createMockWebhook({ events: ['message.received'] });
+      (repository.find as jest.Mock).mockResolvedValue([webhook]);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: {} });
+
+      const base64 = Buffer.alloc(2048, 7).toString('base64'); // 2048 decoded bytes > 1024 cap
+      const data: Record<string, unknown> = {
+        from: 'x@c.us',
+        media: { mimetype: 'image/jpeg', data: base64 },
+      };
+      await service.dispatch('sess-1', 'message.received', data);
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const body = JSON.parse((mockFetch.mock.calls[0] as [unknown, { body: string }])[1].body) as {
+        data: { media: Record<string, unknown> };
+      };
+      // The documented marker shape — the blob itself never reaches the wire.
+      expect(body.data.media).toEqual({ mimetype: 'image/jpeg', omitted: true, sizeBytes: 2048 });
+      // The caller's event data keeps its media — shedding works on a copy.
+      expect((data.media as { data?: string }).data).toBe(base64);
+      expect(failureRepository.insert).not.toHaveBeenCalled();
+    });
+
+    it('keeps under-threshold media inline, unchanged', async () => {
+      const webhook = createMockWebhook({ events: ['message.received'] });
+      (repository.find as jest.Mock).mockResolvedValue([webhook]);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: {} });
+
+      const base64 = Buffer.alloc(512, 3).toString('base64'); // default inline cap is 1 MiB
+      await service.dispatch('sess-1', 'message.received', {
+        from: 'x@c.us',
+        media: { mimetype: 'image/jpeg', data: base64 },
+      });
+
+      const body = JSON.parse((mockFetch.mock.calls[0] as [unknown, { body: string }])[1].body) as {
+        data: { media: { data?: string; omitted?: boolean } };
+      };
+      expect(body.data.media.data).toBe(base64);
+      expect(body.data.media.omitted).toBeUndefined();
+    });
+
+    it('sheds inline media to fit the payload budget instead of recording the event undelivered', async () => {
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | boolean | number => {
+        if (key === 'queue.enabled') return false;
+        if (key === 'webhook.maxPayloadBytes') return 1024;
+        if (key === 'webhook.mediaInlineMaxBytes') return 50 * 1024 * 1024; // pre-fan-out shed stays out of the way
+        return def as T;
+      });
+      const webhook = createMockWebhook({ events: ['message.received'] });
+      (repository.find as jest.Mock).mockResolvedValue([webhook]);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: {} });
+
+      // 2048 decoded bytes → ~2.7 KB base64 → serialized payload over the 1024-byte budget.
+      const base64 = Buffer.alloc(2048, 9).toString('base64');
+      await service.dispatch('sess-1', 'message.received', {
+        from: 'x@c.us',
+        media: { mimetype: 'image/jpeg', filename: 'photo.jpg', data: base64 },
+      });
+
+      // Delivered with the marker (filename preserved) — NOT dropped as undelivered.
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const body = JSON.parse((mockFetch.mock.calls[0] as [unknown, { body: string }])[1].body) as {
+        data: { media: Record<string, unknown> };
+      };
+      expect(body.data.media).toEqual({
+        mimetype: 'image/jpeg',
+        filename: 'photo.jpg',
+        omitted: true,
+        sizeBytes: 2048,
+      });
+      expect(failureRepository.insert).not.toHaveBeenCalled();
+    });
+
+    it('still records undelivered when an over-budget payload has no inline media to shed', async () => {
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | boolean | number => {
+        if (key === 'queue.enabled') return false;
+        if (key === 'webhook.maxPayloadBytes') return 1024;
+        return def as T;
+      });
+      const webhook = createMockWebhook({ events: ['message.received'] });
+      (repository.find as jest.Mock).mockResolvedValue([webhook]);
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: {} });
+
+      await service.dispatch('sess-1', 'message.received', { from: 'x@c.us', body: 'y'.repeat(4096) });
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(failureRepository.insert).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not retry or record a failure when lastTriggeredAt bookkeeping fails after a 2xx', async () => {
+      const webhook = createMockWebhook({ events: ['message.received'] });
+      (repository.find as jest.Mock).mockResolvedValue([webhook]);
+      (repository.update as jest.Mock).mockRejectedValue(new Error('db down'));
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: {} });
+      const failuresBefore = getWebhookDeliveryFailuresTotal();
+
+      await service.dispatch('sess-1', 'message.received', { from: 'x@c.us' });
+
+      // The receiver answered 2xx: no redelivery, no dead-letter row, delivered-hooks still fire.
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(failureRepository.insert).not.toHaveBeenCalled();
+      expect(getWebhookDeliveryFailuresTotal()).toBe(failuresBefore);
+      expect(hookManager.execute).toHaveBeenCalledWith('webhook:delivered', expect.anything(), expect.anything());
+      expect(hookManager.execute).not.toHaveBeenCalledWith('webhook:error', expect.anything(), expect.anything());
     });
 
     it("isolates each webhook's data so an in-place before-hook mutation cannot bleed across webhooks", async () => {
@@ -615,8 +946,9 @@ describe('WebhookService', () => {
   describe('dispatch (queued mode) — serialization safety', () => {
     it('catches an unserializable webhook:before payload instead of aborting the loop / rejecting', async () => {
       (service as unknown as { queueEnabled: boolean }).queueEnabled = true;
-      // A plugin's webhook:before returns a payload JSON.stringify cannot serialize (BigInt). With the
-      // secret set, the queued branch signs JSON.stringify(finalPayload) — which throws.
+      // A plugin's webhook:before returns a payload JSON.stringify cannot serialize (BigInt). The
+      // preflight size check serializes the hook result, so the throw lands in the preflight catch
+      // and the payload is recorded as undelivered.
       (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: { payload: { x: 1n } } });
       const webhook = createMockWebhook({ secret: 'sek', events: ['message.received'] });
       (repository.find as jest.Mock).mockResolvedValue([webhook]);
@@ -626,6 +958,134 @@ describe('WebhookService', () => {
 
       expect(webhookQueue.add).not.toHaveBeenCalled(); // never enqueued the un-signable job
       expect(hookManager.execute).toHaveBeenCalledWith('webhook:error', expect.anything(), expect.anything());
+    });
+  });
+
+  // ── shutdown drain ────────────────────────────────────────────────
+
+  describe('shutdown drain', () => {
+    const mockFetch = undiciFetch as jest.Mock;
+
+    afterEach(() => mockFetch.mockReset());
+
+    it('records parked deliveries on close and abandons a hung in-flight delivery within the drain bound', async () => {
+      const hooks = [
+        createMockWebhook({ id: 'wh-a', url: 'https://a.example/hook', events: ['message.received'] }),
+        createMockWebhook({ id: 'wh-b', url: 'https://b.example/hook', events: ['message.received'] }),
+        createMockWebhook({ id: 'wh-c', url: 'https://c.example/hook', events: ['message.received'] }),
+      ];
+      (repository.find as jest.Mock).mockResolvedValue(hooks);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      (hookManager.execute as jest.Mock).mockImplementation((_event: string, data: unknown) =>
+        Promise.resolve({ continue: true, data }),
+      );
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | boolean | number => {
+        if (key === 'queue.enabled') return false;
+        if (key === 'webhook.shutdownDrainMs') return 150;
+        return def as T;
+      });
+      // One active slot, generous parked bound: B and C park behind the hanging A.
+      (service as unknown as { dispatchLimiter: ConcurrencyLimiter }).dispatchLimiter = new ConcurrencyLimiter(1, 1000);
+
+      let releaseActive: (value: unknown) => void = () => undefined;
+      mockFetch.mockImplementation(() => new Promise(resolve => (releaseActive = resolve)));
+      const loggerSpy = jest.spyOn((service as unknown as { logger: { error: jest.Mock } }).logger, 'error');
+
+      const dispatchP = service.dispatch('sess-1', 'message.received', { from: 'x@c.us' });
+      for (let i = 0; i < 20 && mockFetch.mock.calls.length === 0; i++) await new Promise(r => setImmediate(r));
+
+      const start = Date.now();
+      await service.onModuleDestroy();
+      const elapsed = Date.now() - start;
+
+      // Bounded: the hanging in-flight delivery did not stall teardown past the drain window.
+      expect(elapsed).toBeLessThan(2000);
+      // The two parked deliveries were rejected by the closing limiter and recorded as undelivered —
+      // they never reached the receiver, so a dead-letter row is the honest record.
+      expect(failureRepository.insert).toHaveBeenCalledTimes(2);
+      const shutdownInserts = (failureRepository.insert as jest.Mock).mock.calls as Array<
+        [{ webhookId: string; lastError: string }]
+      >;
+      const recorded = shutdownInserts.map(c => c[0]);
+      expect(recorded.map(r => r.webhookId)).toEqual(expect.arrayContaining(['wh-b', 'wh-c']));
+      for (const r of recorded) expect(r.lastError).toBe('ConcurrencyLimiter closed');
+      // The in-flight delivery was NOT falsely dead-lettered (the receiver may have it); it is
+      // logged as abandoned so the loss is still operator-visible.
+      expect(
+        loggerSpy.mock.calls.some(c => {
+          const meta = c[2] as { action?: string; webhookId?: string } | undefined;
+          return meta?.action === 'webhook_delivery_abandoned_shutdown' && meta.webhookId === 'wh-a';
+        }),
+      ).toBe(true);
+
+      releaseActive({ ok: true, status: 200 });
+      await dispatchP;
+      loggerSpy.mockRestore();
+    });
+
+    it('queued mode: parked enqueues drain to the queue on shutdown instead of dead-lettering', async () => {
+      (service as unknown as { queueEnabled: boolean }).queueEnabled = true;
+      const hooks = [
+        createMockWebhook({ id: 'wh-a', url: 'https://a.example/hook', events: ['message.received'] }),
+        createMockWebhook({ id: 'wh-b', url: 'https://b.example/hook', events: ['message.received'] }),
+        createMockWebhook({ id: 'wh-c', url: 'https://c.example/hook', events: ['message.received'] }),
+      ];
+      (repository.find as jest.Mock).mockResolvedValue(hooks);
+      (hookManager.execute as jest.Mock).mockImplementation((_event: string, data: unknown) =>
+        Promise.resolve({ continue: true, data }),
+      );
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | boolean | number => {
+        if (key === 'queue.enabled') return true;
+        if (key === 'webhook.shutdownDrainMs') return 1000;
+        return def as T;
+      });
+      // One active slot, generous parked bound: B and C park behind A, whose enqueue hangs.
+      (service as unknown as { dispatchLimiter: ConcurrencyLimiter }).dispatchLimiter = new ConcurrencyLimiter(1, 1000);
+
+      let releaseActive: (value: unknown) => void = () => undefined;
+      let firstAdd = true;
+      (webhookQueue.add as jest.Mock).mockImplementation(
+        () =>
+          new Promise(resolve => {
+            if (firstAdd) {
+              firstAdd = false;
+              releaseActive = resolve;
+            } else {
+              resolve(undefined);
+            }
+          }),
+      );
+
+      const dispatchP = service.dispatch('sess-1', 'message.received', { from: 'x@c.us' });
+      for (let i = 0; i < 20 && webhookQueue.add.mock.calls.length === 0; i++) await new Promise(r => setImmediate(r));
+
+      // Shutdown starts while A holds the slot and B/C are parked. Queued mode must not close the
+      // limiter: a parked task is just webhookQueue.add() — durable in Redis once it runs — and it
+      // holds an activeCount slot via handoff, so the drain loop waits for the whole chain.
+      const destroyP = service.onModuleDestroy();
+      releaseActive(undefined);
+      await destroyP;
+      await dispatchP;
+
+      // All three reached the queue; none was dead-lettered as webhook_dispatch_shutdown.
+      expect(webhookQueue.add).toHaveBeenCalledTimes(3);
+      expect(failureRepository.insert).not.toHaveBeenCalled();
+    });
+
+    it('records a dispatch that arrives after the limiter closed (no fetch, dead-letter row)', async () => {
+      const webhook = createMockWebhook({ events: ['message.received'] });
+      (repository.find as jest.Mock).mockResolvedValue([webhook]);
+      (hookManager.execute as jest.Mock).mockImplementation((_event: string, data: unknown) =>
+        Promise.resolve({ continue: true, data }),
+      );
+
+      await service.onModuleDestroy(); // nothing in flight → returns immediately
+      await service.dispatch('sess-1', 'message.received', { from: 'x@c.us' });
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(failureRepository.insert).toHaveBeenCalledWith(
+        expect.objectContaining({ webhookId: webhook.id, attempts: 0, lastError: 'ConcurrencyLimiter closed' }),
+      );
     });
   });
 
@@ -719,6 +1179,25 @@ describe('WebhookService', () => {
       const hasMedia = conds({ field: 'hasMedia', operator: 'is', value: true });
       expect(await deliveries(hasMedia, 'message.received', { media: { mimetype: 'image/png' } })).toBe(1);
       expect(await deliveries(hasMedia, 'message.received', { body: 'just text' })).toBe(0);
+    });
+
+    it('filters message.edited through a wildcard subscription using its normalized message fields', async () => {
+      const f = conds(
+        { field: 'sender', operator: 'is', value: ['part@c.us'] },
+        { field: 'body', operator: 'contains', value: 'invoice' },
+        { field: 'type', operator: 'is', value: ['image'] },
+        { field: 'hasMedia', operator: 'is', value: true },
+      );
+      const data = {
+        from: '120@g.us',
+        author: 'part@c.us',
+        body: 'Updated invoice',
+        type: 'image',
+        hasMedia: true,
+      };
+
+      expect(await deliveries(f, 'message.edited', data)).toBe(1);
+      expect(await deliveries(f, 'message.edited', { ...data, body: 'lunch?', hasMedia: false })).toBe(0);
     });
 
     it('mentions: fires when the message mentions one of the listed JIDs', async () => {
@@ -896,6 +1375,50 @@ describe('WebhookService', () => {
   describe('dispatch (queue mode)', () => {
     afterEach(() => (undiciFetch as jest.Mock).mockReset());
 
+    const buildQueueService = async (configGet: (key: string, def?: unknown) => unknown): Promise<WebhookService> => {
+      const queueModule: TestingModule = await Test.createTestingModule({
+        providers: [
+          WebhookService,
+          { provide: getRepositoryToken(Webhook, 'data'), useValue: repository },
+          { provide: getRepositoryToken(WebhookDeliveryFailure, 'data'), useValue: failureRepository },
+          { provide: ConfigService, useValue: { get: jest.fn().mockImplementation(configGet) } },
+          { provide: HookManager, useValue: hookManager },
+          { provide: getQueueToken(QUEUE_NAMES.WEBHOOK), useValue: webhookQueue },
+        ],
+      }).compile();
+      return queueModule.get<WebhookService>(WebhookService);
+    };
+
+    it('enqueues a small, media-shed job when the event carries over-threshold media', async () => {
+      const queueService = await buildQueueService((key: string, def?: unknown) => {
+        if (key === 'queue.enabled') return true;
+        if (key === 'webhook.retryDelay') return 5000;
+        if (key === 'webhook.mediaInlineMaxBytes') return 1024;
+        return def;
+      });
+      const webhook = createMockWebhook({ events: ['message.received'] });
+      (repository.find as jest.Mock).mockResolvedValue([webhook]);
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: {} });
+
+      const base64 = Buffer.alloc(2048, 5).toString('base64'); // 2048 decoded bytes > 1024 cap
+      await queueService.dispatch('sess-1', 'message.received', {
+        from: 'x@c.us',
+        media: { mimetype: 'image/jpeg', data: base64 },
+      });
+
+      expect(webhookQueue.add).toHaveBeenCalledTimes(1);
+      const addCalls = (webhookQueue.add as jest.Mock).mock.calls as Array<[string, WebhookJobData]>;
+      const jobData = addCalls[0][1];
+      // The blob is shed BEFORE enqueue: a failed job retains only the marker in Redis, and the
+      // bounded removeOnFail window (WEBHOOK_QUEUE_JOB_OPTIONS) keeps count × bytes bounded.
+      expect((jobData.payload.data as { media: Record<string, unknown> }).media).toEqual({
+        mimetype: 'image/jpeg',
+        omitted: true,
+        sizeBytes: 2048,
+      });
+      expect(JSON.stringify(jobData).length).toBeLessThan(2048);
+    });
+
     it('should add job to queue when queue is enabled', async () => {
       // Create a new service with queue enabled
       const queueModule: TestingModule = await Test.createTestingModule({
@@ -1056,8 +1579,10 @@ describe('WebhookService', () => {
       const out = await service.listDeliveryFailures({ sessionId: 's1', limit: 10 });
 
       expect(out).toHaveLength(1);
+      // sessionId resolves through resolveSessionScope, so the WHERE is an IN over the effective scope
+      // ([s1] here for an unrestricted key narrowing to one session) — behaviourally the same rows.
       expect(failureRepository.find).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { sessionId: 's1' }, order: { createdAt: 'DESC' } }),
+        expect.objectContaining({ where: { sessionId: In(['s1']) }, order: { createdAt: 'DESC' } }),
       );
     });
   });

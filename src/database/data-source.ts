@@ -1,16 +1,27 @@
 import { DataSource, DataSourceOptions } from 'typeorm';
 import * as path from 'path';
 import { loadCliEnv } from './load-cli-env';
+import { sqliteDataMainPathCollision } from '../config/env.validation';
 
 // Load env with the same precedence as the app (process.env > .env > data/.env.generated), so the
 // migration CLI targets the SAME database the dashboard configured — not the default SQLite DB.
 loadCliEnv();
 
+// The TypeORM CLI never runs ConfigModule's validate(), so the boot-time guards in env.validation
+// don't apply here. The one that matters for a DDL-issuing connection is re-applied explicitly:
+// DATABASE_NAME must not resolve to the main (auth/audit) SQLite file, or data migrations would
+// run against the wrong database. Resolved exactly like the runtime (env → default), so the CLI
+// and the app make the same call.
+const sqlitePathCollision = sqliteDataMainPathCollision(process.env);
+if (sqlitePathCollision) {
+  throw new Error(sqlitePathCollision);
+}
+
 const dbType = process.env.DATABASE_TYPE || 'sqlite';
 
 const sourceGlob = (...segments: string[]): string => path.join(__dirname, ...segments).replace(/\\/g, '/');
 
-// Scoped to the DATA-owned modules only (session/webhook/message/template/engine/integration), mirroring
+// Scoped to the DATA-owned modules only (session/webhook/message/template/engine/integration/status-store), mirroring
 // the runtime data connection (app.module.ts). A broad '**' glob would also sweep in the main-owned
 // auth/audit entities and pollute `migration:generate` against the data DB with their DDL.
 const dataEntities = [
@@ -20,12 +31,13 @@ const dataEntities = [
   sourceGlob('..', 'modules', 'template', '**', '*.entity{.ts,.js}'),
   sourceGlob('..', 'engine', '**', '*.entity{.ts,.js}'),
   sourceGlob('..', 'modules', 'integration', '**', '*.entity{.ts,.js}'),
+  sourceGlob('..', 'modules', 'status-store', '**', '*.entity{.ts,.js}'),
 ];
 const dataMigrations = [sourceGlob('migrations', '*{.ts,.js}')];
 
 // SQLite configuration
 const sqliteDataSourceOptions: DataSourceOptions = {
-  type: 'sqlite',
+  type: 'better-sqlite3',
   database: process.env.DATABASE_NAME || './data/openwa.sqlite',
   entities: dataEntities,
   migrations: dataMigrations,

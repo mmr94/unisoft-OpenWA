@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpenWA\Tests;
 
+use OpenWA\Exceptions\OpenWANotFoundException;
 use PHPUnit\Framework\TestCase;
 
 class MessagesTest extends TestCase
@@ -18,6 +19,36 @@ class MessagesTest extends TestCase
         // statically configured via base_uri, so we assert on path + body.
         $this->assertSame('/api/sessions/s1/messages/send-text', $call['path']);
         $this->assertSame(['chatId' => 'a@c.us', 'text' => 'hi'], $call['body']);
+    }
+
+    public function testSendTextForwardsMentionsVerbatim(): void
+    {
+        $backend = (new MockBackend())->on(201, ['messageId' => 'm1', 'timestamp' => 1]);
+        $client = $backend->makeClient();
+        $client->messages->sendText('s1', ['chatId' => 'g@g.us', 'text' => 'hi @628123', 'mentions' => ['628123@c.us']]);
+        $this->assertSame(
+            ['chatId' => 'g@g.us', 'text' => 'hi @628123', 'mentions' => ['628123@c.us']],
+            $backend->lastCall()['body']
+        );
+    }
+
+    public function testSendPollUsesSendPollPath(): void
+    {
+        $backend = (new MockBackend())->on(201, ['messageId' => 'm2', 'timestamp' => 2]);
+        $client = $backend->makeClient();
+        $res = $client->messages->sendPoll('s1', [
+            'chatId' => 'a@c.us',
+            'name' => 'Where?',
+            'options' => ['Park', 'Beach'],
+            'allowMultipleAnswers' => true,
+        ]);
+        $call = $backend->lastCall();
+        $this->assertSame('/api/sessions/s1/messages/send-poll', $call['path']);
+        $this->assertSame(
+            ['chatId' => 'a@c.us', 'name' => 'Where?', 'options' => ['Park', 'Beach'], 'allowMultipleAnswers' => true],
+            $call['body']
+        );
+        $this->assertSame('m2', $res['messageId']);
     }
 
     public function testListReturnsMessagesPageEnvelope(): void
@@ -76,6 +107,29 @@ class MessagesTest extends TestCase
         $this->assertStringContainsString('/messages/react', $backend->calls()[2]['url']);
         $client->messages->delete('s', ['chatId' => 'a@c.us', 'messageId' => 'm']);
         $this->assertStringContainsString('/messages/delete', $backend->calls()[3]['url']);
+    }
+
+    public function testEditMessageUsesEditPath(): void
+    {
+        $backend = (new MockBackend())->on(200, ['messageId' => 'm1', 'timestamp' => 123]);
+        $client = $backend->makeClient();
+        $result = $client->messages->editMessage('s1', ['chatId' => 'a@c.us', 'messageId' => 'm1', 'body' => 'edited']);
+        $call = $backend->lastCall();
+        $this->assertSame('POST', $call['method']);
+        $this->assertSame('/api/sessions/s1/messages/edit', $call['path']);
+        $this->assertSame(['chatId' => 'a@c.us', 'messageId' => 'm1', 'body' => 'edited'], $call['body']);
+        $this->assertSame('m1', $result['messageId']);
+    }
+
+    public function testEditMessage404MapsToNotFoundException(): void
+    {
+        $backend = (new MockBackend())->on(404, [
+            'statusCode' => 404,
+            'message' => 'Message not found',
+            'error' => 'Not Found',
+        ]);
+        $this->expectException(OpenWANotFoundException::class);
+        $backend->makeClient()->messages->editMessage('s1', ['chatId' => 'a@c.us', 'messageId' => 'missing', 'body' => 'x']);
     }
 
     public function testHistoryAndReactionsPath(): void

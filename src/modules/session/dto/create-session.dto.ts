@@ -21,8 +21,10 @@ export class CreateSessionDto {
       'Session configuration options. Supported keys: ' +
       'maxReconnectAttempts (number), reconnectBaseDelay (ms), ' +
       'keepAlive (boolean — exclude this session from idle hibernation), ' +
-      'idleTimeoutMs (number — per-session override of the global idle window before hibernation).',
-    example: { autoReconnect: true, keepAlive: false, idleTimeoutMs: 5400000 },
+      'idleTimeoutMs (number — per-session override of the global idle window before hibernation), ' +
+      'autoRejectCalls (boolean, default false — automatically reject incoming calls; the ' +
+      'call.received event is still emitted).',
+    example: { autoReconnect: true, keepAlive: false, idleTimeoutMs: 5400000, autoRejectCalls: false },
   })
   @IsOptional()
   config?: Record<string, unknown>;

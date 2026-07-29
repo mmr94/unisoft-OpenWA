@@ -1,4 +1,4 @@
-import { Injectable, Optional } from '@nestjs/common';
+import { Injectable, OnApplicationBootstrap, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -7,6 +7,7 @@ import { IngressJobData } from '../queue/processors/ingress.processor';
 import { IntegrationDeliveryFailure } from './entities/integration-delivery-failure.entity';
 import { QUEUE_NAMES } from '../queue/queue-names';
 import { createLogger } from '../../common/services/logger.service';
+import { resolveNonNegativeIntEnv } from '../../config/configuration';
 
 /**
  * Outcome of an enqueue attempt. 'queued' = handed to BullMQ; 'dispatched' = delivered inline; 'failed'
@@ -28,10 +29,9 @@ export type EnqueueOutcome = { outcome: 'queued' | 'dispatched' | 'failed'; erro
  */
 export function resolveIngressJobOptions(): { attempts: number; backoff: { type: 'exponential'; delay: number } } {
   const attempts = Number(process.env.INGRESS_MAX_ATTEMPTS);
-  const delay = Number(process.env.INGRESS_RETRY_DELAY_MS);
   return {
     attempts: Number.isInteger(attempts) && attempts >= 1 ? attempts : 3,
-    backoff: { type: 'exponential', delay: Number.isInteger(delay) && delay >= 0 ? delay : 5000 },
+    backoff: { type: 'exponential', delay: resolveNonNegativeIntEnv(process.env.INGRESS_RETRY_DELAY_MS, 5000) },
   };
 }
 
@@ -50,7 +50,12 @@ export function buildIngressDeadLetterRow(data: IngressJobData, error?: string):
     deliveryId: data.deliveryId,
     attempts: 1,
     lastError: error ?? 'inline ingress dispatch failed',
-    payload: { route: data.route, providerConversationId: data.providerConversationId, ingress: data.payload },
+    payload: {
+      route: data.route,
+      method: data.method,
+      providerConversationId: data.providerConversationId,
+      ingress: data.payload,
+    },
     redriven: false,
   };
 }
@@ -59,11 +64,15 @@ export function buildIngressDeadLetterRow(data: IngressJobData, error?: string):
  * Shared queue-or-inline enqueue for inbound ingress jobs. Extracted out of IngressService's DI
  * factory (integration.module.ts) so RedriveService can reuse the exact same behavior when replaying
  * DLQ rows: same queue.add args, same inline dispatch-after-persist fallback, same error swallow.
- * The ingress queue is OPTIONAL — it only exists as a provider under QUEUE_ENABLED (QueueModule) —
- * so a missing injection falls back to inline dispatch, mirroring WebhookService's direct fallback.
+ * The ingress queue stays @Optional so a queue-off boot (QUEUE_ENABLED unset/false) needs no
+ * QueueModule — and no Redis — at all; a missing injection then means inline dispatch, mirroring
+ * WebhookService's direct fallback. Under QUEUE_ENABLED=true, IntegrationModule imports QueueModule
+ * so the queue provider MUST resolve; onApplicationBootstrap below fails the boot if it did not, so
+ * a broken queue wiring crashes at startup instead of silently running inline forever (the queued
+ * dispatch contract — fast-ack, retries, ordered processing — would otherwise be dead with no signal).
  */
 @Injectable()
-export class IngressEnqueueService {
+export class IngressEnqueueService implements OnApplicationBootstrap {
   private readonly logger = createLogger('IngressEnqueueService');
 
   constructor(
@@ -71,6 +80,19 @@ export class IngressEnqueueService {
     private readonly config: ConfigService,
     @Optional() @InjectQueue(QUEUE_NAMES.INGRESS) private readonly ingressQueue?: Queue<IngressJobData>,
   ) {}
+
+  onApplicationBootstrap(): void {
+    // Reads the same module-eval signal as the conditional QueueModule imports (integration.module.ts /
+    // webhook.module.ts), not the runtime config, so the check guards exactly the wiring that should
+    // have happened at import time.
+    if (process.env.QUEUE_ENABLED === 'true' && !this.ingressQueue) {
+      throw new Error(
+        `QUEUE_ENABLED=true but the '${QUEUE_NAMES.INGRESS}' BullMQ queue did not resolve — ` +
+          'IntegrationModule must import QueueModule (see the QUEUE_ENABLED conditional in integration.module.ts). ' +
+          'Refusing to boot: ingress deliveries would silently dispatch inline, defeating the queued-dispatch contract.',
+      );
+    }
+  }
 
   async enqueue(data: IngressJobData, jobId: string): Promise<EnqueueOutcome> {
     const queueEnabled = this.config.get<boolean>('queue.enabled', false);

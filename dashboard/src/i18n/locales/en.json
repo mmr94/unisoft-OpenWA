@@ -7,25 +7,17 @@
   },
   "common": {
     "appName": "OpenWA",
-    "appSubtitle": "WhatsApp API",
     "loading": "Loading...",
-    "save": "Save",
     "cancel": "Cancel",
     "delete": "Delete",
-    "edit": "Edit",
     "create": "Create",
     "close": "Close",
     "showApiKey": "Show API key",
     "hideApiKey": "Hide API key",
-    "submit": "Submit",
-    "confirm": "Confirm",
     "search": "Search",
-    "filter": "Filter",
-    "actions": "Actions",
     "status": "Status",
     "name": "Name",
     "role": "Role",
-    "type": "Type",
     "url": "URL",
     "port": "Port",
     "host": "Host",
@@ -33,8 +25,6 @@
     "password": "Password",
     "active": "Active",
     "inactive": "Inactive",
-    "enabled": "Enabled",
-    "disabled": "Disabled",
     "connected": "Connected",
     "disconnected": "Disconnected",
     "never": "Never",
@@ -43,8 +33,6 @@
     "hoursAgo": "{{count}} hours ago",
     "optional": "optional",
     "language": "Language",
-    "english": "English",
-    "hebrew": "עברית",
     "back": "Back",
     "next": "Next",
     "previous": "Previous",
@@ -63,7 +51,7 @@
     "label": "Theme: {{value}}",
     "appearance": "Appearance",
     "mode": "Mode",
-    "palette": "Palette"
+    "toggleTo": "Switch to {{value}}"
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -96,6 +84,8 @@
     "loadingChats": "Loading chats...",
     "empty": "No chats",
     "noMessageYet": "No messages yet",
+    "unreadBadge": "{{count}} unread message",
+    "unreadBadge_other": "{{count}} unread messages",
     "loadingMessages": "Loading messages...",
     "noMessagesInChat": "No messages yet. Send the first message to get started!",
     "downloadDocument": "Download document",
@@ -116,13 +106,54 @@
     "send": "Send",
     "placeholderTitle": "Start messaging",
     "placeholderDesc": "Choose a conversation to read and reply.",
+    "scrollToBottom": "Scroll to latest",
+    "groupSubtitle": "Group",
+    "privateContactSubtitle": "Private contact",
     "deleteConfirm": "Delete this message for everyone?",
     "messageDeleted": "🚫 This message was deleted",
     "messageMasked": "🔒 Masked by WhatsApp for linked devices — check your primary phone",
+    "kind": {
+      "group": "Group",
+      "channel": "Channel",
+      "status": "Status",
+      "broadcast": "Broadcast"
+    },
+    "tab": {
+      "chats": "Chats",
+      "channels": "Channels",
+      "status": "Status"
+    },
+    "status": {
+      "itemCount": "{{count}} update",
+      "itemCount_other": "{{count}} updates",
+      "empty": "No contacts have an active status.",
+      "loadError": "Failed to load statuses.",
+      "mediaUnavailable": "Media unavailable",
+      "compose": "Post a status",
+      "composeText": "Text",
+      "composeImage": "Image",
+      "recipients": "Who can see this",
+      "recipientsHint": "Baileys requires a recipient list; whatsapp-web.js uses your status-privacy audience.",
+      "noContacts": "No contacts found",
+      "caption": "Caption",
+      "backgroundColor": "Background color",
+      "font": "Font",
+      "fontDefault": "Default",
+      "orLabel": "or",
+      "post": "Post",
+      "posted": "Status posted",
+      "postFailed": "Could not post the status"
+    },
+    "channels": {
+      "notSupported": "Channels are not supported on the Baileys engine.",
+      "empty": "You are not subscribed to any channels yet.",
+      "notReady": "Session is not ready yet.",
+      "subscribers": "{{count}} subscriber",
+      "subscribers_other": "{{count}} subscribers"
+    },
     "errors": {
       "loadSessions": "Failed to load sessions",
       "loadChats": "Failed to load chats",
-      "loadMessages": "Failed to load messages",
       "markRead": "Failed to mark chat as read",
       "send": "Failed to send message",
       "react": "Failed to react to message",
@@ -152,10 +183,10 @@
     "title": "Dashboard",
     "subtitle": "Overview of your WhatsApp sessions and activity",
     "stats": {
-      "activeSessions": "Active Sessions",
+      "activeSessions": "Connected Sessions",
+      "sessionsDetail": "{{running}} running · {{total}} total",
       "messagesToday": "Messages Today",
       "webhooksConfigured": "Webhooks Configured",
-      "apiCalls": "API Calls (24h)",
       "totalMessages": "Total Messages"
     },
     "sessionsOverview": "Sessions Overview",
@@ -196,7 +227,10 @@
     "connecting": "Connecting...",
     "qr_ready": "Scan QR",
     "ready": "Connected",
-    "disconnected": "Disconnected"
+    "disconnected": "Disconnected",
+    "action_required": "Action required",
+    "failed": "Failed",
+    "authenticating": "Authenticating..."
   },
   "sessions": {
     "title": "Sessions",
@@ -243,7 +277,6 @@
       "step3": "<strong>3.</strong> Tap <strong>Link a Device</strong> and scan this QR",
       "autoRefresh": "QR updates automatically every 5 seconds",
       "generating": "Generating QR code...",
-      "unavailable": "QR code not available yet. Try again in a moment.",
       "preparing": "Preparing QR code...",
       "showQr": "Show QR",
       "loading": "Loading...",
@@ -264,6 +297,7 @@
       "start": "Start",
       "stop": "Stop",
       "reconnect": "Reconnect",
+      "unlink": "Unlink",
       "delete": "Delete",
       "killStuck": "Kill Stuck"
     },
@@ -272,6 +306,8 @@
       "readyDesc": "WhatsApp session is now connected",
       "disconnectedTitle": "Session Disconnected",
       "disconnectedDesc": "WhatsApp session was disconnected",
+      "actionRequiredTitle": "Action required",
+      "actionRequiredDesc": "This session needs your attention. Open the session to see what to do.",
       "failedTitle": "Session Failed",
       "failedDesc": "The WhatsApp session failed to start. Open the session to see the reason."
     },
@@ -290,6 +326,18 @@
       "success": "Session has been force-killed. You can restart it now.",
       "failedTitle": "Force-Kill Failed",
       "failed": "Failed to force-kill the session."
+    },
+    "unlink": {
+      "title": "Unlink Device",
+      "message": "Unlink session <strong>\"{{name}}\"</strong> from the WhatsApp account?",
+      "warning": "WhatsApp removes this device from the account's Linked Devices and the session stops. Reconnecting requires a fresh QR scan or pairing code. To also erase all local data, delete the session afterwards.",
+      "confirm": "Unlink",
+      "successTitle": "Device Unlinked",
+      "success": "WhatsApp removed the device from the account's Linked Devices. A fresh QR scan or pairing code is required to reconnect.",
+      "unconfirmedTitle": "Unlink Not Confirmed",
+      "unconfirmed": "The session stopped locally, but WhatsApp did not confirm the unlink — the device may still be listed under Linked Devices. Start the session and try again.",
+      "failedTitle": "Unlink Failed",
+      "failed": "Failed to unlink the session."
     },
     "pairing": {
       "tabQr": "QR Code",
@@ -530,7 +578,13 @@
       "image": "Image",
       "video": "Video",
       "audio": "Audio",
-      "document": "Document"
+      "document": "Document",
+      "location": "Location",
+      "contact": "Contact",
+      "sticker": "Sticker",
+      "poll": "Poll",
+      "forward": "Forward",
+      "bulk": "Bulk"
     },
     "messageContent": "Message Content",
     "messagePlaceholder": "Enter your message here...",
@@ -544,48 +598,66 @@
     "filename": "Filename",
     "captionPlaceholder": "Enter caption...",
     "filenamePlaceholder": "document.pdf",
+    "locationLatitude": "Latitude",
+    "locationLongitude": "Longitude",
+    "locationDescription": "Description",
+    "locationAddress": "Address",
+    "contactName": "Contact Name",
+    "contactNamePlaceholder": "Jane Doe",
+    "contactNumber": "Contact Number",
+    "pollQuestion": "Poll Question",
+    "pollQuestionPlaceholder": "Where should we meet?",
+    "pollOptions": "Poll Options",
+    "pollOptionPlaceholder": "Option {{index}}",
+    "pollOptionsHint": "Between 2 and 12 options",
+    "addOption": "Add Option",
+    "removeOption": "Remove option",
+    "allowMultipleAnswers": "Allow multiple answers",
+    "forwardFromChatId": "From Chat ID",
+    "forwardFromPlaceholder": "628123456789@c.us",
+    "forwardFromHint": "Leave empty to forward from the current recipient",
+    "forwardToChatId": "To Chat ID",
+    "forwardToPlaceholder": "Phone number or chat ID",
+    "forwardMessageId": "Message ID",
+    "forwardMessageIdHint": "ID of the message to forward",
+    "bulkRecipients": "Recipients",
+    "bulkRecipientsPlaceholder": "+62812345678",
+    "bulkRecipientsHint": "One phone number or chat ID per line (max 100)",
+    "bulkRecipientsCount": "Recipients: {{count}}",
+    "bulkDelay": "Delay Between Messages (ms)",
+    "bulkDelayHint": "1000–60000 ms (default 3000)",
     "send": "Send Message",
     "sending": "Sending...",
     "viewOnly": "View Only",
     "responseEmpty": "Send a message to see the API response",
-    "successLabel": "200 OK - Success",
-    "failedLabel": "400 - Failed",
+    "successLabel": "Success",
+    "failedLabel": "Failed",
     "response": {
       "timestamp": "Timestamp",
       "messageId": "Message ID",
+      "batchId": "Batch ID",
       "error": "Error"
     },
     "sendFailed": "Failed to send message",
-    "notOnWhatsApp": "This number is not registered on WhatsApp"
+    "notOnWhatsApp": "This number is not registered on WhatsApp",
+    "batch": {
+      "status": {
+        "pending": "Pending",
+        "processing": "Processing",
+        "completed": "Completed",
+        "cancelled": "Cancelled",
+        "failed": "Failed"
+      },
+      "progress": "Sent {{sent}} of {{total}} · {{failed}} failed · {{pending}} pending",
+      "cancel": "Cancel Batch",
+      "cancelling": "Cancelling..."
+    }
   },
   "infrastructure": {
     "title": "Infrastructure",
     "subtitle": "Configure server, database, cache, storage, and engine settings",
     "saveConfig": "Save Configuration",
     "saving": "Saving...",
-    "server": {
-      "title": "Server Configuration",
-      "production": "Production",
-      "development": "Development",
-      "environment": "Environment",
-      "domain": "Domain",
-      "apiPort": "API Port",
-      "dashboardPort": "Dashboard Port",
-      "corsOrigins": "CORS Origins",
-      "corsPlaceholder": "* or comma-separated origins",
-      "publicApiUrl": "Public API URL (optional)",
-      "publicDashboardUrl": "Public Dashboard URL (optional)"
-    },
-    "webhook": {
-      "title": "Webhook & Rate Limiting",
-      "settings": "Webhook Settings",
-      "timeout": "Timeout (ms)",
-      "maxRetries": "Max Retries",
-      "retryDelay": "Retry Delay (ms)",
-      "rateLimit": "Rate Limiting",
-      "window": "Time Window (seconds)",
-      "maxReq": "Max Requests per Window"
-    },
     "database": {
       "title": "Database Configuration",
       "sqlite": "SQLite",
@@ -608,7 +680,6 @@
     },
     "engine": {
       "title": "WhatsApp Engine",
-      "subtitle": "Choose and configure the WhatsApp connection engine.",
       "builtIn": "Built-in",
       "headless": "Headless Mode",
       "headlessDesc": "Run the browser without a visible UI (recommended for production).",
@@ -708,43 +779,29 @@
     "title": "Plugins",
     "subtitle": "Install, configure, and manage extensions",
     "refresh": "Refresh",
-    "engineCard": "Active WhatsApp Engine",
-    "running": "Running",
-    "supportedFeatures": "Supported Features:",
     "builtIn": "Built-in",
     "noDescription": "No description available",
-    "required": "Required",
-    "active": "Active",
-    "activate": "Activate",
     "enable": "Enable",
     "disable": "Disable",
     "healthCheck": "Health Check",
     "configure": "Configure",
-    "available": "Available",
     "install": "Install plugin",
     "uninstall": "Uninstall",
     "uninstallConfirm": "Uninstall \"{{name}}\"? This deletes its files.",
-    "engineSwitchHint": "To switch the active engine, set ENGINE_TYPE in the environment and restart the server",
     "empty": {
       "title": "No plugins installed",
       "description": "Install a plugin to extend what OpenWA can do."
     },
     "config": {
       "title": "Configure {{name}}",
-      "restartNotice": "Changes require server restart to take effect",
-      "engineType": "Engine Type",
-      "headless": "Headless Mode",
-      "headlessDesc": "Run browser without visible UI (recommended for production)",
-      "sessionDataPath": "Session Data Path",
-      "browserArgs": "Browser Arguments",
       "noOptions": "No configuration options available for this plugin",
+      "uiHandshakeError": "The plugin configuration UI did not initialize. Use the schema form below if available.",
       "save": "Save Configuration",
       "addItem": "Add",
       "tabConfig": "Configuration",
       "tabSessions": "Sessions"
     },
     "rail": {
-      "engine": "Active engine",
       "enabled": "enabled",
       "installed": "installed",
       "active": "Active plugins",
@@ -754,7 +811,12 @@
       "title": "Install a plugin",
       "hint": "Upload a plugin packaged as a .zip (with a manifest.json). It runs sandboxed once enabled.",
       "choose": "Choose a .zip file…",
-      "tooLarge": "The file exceeds the 5 MB limit."
+      "tooLarge": "The file exceeds the 5 MB limit.",
+      "catalogHint": "Install directly from the OpenWA plugin catalog. The .zip is fetched server-side through the SSRF guard, then validated and sandboxed.",
+      "catalogTeaser": "Looking for plugins?",
+      "catalogTeaserSuffix": "browses the official marketplace.",
+      "tabCatalog": "Catalog",
+      "tabUpload": "Upload .zip"
     },
     "toasts": {
       "errorTitle": "Plugin Error",
@@ -768,7 +830,12 @@
       "installed": "Plugin installed",
       "installFailed": "Install failed",
       "uninstalled": "Plugin uninstalled",
-      "uninstallFailed": "Uninstall failed"
+      "uninstallFailed": "Uninstall failed",
+      "enableFailedTitle": "Enable failed",
+      "disableFailedTitle": "Disable failed",
+      "configRequiredTitle": "Configuration required",
+      "configRequiredDesc": "Fill in the required field(s) before enabling: {{fields}}",
+      "updateFailed": "Update failed"
     },
     "sessions": {
       "activationTitle": "Run for",
@@ -800,6 +867,9 @@
         "sessionScopePlaceholder": "Leave blank for all sessions",
         "verifyToken": "Verify token (optional)",
         "verifyTokenPlaceholder": "Token the provider echoes on verification",
+        "secret": "Ingress secret (optional)",
+        "secretPlaceholder": "Provider's webhook secret (e.g. Chatwoot)",
+        "secretHint": "Leave blank to auto-generate (shown once). If the provider fixes its own webhook secret, paste it here — an auto-generated secret won't match.",
         "config": "Config (optional JSON)",
         "configPlaceholder": "{ }"
       },
@@ -814,7 +884,9 @@
         "confirm": "Regenerate the signing secret for {{id}}? The current secret stops working immediately.",
         "action": "Regenerate"
       },
-      "edit": { "title": "Edit {{id}}" },
+      "edit": {
+        "title": "Edit {{id}}"
+      },
       "delete": {
         "title": "Delete instance",
         "confirm": "Delete instance {{id}}? Its ingress URL and secret stop working immediately.",
@@ -832,6 +904,7 @@
       "errors": {
         "invalidId": "Instance ID must be letters, numbers, hyphens or underscores (max 64).",
         "invalidJson": "Config must be valid JSON.",
+        "invalidSecret": "Secret must be at least 16 characters, or leave blank to auto-generate.",
         "duplicateId": "An instance with that ID already exists."
       },
       "toasts": {
@@ -841,6 +914,17 @@
         "secretRegenerated": "Secret regenerated",
         "actionFailed": "Action failed"
       }
+    },
+    "catalog": {
+      "empty": "No plugins in the catalog.",
+      "install": "Install",
+      "installed": "Installed",
+      "noDownload": "This catalog entry has no download URL.",
+      "noMatch": "No plugins match your search.",
+      "searchPlaceholder": "Search plugins…",
+      "update": "Update",
+      "updateAvailable": "Update available",
+      "updated": "Plugin updated"
     }
   },
   "search": {
@@ -849,7 +933,9 @@
     "empty": "No messages found.",
     "error": "Search failed. Try again.",
     "unavailable": "Search is not configured.",
-    "scope": { "current": "This session" },
+    "scope": {
+      "current": "This session"
+    },
     "loading": "Searching…"
   }
 }

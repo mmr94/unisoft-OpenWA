@@ -12,14 +12,18 @@
             "schema": {
               "enum": [
                 "api_key_created",
+                "api_key_updated",
                 "api_key_used",
                 "api_key_revoked",
                 "api_key_deleted",
                 "api_key_auth_failed",
+                "rate_limit_exceeded",
+                "queue_board_mutated",
                 "session_created",
                 "session_started",
                 "session_stopped",
                 "session_force_killed",
+                "session_logged_out",
                 "session_deleted",
                 "session_qr_generated",
                 "session_connected",
@@ -35,7 +39,14 @@
                 "integration_instance_created",
                 "integration_instance_updated",
                 "integration_instance_secret_regenerated",
-                "integration_instance_deleted"
+                "integration_instance_deleted",
+                "integration_instance_redriven",
+                "infra_config_saved",
+                "infra_restart_requested",
+                "infra_data_exported",
+                "infra_data_imported",
+                "infra_storage_exported",
+                "infra_storage_imported"
               ],
               "type": "string"
             }
@@ -214,6 +225,9 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "The change would remove the last usable admin key."
           }
         },
         "summary": "Update API key (admin only)",
@@ -236,6 +250,9 @@
         "responses": {
           "204": {
             "description": "API key deleted"
+          },
+          "409": {
+            "description": "The key is the last usable admin key."
           }
         },
         "summary": "Delete API key (admin only)",
@@ -267,6 +284,9 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "The key is the last usable admin key."
           }
         },
         "summary": "Revoke API key (admin only)",
@@ -549,6 +569,48 @@
         ]
       }
     },
+    "/api/sessions/{id}/logout": {
+      "post": {
+        "description": "Asks WhatsApp to remove this companion device, so it disappears from the account holder's Linked Devices list, then tears the session down. Unlike stop and delete — which only release the session locally and leave the device linked on the phone — reconnecting after a logout always requires a fresh QR scan or pairing code.",
+        "operationId": "SessionController_logout",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session logged out",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started"
+          },
+          "404": {
+            "description": "Session not found"
+          },
+          "502": {
+            "description": "Session was stopped locally, but WhatsApp did not confirm the device unlink — retryable"
+          }
+        },
+        "summary": "Log out of WhatsApp (unlinks this device) and stop the session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/api/sessions/{id}/force-kill": {
       "post": {
         "operationId": "SessionController_forceKill",
@@ -753,7 +815,17 @@
         ],
         "responses": {
           "200": {
-            "description": "List of active chats (most recent first)"
+            "description": "List of active chats (most recent first)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ChatSummaryDto"
+                  }
+                }
+              }
+            }
           },
           "400": {
             "description": "Session not ready"
@@ -1300,7 +1372,7 @@
             "name": "from",
             "required": false,
             "in": "query",
-            "description": "Filter by sender. A phone also matches messages from a lid that resolves to it.",
+            "description": "Filter by sender. A phone also matches group messages via the author field and any lid that resolves to it.",
             "schema": {
               "type": "string"
             }
@@ -2044,6 +2116,57 @@
         ]
       }
     },
+    "/api/sessions/{sessionId}/messages/edit": {
+      "post": {
+        "operationId": "MessageController_edit",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditMessageDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Message edited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session not active, invalid request, or the send was blocked by a plugin"
+          },
+          "403": {
+            "description": "The message was not sent by this account, or the engine refused the edit"
+          },
+          "404": {
+            "description": "Message not found"
+          }
+        },
+        "summary": "Edit the text of a message sent by this account",
+        "tags": [
+          "messages"
+        ]
+      }
+    },
     "/api/sessions/{sessionId}/messages/send-bulk": {
       "post": {
         "operationId": "MessageController_sendBulk",
@@ -2154,7 +2277,7 @@
             "description": "Batch cancelled"
           },
           "400": {
-            "description": "Batch already completed or cancelled"
+            "description": "Batch already completed, cancelled, or failed (terminal statuses are exclusive)"
           },
           "404": {
             "description": "Batch not found"
@@ -2519,7 +2642,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "string"
+                "$ref": "#/components/schemas/SaveConfigDto"
               }
             }
           }
@@ -2539,6 +2662,16 @@
       "post": {
         "operationId": "InfraController_requestRestart",
         "parameters": [],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RestartDto"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Server will restart with new profiles"
@@ -2593,6 +2726,14 @@
               "schema": {
                 "type": "object",
                 "properties": {
+                  "force": {
+                    "type": "boolean",
+                    "description": "Allow the replace to proceed even while engines are running for sessions the backup does not contain (they keep running until restart; see restartRequired). Prefer stopOrphans, which closes that window inside this request instead."
+                  },
+                  "stopOrphans": {
+                    "type": "boolean",
+                    "description": "Stop the running engines for sessions the backup does not contain, inside this request and before the replace runs. Supersedes force for the orphan case: with stopOrphans the engines no longer need a process restart to reconcile, so restartRequired stays false on the success path."
+                  },
                   "tables": {
                     "type": "object",
                     "properties": {
@@ -2607,6 +2748,9 @@
                       },
                       "messageBatches": {
                         "type": "array"
+                      },
+                      "statusUpdates": {
+                        "type": "array"
                       }
                     }
                   }
@@ -2618,6 +2762,9 @@
         "responses": {
           "200": {
             "description": "Data imported successfully"
+          },
+          "409": {
+            "description": "Refused: live engines exist for sessions the backup would remove (retry with stopOrphans=true to stop them in-request, or force=true to proceed and restart after)"
           }
         },
         "summary": "Import data to Data DB (replaces existing data)",
@@ -2726,6 +2873,41 @@
           }
         },
         "summary": "Get all contacts for a session",
+        "tags": [
+          "contacts"
+        ]
+      }
+    },
+    "/api/sessions/{sessionId}/contacts/profile-pictures": {
+      "get": {
+        "description": "One request for a whole chat sidebar — avoids the burst of parallel single fetches that would exhaust the per-IP throttle. Engine lookups run 3 at a time; per-id failures return null.",
+        "operationId": "ContactController_getProfilePictures",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ids",
+            "required": true,
+            "in": "query",
+            "description": "Comma-separated contact ids (max 50 used)",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "summary": "Batch-resolve profile picture URLs for up to 50 contacts",
         "tags": [
           "contacts"
         ]
@@ -2974,6 +3156,135 @@
         ]
       }
     },
+    "/api/sessions/{sessionId}/groups/join": {
+      "post": {
+        "operationId": "GroupController_join",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JoinGroupDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Joined the group"
+          },
+          "400": {
+            "description": "Invalid or expired invite code, or session is not started"
+          }
+        },
+        "summary": "Join a group via invite code",
+        "tags": [
+          "groups"
+        ]
+      }
+    },
+    "/api/sessions/{sessionId}/groups/{groupId}/settings": {
+      "get": {
+        "operationId": "GroupController_getSettings",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "groupId",
+            "required": true,
+            "in": "path",
+            "description": "Group ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Group settings"
+          },
+          "404": {
+            "description": "Group not found"
+          }
+        },
+        "summary": "Get group settings (announce / locked / ephemeral timer)",
+        "tags": [
+          "groups"
+        ]
+      },
+      "put": {
+        "operationId": "GroupController_updateSettings",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "groupId",
+            "required": true,
+            "in": "path",
+            "description": "Group ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GroupSettingsDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Group settings updated"
+          },
+          "400": {
+            "description": "No setting provided, or a value is not a boolean"
+          },
+          "403": {
+            "description": "The engine refused the change (the account is not a group admin)"
+          },
+          "404": {
+            "description": "Group not found"
+          },
+          "501": {
+            "description": "The active engine does not support a requested setting"
+          }
+        },
+        "summary": "Update group settings (announce / locked / ephemeral timer)",
+        "tags": [
+          "groups"
+        ]
+      }
+    },
     "/api/sessions/{sessionId}/groups": {
       "post": {
         "operationId": "GroupController_create",
@@ -3044,7 +3355,7 @@
         },
         "responses": {
           "200": {
-            "description": "Participants added"
+            "description": "Participants processed — `results` carries the per-participant outcome (a partial refusal does not fail the batch; a total refusal is an error)"
           }
         },
         "summary": "Add participants to a group",
@@ -3086,7 +3397,7 @@
         },
         "responses": {
           "200": {
-            "description": "Participants removed"
+            "description": "Participants processed — `results` carries the per-participant outcome (a partial refusal does not fail the batch; a total refusal is an error)"
           }
         },
         "summary": "Remove participants from a group",
@@ -3130,7 +3441,7 @@
         },
         "responses": {
           "200": {
-            "description": "Participants promoted"
+            "description": "Participants processed — `results` carries the per-participant outcome (a partial refusal does not fail the batch; a total refusal is an error)"
           }
         },
         "summary": "Promote participants to admin",
@@ -3174,7 +3485,7 @@
         },
         "responses": {
           "200": {
-            "description": "Participants demoted"
+            "description": "Participants processed — `results` carries the per-participant outcome (a partial refusal does not fail the batch; a total refusal is an error)"
           }
         },
         "summary": "Demote participants from admin",
@@ -3370,6 +3681,169 @@
         "summary": "Revoke group invite code and generate new one",
         "tags": [
           "groups"
+        ]
+      }
+    },
+    "/api/sessions/{sessionId}/profile/name": {
+      "put": {
+        "operationId": "ProfileController_setName",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProfileNameDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Profile name updated"
+          },
+          "400": {
+            "description": "Session is not started"
+          },
+          "403": {
+            "description": "The engine refused the name change"
+          }
+        },
+        "summary": "Set the account display name",
+        "tags": [
+          "profile"
+        ]
+      }
+    },
+    "/api/sessions/{sessionId}/profile/status": {
+      "put": {
+        "operationId": "ProfileController_setStatus",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProfileStatusDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Profile status updated"
+          },
+          "400": {
+            "description": "Session is not started"
+          }
+        },
+        "summary": "Set the account about/status text",
+        "tags": [
+          "profile"
+        ]
+      }
+    },
+    "/api/sessions/{sessionId}/profile/picture": {
+      "put": {
+        "operationId": "ProfileController_setPicture",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProfilePictureDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Profile picture updated"
+          },
+          "400": {
+            "description": "Neither url nor base64 provided, base64 without mimetype, or session is not started"
+          },
+          "403": {
+            "description": "The engine refused the picture change"
+          },
+          "413": {
+            "description": "Decoded base64 image exceeds the configured media cap"
+          }
+        },
+        "summary": "Set the account profile picture (URL or base64 image)",
+        "tags": [
+          "profile"
+        ]
+      }
+    },
+    "/api/sessions/{sessionId}/calls/{callId}/reject": {
+      "post": {
+        "operationId": "CallController_reject",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "callId",
+            "required": true,
+            "in": "path",
+            "description": "Call ID from the call.received event",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Call rejected"
+          },
+          "400": {
+            "description": "Session is not started"
+          },
+          "404": {
+            "description": "Call not found or no longer ringing"
+          }
+        },
+        "summary": "Reject a ringing incoming call",
+        "tags": [
+          "calls"
         ]
       }
     },
@@ -3698,7 +4172,7 @@
             "name": "limit",
             "required": false,
             "in": "query",
-            "description": "Max messages to return (default 50)",
+            "description": "Max messages to return (default 50, max 100)",
             "schema": {
               "type": "number"
             }
@@ -3814,6 +4288,32 @@
         ]
       }
     },
+    "/api/metrics": {
+      "get": {
+        "operationId": "MetricsController_scrape",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Prometheus exposition text"
+          },
+          "401": {
+            "description": "METRICS_TOKEN is configured but the bearer is missing or wrong"
+          },
+          "404": {
+            "description": "Metrics endpoint is disabled (METRICS_TOKEN unset)"
+          }
+        },
+        "security": [
+          {
+            "metrics-bearer": []
+          }
+        ],
+        "summary": "Prometheus metrics (requires METRICS_TOKEN bearer)",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
     "/api/sessions/{sessionId}/status": {
       "get": {
         "operationId": "StatusController_getStatuses",
@@ -3870,6 +4370,41 @@
         ]
       }
     },
+    "/api/sessions/{sessionId}/status/{statusId}/media": {
+      "get": {
+        "operationId": "StatusController_getStatusMedia",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "statusId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The status image/video bytes."
+          },
+          "404": {
+            "description": "No stored media (text status, omitted, or expired)."
+          }
+        },
+        "summary": "Stream a stored status media file",
+        "tags": [
+          "status"
+        ]
+      }
+    },
     "/api/sessions/{sessionId}/status/send-text": {
       "post": {
         "operationId": "StatusController_sendTextStatus",
@@ -3895,10 +4430,13 @@
         },
         "responses": {
           "201": {
-            "description": "Text status posted to the specified recipients."
+            "description": "Text status posted. The recipients allow-list is honored on Baileys only; whatsapp-web.js broadcasts to the account's status-privacy audience."
+          },
+          "400": {
+            "description": "Invalid request, or the post was blocked by a plugin."
           }
         },
-        "summary": "Post a text status (Baileys only)",
+        "summary": "Post a text status",
         "tags": [
           "status"
         ]
@@ -3929,10 +4467,16 @@
         },
         "responses": {
           "201": {
-            "description": "Image status posted to the specified recipients."
+            "description": "Image status posted. The recipients allow-list is honored on Baileys only; whatsapp-web.js broadcasts to the account's status-privacy audience."
+          },
+          "400": {
+            "description": "Neither url nor base64 provided, or the post was blocked by a plugin."
+          },
+          "413": {
+            "description": "Base64 media exceeds MEDIA_DOWNLOAD_MAX_BYTES."
           }
         },
-        "summary": "Post an image status (Baileys only)",
+        "summary": "Post an image status",
         "tags": [
           "status"
         ]
@@ -3963,10 +4507,16 @@
         },
         "responses": {
           "201": {
-            "description": "Video status posted to the specified recipients."
+            "description": "Video status posted. The recipients allow-list is honored on Baileys only; whatsapp-web.js broadcasts to the account's status-privacy audience."
+          },
+          "400": {
+            "description": "Neither url nor base64 provided, or the post was blocked by a plugin."
+          },
+          "413": {
+            "description": "Base64 media exceeds MEDIA_DOWNLOAD_MAX_BYTES."
           }
         },
-        "summary": "Post a video status (Baileys only)",
+        "summary": "Post a video status",
         "tags": [
           "status"
         ]
@@ -4018,11 +4568,11 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "Business catalog metadata for the session."
+          "501": {
+            "description": "Not supported: neither engine implements catalog reads."
           }
         },
-        "summary": "Get business catalog info",
+        "summary": "Get business catalog info (not implemented by any engine)",
         "tags": [
           "catalog"
         ]
@@ -4064,11 +4614,11 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "Paginated list of catalog products."
+          "501": {
+            "description": "Not supported: neither engine implements catalog reads."
           }
         },
-        "summary": "List catalog products",
+        "summary": "List catalog products (not implemented by any engine)",
         "tags": [
           "catalog"
         ]
@@ -4096,11 +4646,11 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "The requested catalog product."
+          "501": {
+            "description": "Not supported: neither engine implements catalog reads."
           }
         },
-        "summary": "Get a specific product",
+        "summary": "Get a specific product (not implemented by any engine)",
         "tags": [
           "catalog"
         ]
@@ -4130,11 +4680,11 @@
           }
         },
         "responses": {
-          "201": {
-            "description": "Product message sent."
+          "501": {
+            "description": "Not supported by the active engine: no engine can send product messages."
           }
         },
-        "summary": "Send a product message",
+        "summary": "Send a product message (not supported by any engine)",
         "tags": [
           "catalog"
         ]
@@ -4164,11 +4714,11 @@
           }
         },
         "responses": {
-          "201": {
-            "description": "Catalog link sent."
+          "501": {
+            "description": "Not supported by the active engine: no engine can send catalog links."
           }
         },
-        "summary": "Send catalog link",
+        "summary": "Send catalog link (not supported by any engine)",
         "tags": [
           "catalog"
         ]
@@ -4991,7 +5541,7 @@
         ],
         "responses": {
           "201": {
-            "description": "Dead-lettered ingress deliveries for the instance re-dispatched. Returns the count redriven."
+            "description": "One bounded batch of dead-lettered ingress deliveries re-dispatched, with remaining depth."
           }
         },
         "tags": [
@@ -5341,7 +5891,7 @@
   "info": {
     "title": "OpenWA API",
     "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API",
-    "version": "0.8.17",
+    "version": "0.11.1",
     "contact": {
       "name": "OpenWA",
       "url": "https://github.com/rmyndharis/OpenWA",
@@ -5386,6 +5936,18 @@
       "description": "Status/Stories"
     },
     {
+      "name": "calls",
+      "description": "Call handling"
+    },
+    {
+      "name": "profile",
+      "description": "Own profile management"
+    },
+    {
+      "name": "search",
+      "description": "Global message search"
+    },
+    {
       "name": "statistics",
       "description": "Usage statistics"
     },
@@ -5426,13 +5988,33 @@
       "description": "Health check endpoints"
     }
   ],
-  "servers": [],
+  "servers": [
+    {
+      "url": "http://{host}:{port}",
+      "description": "OpenWA instance",
+      "variables": {
+        "host": {
+          "default": "localhost"
+        },
+        "port": {
+          "default": "2785",
+          "description": "PORT env var"
+        }
+      }
+    }
+  ],
   "components": {
     "securitySchemes": {
       "X-API-Key": {
         "type": "apiKey",
         "in": "header",
         "name": "X-API-Key"
+      },
+      "metrics-bearer": {
+        "scheme": "bearer",
+        "bearerFormat": "opaque",
+        "type": "http",
+        "description": "METRICS_TOKEN for the GET /api/metrics scrape endpoint"
       }
     },
     "schemas": {
@@ -5659,11 +6241,12 @@
           },
           "config": {
             "type": "object",
-            "description": "Session configuration options. Supported keys: maxReconnectAttempts (number), reconnectBaseDelay (ms), keepAlive (boolean — exclude this session from idle hibernation), idleTimeoutMs (number — per-session override of the global idle window before hibernation).",
+            "description": "Session configuration options. Supported keys: maxReconnectAttempts (number), reconnectBaseDelay (ms), keepAlive (boolean — exclude this session from idle hibernation), idleTimeoutMs (number — per-session override of the global idle window before hibernation), autoRejectCalls (boolean, default false — automatically reject incoming calls; the call.received event is still emitted).",
             "example": {
               "autoReconnect": true,
               "keepAlive": false,
-              "idleTimeoutMs": 5400000
+              "idleTimeoutMs": 5400000,
+              "autoRejectCalls": false
             }
           },
           "proxyUrl": {
@@ -5706,6 +6289,7 @@
               "authenticating",
               "ready",
               "disconnected",
+              "action_required",
               "failed",
               "hibernated"
             ],
@@ -5750,7 +6334,7 @@
           },
           "lastError": {
             "type": "string",
-            "description": "Human-readable reason for the most recent terminal engine failure (only set when status is FAILED).",
+            "description": "Human-readable reason carried while the status is FAILED (a terminal engine failure) or ACTION_REQUIRED (the engine is running but something needs a human). Cleared on any other status.",
             "example": "Failed to launch the browser process: spawn /usr/bin/chromium ENOENT",
             "nullable": true
           }
@@ -5780,6 +6364,7 @@
               "authenticating",
               "ready",
               "disconnected",
+              "action_required",
               "failed",
               "hibernated"
             ],
@@ -5821,6 +6406,58 @@
         "required": [
           "pairingCode",
           "status"
+        ]
+      },
+      "ChatSummaryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "example": "628111@c.us"
+          },
+          "name": {
+            "type": "string",
+            "example": "Alice"
+          },
+          "isGroup": {
+            "type": "boolean",
+            "description": "Retained for back-compat; true for @g.us chats.",
+            "example": false
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "individual",
+              "group",
+              "channel",
+              "status",
+              "broadcast",
+              "unknown"
+            ],
+            "description": "User-facing chat kind.",
+            "example": "individual"
+          },
+          "unreadCount": {
+            "type": "number",
+            "example": 1
+          },
+          "timestamp": {
+            "type": "number",
+            "description": "Unix seconds of the last activity.",
+            "example": 1700000010
+          },
+          "lastMessage": {
+            "type": "string",
+            "example": "hi"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "isGroup",
+          "kind",
+          "unreadCount",
+          "timestamp"
         ]
       },
       "MarkChatReadDto": {
@@ -5898,6 +6535,8 @@
                 "message.failed",
                 "message.revoked",
                 "message.reaction",
+                "message.edited",
+                "status.received",
                 "session.status",
                 "session.qr",
                 "session.authenticated",
@@ -5906,6 +6545,7 @@
                 "group.join",
                 "group.leave",
                 "group.update",
+                "call.received",
                 "*"
               ]
             }
@@ -6041,6 +6681,8 @@
                 "message.failed",
                 "message.revoked",
                 "message.reaction",
+                "message.edited",
+                "status.received",
                 "session.status",
                 "session.qr",
                 "session.authenticated",
@@ -6049,6 +6691,7 @@
                 "group.join",
                 "group.leave",
                 "group.update",
+                "call.received",
                 "*"
               ]
             }
@@ -6126,7 +6769,7 @@
         "properties": {
           "messageId": {
             "type": "string",
-            "description": "The message id, assigned when the gateway accepts the message for sending. A 201 here means the message was handed to the WhatsApp client — it does NOT confirm delivery. WhatsApp does not reject an unregistered recipient synchronously, so a message to a number that is not on WhatsApp still returns 201 with a valid messageId but never delivers. To confirm a number is on WhatsApp before sending, use GET /api/sessions/{sessionId}/contacts/check/{number}; track real delivery via the message `status` field (sent → delivered → read).",
+            "description": "The message id, assigned when the gateway accepts the message for sending. A 201 here means the message was handed to the WhatsApp client — it does NOT confirm delivery. WhatsApp does not reject an unregistered recipient synchronously, so a message to a number that is not on WhatsApp still returns 201 with a valid messageId; whether it later delivers, stalls, or is reported as an error reaches you asynchronously, if at all. To confirm a number is on WhatsApp before sending, use GET /api/sessions/{sessionId}/contacts/check/{number}; track real delivery via the message `status` field (sent → delivered → read, or failed if WhatsApp reports an error for it). A message resting at `sent` is not diagnostic on its own: a registered recipient whose device has not come online since the send stays at `sent` too.",
             "example": "true_628123456789@c.us_3EB0123456789"
           },
           "timestamp": {
@@ -6437,6 +7080,27 @@
           "messageId"
         ]
       },
+      "EditMessageDto": {
+        "type": "object",
+        "properties": {
+          "chatId": {
+            "type": "string"
+          },
+          "messageId": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string",
+            "description": "New text body for the message",
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "chatId",
+          "messageId",
+          "body"
+        ]
+      },
       "BulkMediaDto": {
         "type": "object",
         "properties": {
@@ -6575,7 +7239,7 @@
             "description": "Custom batch ID (auto-generated if not provided)"
           },
           "messages": {
-            "description": "Array of messages (max 100 per request)",
+            "description": "Array of messages (max 100 per request; exact duplicate entries are collapsed — first occurrence wins)",
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/BulkMessageItemDto"
@@ -6719,6 +7383,200 @@
           }
         }
       },
+      "DatabaseConfigDto": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "sqlite",
+              "postgres"
+            ]
+          },
+          "builtIn": {
+            "type": "boolean"
+          },
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "poolSize": {
+            "type": "number"
+          },
+          "sslEnabled": {
+            "type": "boolean"
+          },
+          "sslRejectUnauthorized": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "RedisConfigDto": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "builtIn": {
+            "type": "boolean"
+          },
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          }
+        }
+      },
+      "QueueConfigDto": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "StorageConfigDto": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "local",
+              "s3"
+            ]
+          },
+          "builtIn": {
+            "type": "boolean"
+          },
+          "localPath": {
+            "type": "string"
+          },
+          "s3Bucket": {
+            "type": "string"
+          },
+          "s3Region": {
+            "type": "string"
+          },
+          "s3AccessKey": {
+            "type": "string"
+          },
+          "s3SecretKey": {
+            "type": "string"
+          },
+          "s3Endpoint": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "EngineConfigDto": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "headless": {
+            "type": "boolean"
+          },
+          "sessionDataPath": {
+            "type": "string"
+          },
+          "browserArgs": {
+            "type": "string"
+          }
+        }
+      },
+      "SaveConfigDto": {
+        "type": "object",
+        "properties": {
+          "database": {
+            "$ref": "#/components/schemas/DatabaseConfigDto"
+          },
+          "redis": {
+            "$ref": "#/components/schemas/RedisConfigDto"
+          },
+          "queue": {
+            "$ref": "#/components/schemas/QueueConfigDto"
+          },
+          "storage": {
+            "$ref": "#/components/schemas/StorageConfigDto"
+          },
+          "engine": {
+            "$ref": "#/components/schemas/EngineConfigDto"
+          }
+        }
+      },
+      "RestartDto": {
+        "type": "object",
+        "properties": {
+          "profiles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "profilesToRemove": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "JoinGroupDto": {
+        "type": "object",
+        "properties": {
+          "inviteCode": {
+            "type": "string",
+            "description": "Group invite code (the token from a https://chat.whatsapp.com/<code> link)",
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "inviteCode"
+        ]
+      },
+      "GroupSettingsDto": {
+        "type": "object",
+        "properties": {
+          "announce": {
+            "type": "boolean",
+            "description": "Only admins can send messages (announce group)"
+          },
+          "locked": {
+            "type": "boolean",
+            "description": "Only admins can edit group info (locked group)"
+          },
+          "ephemeralSeconds": {
+            "type": "number",
+            "description": "Disappearing-messages timer in seconds; 0 disables. Known values: 86400 (24h), 604800 (7d), 7776000 (90d)",
+            "minimum": 0
+          }
+        }
+      },
       "CreateGroupDto": {
         "type": "object",
         "properties": {
@@ -6729,6 +7587,7 @@
           },
           "participants": {
             "description": "Participant WhatsApp IDs (e.g. 628123456789@c.us)",
+            "maxItems": 256,
             "type": "array",
             "items": {
               "type": "string"
@@ -6745,6 +7604,7 @@
         "properties": {
           "participants": {
             "description": "Participant WhatsApp IDs (e.g. 628123456789@c.us)",
+            "maxItems": 256,
             "type": "array",
             "items": {
               "type": "string"
@@ -6781,6 +7641,51 @@
           "description"
         ]
       },
+      "SetProfileNameDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "New display name (WhatsApp limit: 25 characters)",
+            "maxLength": 25
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "SetProfileStatusDto": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "description": "New about/status text (may be empty to clear it; WhatsApp limit: 139 characters)",
+            "maxLength": 139
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "SetProfilePictureDto": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Image URL (http/https)",
+            "example": "https://example.com/avatar.jpg"
+          },
+          "base64": {
+            "type": "string",
+            "description": "Base64 encoded image data"
+          },
+          "mimetype": {
+            "type": "string",
+            "description": "Image MIME type (required when using base64)",
+            "example": "image/jpeg"
+          }
+        }
+      },
       "SendTextStatusDto": {
         "type": "object",
         "properties": {
@@ -6797,17 +7702,24 @@
           },
           "font": {
             "type": "number",
-            "description": "Font family index (0–5).",
+            "description": "Font family index from the WhatsApp status font enum: 0 (default), 1, 2, 6 (bold), 7, 8, 9, or 10. whatsapp-web.js honors only 0–7 and clamps anything above to the default.",
             "example": 0,
-            "minimum": 0,
-            "maximum": 5
+            "enum": [
+              0,
+              1,
+              2,
+              6,
+              7,
+              8,
+              9,
+              10
+            ]
           },
           "recipients": {
-            "description": "Recipient JIDs (1–256). WhatsApp Status is not posted to a group — use @c.us or @lid individuals.",
+            "description": "Recipient JIDs (0–256). WhatsApp Status is not posted to a group — use @c.us or @lid individuals. Required on the Baileys engine (it posts to exactly this allow-list); ignored by whatsapp-web.js, which broadcasts to the account's status-privacy audience — omit it there.",
             "example": [
               "628123456789@c.us"
             ],
-            "minItems": 1,
             "maxItems": 256,
             "type": "array",
             "items": {
@@ -6816,8 +7728,7 @@
           }
         },
         "required": [
-          "text",
-          "recipients"
+          "text"
         ]
       },
       "StatusMediaInput": {
@@ -6831,7 +7742,7 @@
           "base64": {
             "type": "string",
             "description": "Base64-encoded media. Requires mimetype.",
-            "example": "data:image/jpeg;base64,..."
+            "example": "/9j/4AAQSkZJRg..."
           },
           "mimetype": {
             "type": "string",
@@ -6858,11 +7769,10 @@
             "maxLength": 1024
           },
           "recipients": {
-            "description": "Recipient JIDs (1–256), @c.us or @lid.",
+            "description": "Recipient JIDs (0–256), @c.us or @lid. Required on the Baileys engine (it posts to exactly this allow-list); ignored by whatsapp-web.js, which broadcasts to the account's status-privacy audience — omit it there.",
             "example": [
               "628123456789@c.us"
             ],
-            "minItems": 1,
             "maxItems": 256,
             "type": "array",
             "items": {
@@ -6871,8 +7781,7 @@
           }
         },
         "required": [
-          "image",
-          "recipients"
+          "image"
         ]
       },
       "SendVideoStatusDto": {
@@ -6893,11 +7802,10 @@
             "maxLength": 1024
           },
           "recipients": {
-            "description": "Recipient JIDs (1–256), @c.us or @lid.",
+            "description": "Recipient JIDs (0–256), @c.us or @lid. Required on the Baileys engine (it posts to exactly this allow-list); ignored by whatsapp-web.js, which broadcasts to the account's status-privacy audience — omit it there.",
             "example": [
               "628123456789@c.us"
             ],
-            "minItems": 1,
             "maxItems": 256,
             "type": "array",
             "items": {
@@ -6906,8 +7814,7 @@
           }
         },
         "required": [
-          "video",
-          "recipients"
+          "video"
         ]
       },
       "SendProductDto": {
@@ -6957,7 +7864,7 @@
         "properties": {
           "url": {
             "type": "string",
-            "description": "HTTP(S) URL of the plugin .zip to download and install"
+            "description": "HTTPS URL of the plugin .zip to download and install. Plain http:// is rejected: the package is executable code, so it must be integrity-protected in transit (hosts on private networks remain subject to the SSRF guard). Optional content pinning: append `#sha256=<64 hex>` (fragment — never sent to the server; query params are ignored) to require the downloaded archive to match that digest; a mismatch fails the install."
           }
         },
         "required": [
@@ -7196,7 +8103,7 @@
           },
           "config": {
             "type": "object",
-            "description": "Per-instance config slice passed to the adapter, or null.",
+            "description": "Per-instance config slice passed to the adapter, or null. Fields flagged `secret` in the plugin's config schema are masked ('***') on EVERY response — including create/regenerate-secret; only the ingress secret and verifyToken are ever revealed once.",
             "nullable": true
           },
           "enabled": {

@@ -7,25 +7,17 @@
   },
   "common": {
     "appName": "OpenWA",
-    "appSubtitle": "واجهة برمجة واتساب",
     "loading": "جارٍ التحميل...",
-    "save": "حفظ",
     "cancel": "إلغاء",
     "delete": "حذف",
-    "edit": "تعديل",
     "create": "إنشاء",
     "close": "إغلاق",
     "showApiKey": "إظهار مفتاح API",
     "hideApiKey": "إخفاء مفتاح API",
-    "submit": "إرسال",
-    "confirm": "تأكيد",
     "search": "بحث",
-    "filter": "تصفية",
-    "actions": "إجراءات",
     "status": "الحالة",
     "name": "الاسم",
     "role": "الدور",
-    "type": "النوع",
     "url": "الرابط",
     "port": "المنفذ",
     "host": "المضيف",
@@ -33,8 +25,6 @@
     "password": "كلمة المرور",
     "active": "نشط",
     "inactive": "غير نشط",
-    "enabled": "مفعّل",
-    "disabled": "معطّل",
     "connected": "متصل",
     "disconnected": "غير متصل",
     "never": "أبداً",
@@ -43,8 +33,6 @@
     "hoursAgo": "منذ {{count}} ساعة",
     "optional": "اختياري",
     "language": "اللغة",
-    "english": "English",
-    "hebrew": "עברית",
     "back": "رجوع",
     "next": "التالي",
     "previous": "السابق",
@@ -63,7 +51,7 @@
     "label": "المظهر: {{value}}",
     "appearance": "المظهر",
     "mode": "الوضع",
-    "palette": "لوحة الألوان"
+    "toggleTo": "التبديل إلى {{value}}"
   },
   "nav": {
     "dashboard": "لوحة التحكم",
@@ -96,6 +84,11 @@
     "loadingChats": "جارٍ تحميل المحادثات...",
     "empty": "لا توجد محادثات",
     "noMessageYet": "لا توجد رسائل بعد",
+    "unreadBadge": "{{count}} رسالة غير مقروءة",
+    "unreadBadge_other": "{{count}} رسالة غير مقروءة",
+    "unreadBadge_two": "{{count}} رسالتان غير مقروءتان",
+    "unreadBadge_few": "{{count}} رسائل غير مقروءة",
+    "unreadBadge_many": "{{count}} رسالة غير مقروءة",
     "loadingMessages": "جارٍ تحميل الرسائل...",
     "noMessagesInChat": "لا توجد رسائل بعد. أرسل الرسالة الأولى للبدء!",
     "downloadDocument": "تنزيل المستند",
@@ -116,13 +109,62 @@
     "send": "إرسال",
     "placeholderTitle": "ابدأ المراسلة",
     "placeholderDesc": "اختر محادثة نشطة من الشريط الجانبي الأيسر لبدء قراءة وإرسال رسائل واتساب.",
+    "scrollToBottom": "انتقل إلى الأحدث",
+    "groupSubtitle": "مجموعة",
+    "privateContactSubtitle": "جهة اتصال خاصة",
     "deleteConfirm": "حذف هذه الرسالة للجميع؟",
     "messageDeleted": "🚫 تم حذف هذه الرسالة",
     "messageMasked": "🔒 أخفته واتساب على الأجهزة المرتبطة — تحقق منه على هاتفك الأساسي",
+    "kind": {
+      "group": "مجموعة",
+      "channel": "قناة",
+      "status": "الحالة",
+      "broadcast": "بث"
+    },
+    "tab": {
+      "chats": "المحادثات",
+      "channels": "القنوات",
+      "status": "الحالة"
+    },
+    "status": {
+      "itemCount": "تحديث {{count}}",
+      "itemCount_zero": "{{count}} تحديثات",
+      "itemCount_one": "تحديث واحد",
+      "itemCount_two": "تحديثان",
+      "itemCount_few": "{{count}} تحديثات",
+      "itemCount_many": "{{count}} تحديثًا",
+      "itemCount_other": "{{count}} تحديثات",
+      "empty": "لا توجد جهات اتصال لديها حالة نشطة.",
+      "loadError": "تعذر تحميل الحالات.",
+      "mediaUnavailable": "الوسائط غير متوفرة",
+      "compose": "نشر حالة",
+      "composeText": "نص",
+      "composeImage": "صورة",
+      "recipients": "من يمكنه رؤية هذا",
+      "recipientsHint": "يتطلب Baileys قائمة مستلمين؛ يستخدم whatsapp-web.js جمهور خصوصية الحالة الخاص بك.",
+      "noContacts": "لم يتم العثور على جهات اتصال",
+      "caption": "التسمية التوضيحية",
+      "backgroundColor": "لون الخلفية",
+      "font": "الخط",
+      "fontDefault": "افتراضي",
+      "orLabel": "أو",
+      "post": "نشر",
+      "posted": "تم نشر الحالة",
+      "postFailed": "تعذر نشر الحالة"
+    },
+    "channels": {
+      "notSupported": "القنوات غير مدعومة على محرك Baileys.",
+      "empty": "أنت غير مشترك في أي قناة حتى الآن.",
+      "notReady": "الجلسة ليست جاهزة بعد.",
+      "subscribers": "{{count}} مشترك",
+      "subscribers_other": "{{count}} مشترك",
+      "subscribers_two": "{{count}} مشتركان",
+      "subscribers_few": "{{count}} مشتركين",
+      "subscribers_many": "{{count}} مشترك"
+    },
     "errors": {
       "loadSessions": "فشل تحميل الجلسات",
       "loadChats": "فشل تحميل المحادثات",
-      "loadMessages": "فشل تحميل الرسائل",
       "markRead": "فشل تعليم المحادثة كمقروءة",
       "send": "فشل إرسال الرسالة",
       "react": "فشل التفاعل مع الرسالة",
@@ -152,10 +194,10 @@
     "title": "لوحة التحكم",
     "subtitle": "نظرة عامة على جلسات واتساب ونشاطك",
     "stats": {
-      "activeSessions": "الجلسات النشطة",
+      "activeSessions": "الجلسات المتصلة",
+      "sessionsDetail": "{{running}} قيد التشغيل · {{total}} الإجمالي",
       "messagesToday": "رسائل اليوم",
       "webhooksConfigured": "الويب هوك المُهيّأة",
-      "apiCalls": "استدعاءات API (24 ساعة)",
       "totalMessages": "إجمالي الرسائل"
     },
     "sessionsOverview": "نظرة عامة على الجلسات",
@@ -196,7 +238,10 @@
     "connecting": "جارٍ الاتصال...",
     "qr_ready": "امسح رمز QR",
     "ready": "متصل",
-    "disconnected": "غير متصل"
+    "disconnected": "غير متصل",
+    "action_required": "إجراء مطلوب",
+    "failed": "فشل",
+    "authenticating": "جارٍ المصادقة..."
   },
   "sessions": {
     "title": "الجلسات",
@@ -243,7 +288,6 @@
       "step3": "<strong>3.</strong> اضغط على <strong>ربط جهاز</strong> وامسح رمز QR هذا",
       "autoRefresh": "يتجدد رمز QR تلقائياً كل 5 ثوانٍ",
       "generating": "جارٍ إنشاء رمز QR...",
-      "unavailable": "رمز QR غير متاح بعد. حاول مرة أخرى بعد لحظة.",
       "preparing": "جارٍ تحضير رمز QR...",
       "showQr": "عرض رمز QR",
       "loading": "جارٍ التحميل...",
@@ -264,6 +308,7 @@
       "start": "بدء",
       "stop": "إيقاف",
       "reconnect": "إعادة الاتصال",
+      "unlink": "إلغاء الربط",
       "delete": "حذف",
       "killStuck": "إنهاء العالقة"
     },
@@ -272,6 +317,8 @@
       "readyDesc": "جلسة واتساب متصلة الآن",
       "disconnectedTitle": "انقطع اتصال الجلسة",
       "disconnectedDesc": "انقطع اتصال جلسة واتساب",
+      "actionRequiredTitle": "إجراء مطلوب",
+      "actionRequiredDesc": "تتطلب هذه الجلسة انتباهك. افتح الجلسة لمعرفة ما يجب فعله.",
       "failedTitle": "فشلت الجلسة",
       "failedDesc": "فشل بدء جلسة واتساب. افتح الجلسة لمعرفة السبب."
     },
@@ -290,6 +337,18 @@
       "success": "تم إنهاء الجلسة قسريًا. يمكنك إعادة تشغيلها الآن.",
       "failedTitle": "فشل الإنهاء القسري",
       "failed": "فشل إنهاء الجلسة قسريًا."
+    },
+    "unlink": {
+      "title": "إلغاء ربط الجهاز",
+      "message": "هل تريد إلغاء ربط الجلسة <strong>\"{{name}}\"</strong> بحساب واتساب؟",
+      "warning": "سيُزيل واتساب هذا الجهاز من الأجهزة المرتبطة بالحساب وستتوقف الجلسة. تتطلب إعادة الاتصال مسح رمز QR جديدًا أو رمز اقتران. لحذف جميع البيانات المحلية أيضًا، احذف الجلسة بعد ذلك.",
+      "confirm": "إلغاء الربط",
+      "successTitle": "تم إلغاء ربط الجهاز",
+      "success": "أزال واتساب الجهاز من الأجهزة المرتبطة بالحساب. تتطلب إعادة الاتصال مسح رمز QR جديدًا أو رمز اقتران.",
+      "unconfirmedTitle": "لم يتم تأكيد إلغاء الربط",
+      "unconfirmed": "توقفت الجلسة محليًا، لكن واتساب لم يؤكد إلغاء الربط — قد يظل الجهاز مدرجًا ضمن الأجهزة المرتبطة. ابدأ الجلسة وحاول مرة أخرى.",
+      "failedTitle": "فشل إلغاء الربط",
+      "failed": "تعذر إلغاء ربط الجلسة."
     },
     "pairing": {
       "tabQr": "رمز QR",
@@ -325,11 +384,11 @@
     "saveChanges": "حفظ التغييرات",
     "filters": {
       "badge": "{{count}} عامل تصفية",
-      "badge_zero": "بدون عوامل تصفية",
+      "badge_other": "{{count}} عامل تصفية",
       "badge_two": "عاملا تصفية",
       "badge_few": "{{count}} عوامل تصفية",
       "badge_many": "{{count}} عامل تصفية",
-      "badge_other": "{{count}} عوامل تصفية",
+      "badge_zero": "بدون عوامل تصفية",
       "title": "عوامل التصفية (اختياري)",
       "hint": "يتم التفعيل فقط عند تطابق جميع الشروط. ينطبق على أحداث الرسائل.",
       "addCondition": "إضافة شرط",
@@ -534,7 +593,13 @@
       "image": "صورة",
       "video": "فيديو",
       "audio": "صوت",
-      "document": "مستند"
+      "document": "مستند",
+      "location": "موقع",
+      "contact": "جهة اتصال",
+      "sticker": "ملصق",
+      "poll": "استطلاع",
+      "forward": "إعادة توجيه",
+      "bulk": "جماعي"
     },
     "messageContent": "محتوى الرسالة",
     "messagePlaceholder": "أدخل رسالتك هنا...",
@@ -548,48 +613,66 @@
     "filename": "اسم الملف",
     "captionPlaceholder": "أدخل التعليق...",
     "filenamePlaceholder": "document.pdf",
+    "locationLatitude": "خط العرض",
+    "locationLongitude": "خط الطول",
+    "locationDescription": "الوصف",
+    "locationAddress": "العنوان",
+    "contactName": "اسم جهة الاتصال",
+    "contactNamePlaceholder": "Jane Doe",
+    "contactNumber": "رقم جهة الاتصال",
+    "pollQuestion": "سؤال الاستطلاع",
+    "pollQuestionPlaceholder": "أين نلتقي؟",
+    "pollOptions": "خيارات الاستطلاع",
+    "pollOptionPlaceholder": "الخيار {{index}}",
+    "pollOptionsHint": "بين 2 و12 خيارًا",
+    "addOption": "إضافة خيار",
+    "removeOption": "إزالة الخيار",
+    "allowMultipleAnswers": "السماح بإجابات متعددة",
+    "forwardFromChatId": "معرّف الدردشة المصدر",
+    "forwardFromPlaceholder": "628123456789@c.us",
+    "forwardFromHint": "اتركه فارغًا لإعادة التوجيه من المستلم الحالي",
+    "forwardToChatId": "معرّف الدردشة الوجهة",
+    "forwardToPlaceholder": "رقم الهاتف أو معرّف الدردشة",
+    "forwardMessageId": "معرّف الرسالة",
+    "forwardMessageIdHint": "معرّف الرسالة المراد إعادة توجيهها",
+    "bulkRecipients": "المستلمون",
+    "bulkRecipientsPlaceholder": "+62812345678",
+    "bulkRecipientsHint": "رقم هاتف أو معرّف دردشة واحد في كل سطر (100 كحد أقصى)",
+    "bulkRecipientsCount": "المستلمون: {{count}}",
+    "bulkDelay": "التأخير بين الرسائل (مللي ثانية)",
+    "bulkDelayHint": "1000–60000 مللي ثانية (الافتراضي 3000)",
     "send": "إرسال الرسالة",
     "sending": "جارٍ الإرسال...",
     "viewOnly": "للعرض فقط",
     "responseEmpty": "أرسل رسالة لرؤية استجابة API",
-    "successLabel": "200 OK - نجاح",
-    "failedLabel": "400 - فشل",
+    "successLabel": "نجاح",
+    "failedLabel": "فشل",
     "response": {
       "timestamp": "الوقت",
       "messageId": "معرّف الرسالة",
+      "batchId": "معرّف الدفعة",
       "error": "خطأ"
     },
     "sendFailed": "فشل إرسال الرسالة",
-    "notOnWhatsApp": "هذا الرقم غير مسجَّل على واتساب"
+    "notOnWhatsApp": "هذا الرقم غير مسجَّل على واتساب",
+    "batch": {
+      "status": {
+        "pending": "قيد الانتظار",
+        "processing": "قيد المعالجة",
+        "completed": "مكتمل",
+        "cancelled": "ملغى",
+        "failed": "فشل"
+      },
+      "progress": "تم إرسال {{sent}} من {{total}} · {{failed}} فشلت · {{pending}} قيد الانتظار",
+      "cancel": "إلغاء الدفعة",
+      "cancelling": "جارٍ الإلغاء..."
+    }
   },
   "infrastructure": {
     "title": "البنية التحتية",
     "subtitle": "تهيئة إعدادات الخادم وقاعدة البيانات والذاكرة المؤقتة والتخزين والمحرك",
     "saveConfig": "حفظ الإعدادات",
     "saving": "جارٍ الحفظ...",
-    "server": {
-      "title": "إعدادات الخادم",
-      "production": "إنتاج",
-      "development": "تطوير",
-      "environment": "البيئة",
-      "domain": "النطاق",
-      "apiPort": "منفذ API",
-      "dashboardPort": "منفذ لوحة التحكم",
-      "corsOrigins": "مصادر CORS",
-      "corsPlaceholder": "* أو مصادر مفصولة بفاصلة",
-      "publicApiUrl": "رابط API العام (اختياري)",
-      "publicDashboardUrl": "رابط لوحة التحكم العامة (اختياري)"
-    },
-    "webhook": {
-      "title": "الويب هوك وحد التحميل",
-      "settings": "إعدادات الويب هوك",
-      "timeout": "المهلة (مللي ثانية)",
-      "maxRetries": "أقصى عدد للمحاولات",
-      "retryDelay": "تأخير إعادة المحاولة (مللي ثانية)",
-      "rateLimit": "حد التحميل",
-      "window": "نافذة الوقت (ثوانٍ)",
-      "maxReq": "أقصى عدد طلبات لكل نافذة"
-    },
     "database": {
       "title": "إعدادات قاعدة البيانات",
       "sqlite": "SQLite",
@@ -612,7 +695,6 @@
     },
     "engine": {
       "title": "محرك واتساب",
-      "subtitle": "اختر محرك اتصال واتساب وقم بتهيئته.",
       "builtIn": "مدمج",
       "headless": "الوضع بدون واجهة",
       "headlessDesc": "تشغيل المتصفح بدون واجهة مرئية (موصى به للإنتاج).",
@@ -712,43 +794,29 @@
     "title": "الإضافات",
     "subtitle": "ثبّت الإضافات وكوّنها وأدِرها",
     "refresh": "تحديث",
-    "engineCard": "محرك واتساب النشط",
-    "running": "يعمل",
-    "supportedFeatures": "الميزات المدعومة:",
     "builtIn": "مدمج",
     "noDescription": "لا يوجد وصف متاح",
-    "required": "مطلوب",
-    "active": "نشط",
-    "activate": "تفعيل",
     "enable": "تمكين",
     "disable": "تعطيل",
     "healthCheck": "فحص الصحة",
     "configure": "إعداد",
-    "available": "متاحة",
     "install": "تثبيت إضافة",
     "uninstall": "إزالة",
     "uninstallConfirm": "إزالة \"{{name}}\"؟ سيؤدي ذلك إلى حذف ملفاتها.",
-    "engineSwitchHint": "عيّنها كمحرك نشط في الإعدادات، ثم أعد التشغيل",
     "empty": {
       "title": "لم يتم العثور على إضافات",
       "description": "ثبّت إضافات لتوسيع وظائف OpenWA"
     },
     "config": {
       "title": "إعداد {{name}}",
-      "restartNotice": "تتطلب التغييرات إعادة تشغيل الخادم لتصبح فعّالة",
-      "engineType": "نوع المحرك",
-      "headless": "الوضع غير المرئي",
-      "headlessDesc": "تشغيل المتصفح بدون واجهة مرئية (موصى به للإنتاج)",
-      "sessionDataPath": "مسار بيانات الجلسة",
-      "browserArgs": "مُعطيات المتصفح",
       "noOptions": "لا توجد خيارات إعداد لهذه الإضافة",
+      "uiHandshakeError": "لم تتم تهيئة واجهة إعداد الإضافة. استخدم نموذج الإعدادات أدناه إن كان متاحًا.",
       "save": "حفظ الإعدادات",
       "addItem": "إضافة",
       "tabConfig": "الإعدادات",
       "tabSessions": "الجلسات"
     },
     "rail": {
-      "engine": "المحرك النشط",
       "enabled": "مُمكَّنة",
       "installed": "مُثبَّتة",
       "active": "الإضافات النشطة",
@@ -758,7 +826,12 @@
       "title": "تثبيت إضافة",
       "hint": "ارفع إضافة معبّأة بصيغة .zip (تحتوي على manifest.json). تعمل في بيئة معزولة بعد تمكينها.",
       "choose": "اختر ملف .zip…",
-      "tooLarge": "يتجاوز الملف الحد الأقصى البالغ 5 MB."
+      "tooLarge": "يتجاوز الملف الحد الأقصى البالغ 5 MB.",
+      "catalogHint": "ثبّت مباشرة من كتالوج إضافات OpenWA. يتم جلب ملف .zip من جانب الخادم عبر حماية SSRF، ثم يُتحقق منه ويُشغَّل في وضع الحماية.",
+      "catalogTeaser": "تبحث عن إضافات؟",
+      "catalogTeaserSuffix": "يتصفح المتجر الرسمي.",
+      "tabCatalog": "الكتالوج",
+      "tabUpload": "رفع .zip"
     },
     "toasts": {
       "errorTitle": "خطأ في الإضافة",
@@ -772,7 +845,12 @@
       "installed": "تم تثبيت الإضافة",
       "installFailed": "فشل التثبيت",
       "uninstalled": "تمت إزالة الإضافة",
-      "uninstallFailed": "فشلت الإزالة"
+      "uninstallFailed": "فشلت الإزالة",
+      "enableFailedTitle": "فشل التفعيل",
+      "disableFailedTitle": "فشل التعطيل",
+      "configRequiredTitle": "الإعداد مطلوب",
+      "configRequiredDesc": "املأ الحقول المطلوبة قبل التفعيل: {{fields}}",
+      "updateFailed": "فشل التحديث"
     },
     "sessions": {
       "activationTitle": "التشغيل لـ",
@@ -804,6 +882,9 @@
         "sessionScopePlaceholder": "اتركه فارغًا لجميع الجلسات",
         "verifyToken": "رمز التحقق (اختياري)",
         "verifyTokenPlaceholder": "الرمز الذي يُرجعه المزوّد عند التحقق",
+        "secret": "سر Ingress (اختياري)",
+        "secretPlaceholder": "سر webhook الخاص بالمزوّد (مثل Chatwoot)",
+        "secretHint": "اتركه فارغًا للتوليد التلقائي (يُعرض مرة واحدة). إذا كان المزوّد يفرض سر webhook خاصًا به، ألصقه هنا — السر المولَّد تلقائيًا لن يطابق.",
         "config": "التكوين (JSON اختياري)",
         "configPlaceholder": "{ }"
       },
@@ -818,7 +899,9 @@
         "confirm": "هل تريد إعادة إنشاء المفتاح السري لـ {{id}}؟ سيتوقف المفتاح الحالي عن العمل فورًا.",
         "action": "إعادة الإنشاء"
       },
-      "edit": { "title": "تعديل {{id}}" },
+      "edit": {
+        "title": "تعديل {{id}}"
+      },
       "delete": {
         "title": "حذف المثيل",
         "confirm": "هل تريد حذف المثيل {{id}}؟ سيتوقف عنوان الدخول والمفتاح السري الخاصان به عن العمل فورًا.",
@@ -836,6 +919,7 @@
       "errors": {
         "invalidId": "يجب أن يتكوّن معرّف المثيل من أحرف وأرقام وشرطات أو شرطات سفلية فقط (بحد أقصى 64 حرفًا).",
         "invalidJson": "يجب أن يكون التكوين بصيغة JSON صحيحة.",
+        "invalidSecret": "يجب أن يتكون السر من 16 حرفًا على الأقل، أو اتركه فارغًا للتوليد التلقائي.",
         "duplicateId": "يوجد مثيل بهذا المعرّف مسبقًا."
       },
       "toasts": {
@@ -845,6 +929,17 @@
         "secretRegenerated": "تم إعادة إنشاء المفتاح السري",
         "actionFailed": "فشل الإجراء"
       }
+    },
+    "catalog": {
+      "empty": "لا توجد إضافات في الكتالوج.",
+      "install": "تثبيت",
+      "installed": "مُثبَّت",
+      "noDownload": "لا يحتوي إدخال الكتالوج هذا على عنوان URL للتنزيل.",
+      "noMatch": "لا توجد إضافات تطابق بحثك.",
+      "searchPlaceholder": "ابحث في الإضافات…",
+      "update": "تحديث",
+      "updateAvailable": "يتوفر تحديث",
+      "updated": "تم تحديث الإضافة"
     }
   },
   "search": {
@@ -853,7 +948,9 @@
     "empty": "لم يتم العثور على رسائل.",
     "error": "فشل البحث. حاول مرة أخرى.",
     "unavailable": "البحث غير مُكون.",
-    "scope": { "current": "هذه الجلسة" },
+    "scope": {
+      "current": "هذه الجلسة"
+    },
     "loading": "جارٍ البحث…"
   }
 }

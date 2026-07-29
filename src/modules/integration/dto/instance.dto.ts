@@ -1,6 +1,7 @@
 import { IsBoolean, IsNotEmpty, IsObject, IsOptional, IsString, Matches, MaxLength, MinLength } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { IngressUrl } from '../ingress-url';
+import { ToStrictBoolean } from '../../../common/utils/strict-boolean';
 
 // Safe charset: also prevents an instanceId containing ':' (which would collide the P1 ordering key).
 const INSTANCE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -63,6 +64,7 @@ export class UpdateInstanceDto {
     description: 'Whether the instance is enabled (ingress accepted, dispatch active).',
     example: true,
   })
+  @ToStrictBoolean()
   @IsOptional()
   @IsBoolean()
   enabled?: boolean;
@@ -111,7 +113,8 @@ export class InstanceView {
   verifyToken: string | null;
 
   @ApiPropertyOptional({
-    description: 'Per-instance config slice passed to the adapter, or null.',
+    description:
+      "Per-instance config slice passed to the adapter, or null. Fields flagged `secret` in the plugin's config schema are masked ('***') on EVERY response — including create/regenerate-secret; only the ingress secret and verifyToken are ever revealed once.",
     nullable: true,
     type: Object,
   })

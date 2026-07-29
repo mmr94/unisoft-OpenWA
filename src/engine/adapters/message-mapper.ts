@@ -1,4 +1,6 @@
-import { IncomingMessage, MessageContact, MessageType } from '../interfaces/whatsapp-engine.interface';
+import { EditedMessage, IncomingMessage, MessageContact, MessageType } from '../interfaces/whatsapp-engine.interface';
+import type { SerializedWid } from '../types/whatsapp-web-js.types';
+import { chatKind } from '../identity/wa-id';
 
 /**
  * Map a whatsapp-web.js `MessageTypes` token to the engine-neutral {@link MessageType}, so no
@@ -44,7 +46,13 @@ export function mapWwebjsMessageType(raw: string): MessageType {
  * unit-testable without constructing a full wwebjs `Message`.
  */
 export interface RawMessageFields {
-  id: { _serialized: string };
+  /**
+   * Typed as the raw wid rather than `{ _serialized: string }`: a WA Web build that renamed the field
+   * to `$1` (#747) leaves `_serialized` undefined, and the old type made that state unrepresentable —
+   * so `$1` could not even be read without a cast, and the unsound `id: string` it fed was `undefined`
+   * at runtime on every inbound message.
+   */
+  id: SerializedWid;
   from: string;
   to: string;
   body: string;
@@ -69,7 +77,12 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
   // for an incoming message it's the reverse. So the chat is `to` when fromMe, else `from`.
   const chatId = msg.fromMe ? msg.to : msg.from;
   const incoming: IncomingMessage = {
-    id: msg.id._serialized,
+    // Read `$1` before giving up, as the send/ack/status paths do (#762/#765/#773). This runs on the
+    // LIVE inbound path (`onMessage`/`onMessageCreate`), so on a renamed build without the build-time
+    // backport every arriving message otherwise carries `id: undefined`. The empty sentinel means
+    // "received, id unreadable" and is normalized to NULL where it is persisted — never to `''`, which
+    // the non-partial (sessionId, waMessageId) unique index would collide the second such message on.
+    id: msg.id._serialized ?? msg.id.$1 ?? '',
     from: msg.from,
     to: msg.to,
     chatId,
@@ -78,6 +91,7 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
     timestamp: msg.timestamp,
     fromMe: msg.fromMe,
     isGroup: chatId.endsWith('@g.us'),
+    kind: chatKind(chatId),
     // Flag status/story broadcasts here (the engine-specific `status@broadcast` pseudo-JID stays in
     // the adapter) so engine-neutral code can skip them without matching the literal.
     isStatusBroadcast: msg.to === 'status@broadcast' || chatId === 'status@broadcast',
@@ -112,6 +126,28 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
   }
 
   return incoming;
+}
+
+/**
+ * Project an engine-neutral message base into the public edit-event contract. Keeping this projection
+ * shared prevents the two adapters from drifting on identity, direction, group, type, or filter fields.
+ */
+export function buildEditedMessage(message: IncomingMessage, hasMedia: boolean): EditedMessage {
+  return {
+    messageId: message.id,
+    chatId: message.chatId,
+    body: message.body,
+    senderId: message.author ?? message.from,
+    from: message.from,
+    to: message.to,
+    fromMe: message.fromMe,
+    isGroup: message.isGroup,
+    type: message.type,
+    hasMedia,
+    ...(message.author ? { author: message.author } : {}),
+    ...(message.mentionedIds ? { mentionedIds: message.mentionedIds } : {}),
+    timestamp: message.timestamp,
+  };
 }
 
 /**

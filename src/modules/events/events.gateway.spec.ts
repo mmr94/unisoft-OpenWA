@@ -137,7 +137,7 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
     expect(sock.join).toHaveBeenCalled();
   });
 
-  it('rejects a subscription to a reserved, never-emitted event (group.*) with INVALID_EVENTS', async () => {
+  it('accepts a subscription to group.join (a live, engine-emitted event)', async () => {
     authService.validateApiKey.mockResolvedValue({ name: 'k', allowedSessions: null });
     const sock = makeSocket({ apiKey: 'good' });
     await gateway.handleConnection(asSocket(sock));
@@ -145,6 +145,21 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
     const res = (await gateway.handleMessage(
       asSocket(sock),
       subscribeMsg('sess-1', ['group.join']),
+    )) as WSSubscribedResponse;
+
+    expect(res.type).toBe('subscribed');
+    expect(res.events).toEqual(['group.join']);
+    expect(sock.join).toHaveBeenCalledWith(buildRoomName('sess-1', 'group.join'));
+  });
+
+  it('rejects a subscription to an unknown, never-emitted event with INVALID_EVENTS', async () => {
+    authService.validateApiKey.mockResolvedValue({ name: 'k', allowedSessions: null });
+    const sock = makeSocket({ apiKey: 'good' });
+    await gateway.handleConnection(asSocket(sock));
+
+    const res = (await gateway.handleMessage(
+      asSocket(sock),
+      subscribeMsg('sess-1', ['session.connected']),
     )) as WSErrorResponse;
 
     expect(res.type).toBe('error');
@@ -152,14 +167,14 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
     expect(sock.join).not.toHaveBeenCalled();
   });
 
-  it('keeps the valid events when a subscription mixes a valid and a reserved event', async () => {
+  it('keeps the valid events when a subscription mixes a valid and an unknown event', async () => {
     authService.validateApiKey.mockResolvedValue({ name: 'k', allowedSessions: null });
     const sock = makeSocket({ apiKey: 'good' });
     await gateway.handleConnection(asSocket(sock));
 
     const res = (await gateway.handleMessage(
       asSocket(sock),
-      subscribeMsg('sess-1', ['message.received', 'group.join']),
+      subscribeMsg('sess-1', ['message.received', 'session.connected']),
     )) as WSSubscribedResponse;
 
     expect(res.type).toBe('subscribed');
@@ -303,6 +318,49 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
 
       expect(() => gateway.evictApiKey('k1')).not.toThrow();
     });
+
+    it('evicts a passive socket once its cached API key expires', async () => {
+      authService.validateApiKey.mockResolvedValue({
+        id: 'k1',
+        name: 'k',
+        allowedSessions: null,
+        expiresAt: new Date('2026-01-01T00:00:00Z'),
+      });
+      const sock = makeSocket({ apiKey: 'good' });
+      await gateway.handleConnection(asSocket(sock));
+
+      (gateway as unknown as { sweepExpiredApiKeys: (now: number) => void }).sweepExpiredApiKeys(
+        Date.parse('2026-01-01T00:00:01Z'),
+      );
+
+      expect(sock.disconnect).toHaveBeenCalledWith(true);
+      expect(sock.emit).toHaveBeenCalledWith(
+        'message',
+        expect.objectContaining({ code: 'UNAUTHORIZED', message: 'API key has expired' }),
+      );
+    });
+
+    it('keeps sockets with no expiry or a future expiry', async () => {
+      const noExpiry = makeSocket({ apiKey: 'a' });
+      const future = { ...makeSocket({ apiKey: 'b' }), id: 'sock-2' };
+      authService.validateApiKey
+        .mockResolvedValueOnce({ id: 'k1', name: 'a', allowedSessions: null, expiresAt: null })
+        .mockResolvedValueOnce({
+          id: 'k2',
+          name: 'b',
+          allowedSessions: null,
+          expiresAt: new Date('2026-01-02T00:00:00Z'),
+        });
+      await gateway.handleConnection(asSocket(noExpiry));
+      await gateway.handleConnection(asSocket(future));
+
+      (gateway as unknown as { sweepExpiredApiKeys: (now: number) => void }).sweepExpiredApiKeys(
+        Date.parse('2026-01-01T00:00:00Z'),
+      );
+
+      expect(noExpiry.disconnect).not.toHaveBeenCalled();
+      expect(future.disconnect).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -382,9 +440,314 @@ describe('event catalog ⇔ emitter invariants (drift guard)', () => {
     expect(new Set(SUBSCRIBABLE_EVENTS)).toEqual(deriveEmittedEvents());
   });
 
-  it('reserved webhook group.* events are NOT advertised as socket-subscribable', () => {
+  it('reserved webhook events (currently none) never overlap the socket-subscribable catalog', () => {
+    // WEBHOOK_RESERVED_EVENTS is intentionally empty — the former group.* occupants are now live,
+    // engine-emitted (and socket-subscribable) events covered by the equality guard above. The
+    // export stays so a future declared-but-undispatched event can be whitelisted there; whenever
+    // the list is non-empty, no reserved event may also be advertised as subscribable.
+    expect(WEBHOOK_RESERVED_EVENTS).toHaveLength(0);
     for (const reserved of WEBHOOK_RESERVED_EVENTS) {
       expect(SUBSCRIBABLE_EVENTS).not.toContain(reserved);
     }
+  });
+});
+
+// Rate limiting on the WS surface: the gateway sits outside the Nest guard pipeline, so the
+// per-key frame bucket, the pre-auth per-IP handshake window, and the per-key socket cap are
+// all enforced inside EventsGateway. The gateway reads its config from the env at construction,
+// so these tests pin the WS_* env vars per test (and restore them afterwards).
+describe('EventsGateway rate limiting', () => {
+  const WS_ENV_KEYS = [
+    'WS_RATE_LIMIT_FRAME_PER_SECOND',
+    'WS_RATE_LIMIT_FRAME_BURST',
+    'WS_RATE_LIMIT_HANDSHAKE_MAX',
+    'WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS',
+    'WS_MAX_SOCKETS_PER_KEY',
+  ] as const;
+
+  let gateway: EventsGateway;
+  let authService: { validateApiKey: jest.Mock };
+  let auditService: { logWarn: jest.Mock };
+  let savedEnv: Record<string, string | undefined>;
+
+  const makeSock = (id: string, auth: { apiKey?: string } = {}): MockSocket => ({
+    id,
+    handshake: { headers: {}, query: {}, auth, address: '203.0.113.5' },
+    data: {},
+    emit: jest.fn(),
+    disconnect: jest.fn(),
+    join: jest.fn(),
+    rooms: new Set<string>(),
+  });
+  const asSocket = (s: MockSocket): Socket => s as unknown as Socket;
+  const subscribeMsg = (sessionId: string, events: string[]): WSClientMessage =>
+    ({ type: 'subscribe', sessionId, events, requestId: 'r1' }) as unknown as WSClientMessage;
+
+  beforeEach(() => {
+    savedEnv = {};
+    for (const key of WS_ENV_KEYS) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    authService = { validateApiKey: jest.fn() };
+    auditService = { logWarn: jest.fn().mockResolvedValue(null) };
+  });
+
+  afterEach(() => {
+    for (const key of WS_ENV_KEYS) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+    jest.useRealTimers();
+  });
+
+  const buildGateway = (): EventsGateway => {
+    gateway = new EventsGateway(authService as unknown as AuthService, auditService as unknown as AuditService);
+    return gateway;
+  };
+
+  // Typed view over the audit mock's calls so assertions on action/metadata don't wade through `any`.
+  interface WarnContext {
+    metadata?: Record<string, unknown>;
+  }
+  const warnCalls = (): [AuditAction, WarnContext?][] =>
+    auditService.logWarn.mock.calls as [AuditAction, WarnContext?][];
+
+  describe('per-key frame token bucket', () => {
+    it('rejects the frame above the bucket with a RATE_LIMITED error frame and never reaches the handler', async () => {
+      process.env.WS_RATE_LIMIT_FRAME_PER_SECOND = '2';
+      process.env.WS_RATE_LIMIT_FRAME_BURST = '3';
+      authService.validateApiKey.mockResolvedValue({ id: 'k1', name: 'k', allowedSessions: null });
+      const gw = buildGateway();
+      const sock = makeSock('s1', { apiKey: 'good' });
+      await gw.handleConnection(asSocket(sock));
+      expect(authService.validateApiKey).toHaveBeenCalledTimes(1);
+
+      // The 3-frame burst passes; each subscribe re-validates the key.
+      for (let i = 0; i < 3; i++) {
+        const res = (await gw.handleMessage(asSocket(sock), subscribeMsg('sess-1', ['session.status']))) as {
+          type: string;
+        };
+        expect(res.type).toBe('subscribed');
+      }
+      expect(authService.validateApiKey).toHaveBeenCalledTimes(4);
+
+      // The frame above the bucket: error frame back to the client, and NOT dispatched —
+      // in particular it never reaches the per-subscribe DB re-validation.
+      const res = (await gw.handleMessage(
+        asSocket(sock),
+        subscribeMsg('sess-1', ['session.status']),
+      )) as WSErrorResponse;
+      expect(res.type).toBe('error');
+      expect(res.code).toBe('RATE_LIMITED');
+      expect(sock.emit).toHaveBeenCalledWith('message', expect.objectContaining({ code: 'RATE_LIMITED' }));
+      expect(authService.validateApiKey).toHaveBeenCalledTimes(4);
+    });
+
+    it('lets a normal dashboard connect-time subscribe burst (8 frames) through untouched', async () => {
+      // Defaults: 60 frames/s sustained + 120 burst — far above a page-mount burst.
+      authService.validateApiKey.mockResolvedValue({ id: 'k1', name: 'k', allowedSessions: null });
+      const gw = buildGateway();
+      const sock = makeSock('s1', { apiKey: 'good' });
+      await gw.handleConnection(asSocket(sock));
+
+      for (let i = 0; i < 8; i++) {
+        const res = (await gw.handleMessage(asSocket(sock), subscribeMsg('sess-1', ['session.status']))) as {
+          type: string;
+        };
+        expect(res.type).toBe('subscribed');
+      }
+    });
+
+    it('recovers after the refill window: a throttled key can send again', async () => {
+      process.env.WS_RATE_LIMIT_FRAME_PER_SECOND = '2';
+      process.env.WS_RATE_LIMIT_FRAME_BURST = '2';
+      jest.useFakeTimers();
+      authService.validateApiKey.mockResolvedValue({ id: 'k1', name: 'k', allowedSessions: null });
+      const gw = buildGateway();
+      const sock = makeSock('s1', { apiKey: 'good' });
+      await gw.handleConnection(asSocket(sock));
+
+      await gw.handleMessage(asSocket(sock), subscribeMsg('sess-1', ['session.status']));
+      await gw.handleMessage(asSocket(sock), subscribeMsg('sess-1', ['session.status']));
+      const limited = (await gw.handleMessage(asSocket(sock), subscribeMsg('sess-1', ['session.status']))) as {
+        code?: string;
+      };
+      expect(limited.code).toBe('RATE_LIMITED');
+
+      jest.advanceTimersByTime(1_000); // 2 tokens refill at 2/s
+      const res = (await gw.handleMessage(asSocket(sock), subscribeMsg('sess-1', ['session.status']))) as {
+        type: string;
+      };
+      expect(res.type).toBe('subscribed');
+    });
+  });
+
+  describe('pre-auth per-IP handshake window', () => {
+    it('rejects the handshake above the window BEFORE validateApiKey runs', async () => {
+      process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '3';
+      process.env.WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS = '60000';
+      // Failed handshakes are what the window is for — an authenticated one is refunded (below).
+      authService.validateApiKey.mockRejectedValue(new Error('bad key'));
+      const gw = buildGateway();
+
+      for (let i = 0; i < 3; i++) {
+        await gw.handleConnection(asSocket(makeSock(`s${i}`, { apiKey: 'good' })));
+      }
+      expect(authService.validateApiKey).toHaveBeenCalledTimes(3);
+
+      // The 4th handshake from the same IP inside the window is gated pre-auth: the DB
+      // validate is never reached.
+      const blocked = makeSock('s-blocked', { apiKey: 'good' });
+      await gw.handleConnection(asSocket(blocked));
+      expect(authService.validateApiKey).toHaveBeenCalledTimes(3);
+      expect(blocked.disconnect).toHaveBeenCalled();
+      expect(blocked.emit).toHaveBeenCalledWith('message', expect.objectContaining({ code: 'RATE_LIMITED' }));
+      const violations = warnCalls().filter(([action]) => action === AuditAction.RATE_LIMIT_EXCEEDED);
+      expect(violations).toHaveLength(1);
+      expect(violations[0]?.[1]?.metadata).toEqual(
+        expect.objectContaining({ surface: 'websocket', kind: 'handshake' }),
+      );
+    });
+
+    it('emits the RATE_LIMITED error frame BEFORE disconnecting, so the client can tell throttling from a dead server', async () => {
+      process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '1';
+      authService.validateApiKey.mockRejectedValue(new Error('bad key'));
+      const gw = buildGateway();
+
+      await gw.handleConnection(asSocket(makeSock('s1', { apiKey: 'good' })));
+      const blocked = makeSock('s-blocked', { apiKey: 'good' });
+      await gw.handleConnection(asSocket(blocked));
+
+      // Order is the client-visible contract: socket.io delivers the queued error frame ahead of
+      // the disconnect packet, and the dashboard keys its reconnect banner on receiving a
+      // distinguishable error plus the server-initiated close.
+      expect(blocked.emit).toHaveBeenCalledWith(
+        'message',
+        expect.objectContaining({ type: 'error', code: 'RATE_LIMITED' }),
+      );
+      expect(blocked.disconnect).toHaveBeenCalled();
+      const emitOrder = blocked.emit.mock.invocationCallOrder[0];
+      const disconnectOrder = blocked.disconnect.mock.invocationCallOrder[0];
+      expect(emitOrder).toBeLessThan(disconnectOrder);
+    });
+
+    it('does not spend the shared per-IP budget on handshakes that authenticate', async () => {
+      // The window is charged pre-auth to keep a flood off the DB, but every client behind one
+      // NAT/proxy IP shares the subject — charging successful connects too would let a few
+      // dashboards re-mounting lock each other out. Authenticated volume is bounded by the
+      // per-key socket cap instead.
+      process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '2';
+      process.env.WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS = '60000';
+      process.env.WS_MAX_SOCKETS_PER_KEY = '99';
+      authService.validateApiKey.mockResolvedValue({ id: 'k1', name: 'k', allowedSessions: null });
+      const gw = buildGateway();
+
+      for (let i = 0; i < 6; i++) {
+        const sock = makeSock(`ok${i}`, { apiKey: 'good' });
+        await gw.handleConnection(asSocket(sock));
+        expect(sock.disconnect).not.toHaveBeenCalled();
+      }
+      expect(authService.validateApiKey).toHaveBeenCalledTimes(6);
+    });
+
+    it('throttles an unauthenticated handshake flood before any credential/audit work', async () => {
+      process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '2';
+      const gw = buildGateway();
+
+      // Three key-less handshakes from one IP: the first two reach the missing-key audit,
+      // the third is gated by the limiter instead (no per-attempt auth failure processing).
+      await gw.handleConnection(asSocket(makeSock('a')));
+      await gw.handleConnection(asSocket(makeSock('b')));
+      await gw.handleConnection(asSocket(makeSock('c')));
+
+      const authFailed = warnCalls().filter(([action]) => action === AuditAction.API_KEY_AUTH_FAILED);
+      expect(authFailed).toHaveLength(2);
+      expect(authService.validateApiKey).not.toHaveBeenCalled();
+    });
+
+    it('recovers once the window slides past the oldest handshake', async () => {
+      process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '1';
+      process.env.WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS = '60000';
+      jest.useFakeTimers();
+      authService.validateApiKey.mockRejectedValue(new Error('bad key'));
+      const gw = buildGateway();
+
+      await gw.handleConnection(asSocket(makeSock('a', { apiKey: 'good' })));
+      const blocked = makeSock('b', { apiKey: 'good' });
+      await gw.handleConnection(asSocket(blocked));
+      expect(blocked.disconnect).toHaveBeenCalled();
+      expect(authService.validateApiKey).toHaveBeenCalledTimes(1);
+
+      jest.advanceTimersByTime(60_001);
+      const recovered = makeSock('c', { apiKey: 'good' });
+      await gw.handleConnection(asSocket(recovered));
+      // No longer shed by the window: it reaches the credential check. (It is still rejected here
+      // because this test drives the window with failing credentials, so assert on WHICH rejection.)
+      expect(authService.validateApiKey).toHaveBeenCalledTimes(2);
+      expect(recovered.emit).toHaveBeenCalledWith('message', expect.objectContaining({ code: 'UNAUTHORIZED' }));
+      expect(recovered.emit).not.toHaveBeenCalledWith('message', expect.objectContaining({ code: 'RATE_LIMITED' }));
+    });
+
+    it('samples the violation audit: one row per subject per minute, suppressed count folded in', async () => {
+      process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '1';
+      process.env.WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS = '60000';
+      jest.useFakeTimers();
+      authService.validateApiKey.mockRejectedValue(new Error('bad key'));
+      const gw = buildGateway();
+
+      await gw.handleConnection(asSocket(makeSock('a', { apiKey: 'good' }))); // allowed
+      await gw.handleConnection(asSocket(makeSock('b', { apiKey: 'good' }))); // rejected → audit #1
+      await gw.handleConnection(asSocket(makeSock('c', { apiKey: 'good' }))); // rejected → suppressed
+
+      jest.advanceTimersByTime(61_000);
+      await gw.handleConnection(asSocket(makeSock('d', { apiKey: 'good' }))); // allowed again
+      await gw.handleConnection(asSocket(makeSock('e', { apiKey: 'good' }))); // rejected → audit #2
+
+      const rateLimited = warnCalls().filter(([action]) => action === AuditAction.RATE_LIMIT_EXCEEDED);
+      expect(rateLimited).toHaveLength(2);
+      expect(rateLimited[0]?.[1]?.metadata).toEqual(expect.objectContaining({ kind: 'handshake', suppressed: 0 }));
+      expect(rateLimited[1]?.[1]?.metadata).toEqual(expect.objectContaining({ kind: 'handshake', suppressed: 1 }));
+    });
+  });
+
+  describe('per-key simultaneous socket cap', () => {
+    it('rejects the socket above the cap with a clear error, and frees the slot on disconnect', async () => {
+      process.env.WS_MAX_SOCKETS_PER_KEY = '2';
+      // Keep the handshake window out of the way: this test is about the socket cap.
+      process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '100';
+      authService.validateApiKey.mockResolvedValue({ id: 'k1', name: 'k', allowedSessions: null });
+      const gw = buildGateway();
+
+      const s1 = makeSock('s1', { apiKey: 'good' });
+      const s2 = makeSock('s2', { apiKey: 'good' });
+      await gw.handleConnection(asSocket(s1));
+      await gw.handleConnection(asSocket(s2));
+      expect(s1.disconnect).not.toHaveBeenCalled();
+      expect(s2.disconnect).not.toHaveBeenCalled();
+
+      // The 3rd simultaneous socket for the same key IS authenticated (the cap is a post-auth
+      // fairness bound, not an auth failure) and then refused with a clear error.
+      const s3 = makeSock('s3', { apiKey: 'good' });
+      await gw.handleConnection(asSocket(s3));
+      expect(authService.validateApiKey).toHaveBeenCalledTimes(3);
+      expect(s3.disconnect).toHaveBeenCalled();
+      expect(s3.emit).toHaveBeenCalledWith(
+        'message',
+        expect.objectContaining({
+          code: 'RATE_LIMITED',
+          message: expect.stringContaining('Too many concurrent connections') as unknown,
+        }),
+      );
+      const violations = warnCalls().filter(([action]) => action === AuditAction.RATE_LIMIT_EXCEEDED);
+      expect(violations).toHaveLength(1);
+      expect(violations[0]?.[1]?.metadata).toEqual(expect.objectContaining({ kind: 'sockets' }));
+
+      // Disconnecting one socket frees the slot for the next connection.
+      gw.handleDisconnect(asSocket(s2));
+      const s4 = makeSock('s4', { apiKey: 'good' });
+      await gw.handleConnection(asSocket(s4));
+      expect(s4.disconnect).not.toHaveBeenCalled();
+    });
   });
 });

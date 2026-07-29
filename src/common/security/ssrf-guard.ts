@@ -378,6 +378,37 @@ export function validatingLookup(): LookupFunction {
 }
 
 /**
+ * Cancel an unread response body before the per-request dispatcher is destroyed.
+ *
+ * Status-only callers (webhook delivery) often leave `response.body` unread. When undici then
+ * tears down the socket — or the peer resets it mid-flight — the body stream can emit an `error`
+ * (`TypeError: terminated` / `ECONNRESET`) with no listener, which becomes a process-fatal
+ * `uncaughtException` (see #887). Cancelling here drains that path safely; already-consumed
+ * bodies (`bodyUsed`) are left alone so streaming readers (media / plugin downloads) are unaffected.
+ */
+async function settleUnreadResponseBody(response: Response): Promise<void> {
+  // bodyUsed only covers *disturbed* streams. A stream the caller locked with getReader() but never
+  // read from is not disturbed, and cancel() on a locked stream rejects — such callers must cancel
+  // their own reader on error paths, so locked streams are left to them.
+  if (response.bodyUsed || !response.body || response.body.locked) return;
+  // Guard the call itself: a duck-typed response (e.g. a test mock without cancel) must not throw
+  // synchronously from a `finally` and mask the original error.
+  if (typeof response.body.cancel !== 'function') return;
+  await response.body.cancel().catch(() => undefined);
+}
+
+/**
+ * Run `use(response)` and always settle an unread body afterwards, even if `use` throws.
+ */
+async function useAndSettleBody<T>(response: Response, use: (response: Response) => Promise<T> | T): Promise<T> {
+  try {
+    return await use(response);
+  } finally {
+    await settleUnreadResponseBody(response);
+  }
+}
+
+/**
  * Perform an SSRF-safe fetch and hand the response to `use`, then tear down the per-request
  * connection. The host is validated and resolved ONCE; the connection is pinned to the vetted IP(s)
  * via an undici dispatcher so it cannot be re-resolved to an internal address between check and
@@ -386,7 +417,9 @@ export function validatingLookup(): LookupFunction {
  * so A-record failover still works. Redirects are refused (the guard only validated the original host).
  *
  * `use` must read everything it needs from the response before returning — the dispatcher (and its
- * sockets) is destroyed once `use` settles, so a still-streaming body would be cut off.
+ * sockets) is destroyed once `use` settles, so a still-streaming body would be cut off. Unread
+ * bodies are cancelled automatically before teardown so status-only callers cannot crash the process
+ * when the peer resets the connection (#887).
  *
  * @param opts.guard - when false (the WEBHOOK_SSRF_PROTECT opt-out), skips validation/pinning and
  *   performs a plain redirect-following fetch. Defaults to true (always guard).
@@ -399,7 +432,7 @@ export async function withSafeFetch<T>(
 ): Promise<T> {
   const guard = opts.guard ?? true;
   if (!guard) {
-    return use(await undiciFetch(rawUrl, { ...init, redirect: 'follow' }));
+    return useAndSettleBody(await undiciFetch(rawUrl, { ...init, redirect: 'follow' }), use);
   }
 
   if (opts.followRedirects) {
@@ -411,7 +444,7 @@ export async function withSafeFetch<T>(
     await resolveSafeFetchTarget(rawUrl);
     const dispatcher = new Agent({ connect: { lookup: validatingLookup() } });
     try {
-      return await use(await undiciFetch(rawUrl, { ...init, redirect: 'follow', dispatcher }));
+      return await useAndSettleBody(await undiciFetch(rawUrl, { ...init, redirect: 'follow', dispatcher }), use);
     } finally {
       await dispatcher.destroy().catch(() => undefined);
     }
@@ -421,8 +454,14 @@ export async function withSafeFetch<T>(
   const dispatcher = target ? new Agent({ connect: { lookup: pinnedLookup(target) } }) : undefined;
   try {
     const response = await undiciFetch(rawUrl, { ...init, redirect: 'manual', dispatcher });
-    assertNoRedirect(response, rawUrl);
-    return await use(response);
+    try {
+      assertNoRedirect(response, rawUrl);
+      return await use(response);
+    } finally {
+      // Settle even when assertNoRedirect throws: a refused 3xx still carries an unread body,
+      // and tearing the dispatcher down with it open is the same crash path as #887.
+      await settleUnreadResponseBody(response);
+    }
   } finally {
     if (dispatcher) await dispatcher.destroy().catch(() => undefined);
   }

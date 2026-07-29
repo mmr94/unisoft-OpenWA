@@ -101,6 +101,17 @@ class MessagesResource
         return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-template", [], $body);
     }
 
+    /**
+     * Send a native WhatsApp poll (2–12 options).
+     *
+     * @param array<string,mixed> $body {chatId, name, options, allowMultipleAnswers?}
+     * @return array<string,mixed>
+     */
+    public function sendPoll(string $sessionId, array $body): array
+    {
+        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-poll", [], $body);
+    }
+
     /** @return array<string,mixed> */
     public function reply(string $sessionId, array $body): array
     {
@@ -123,6 +134,18 @@ class MessagesResource
     public function delete(string $sessionId, array $body): array
     {
         return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/delete", [], $body);
+    }
+
+    /**
+     * Edit the text of a message sent by this account. Body is
+     * {chatId, messageId, body}; 404 when the message is not found.
+     *
+     * @param array<string,mixed> $body
+     * @return array<string,mixed>
+     */
+    public function editMessage(string $sessionId, array $body): array
+    {
+        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/edit", [], $body);
     }
 
     /**

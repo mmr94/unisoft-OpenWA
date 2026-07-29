@@ -1,5 +1,6 @@
-import { Controller, Post, Get, Param, Body, Query, HttpCode, HttpStatus } from '@nestjs/common';
+import { Controller, Post, Get, Param, Body, Query, Res, HttpCode, HttpStatus } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery } from '@nestjs/swagger';
+import type { Response } from 'express';
 import { MessageService } from './message.service';
 import { BulkMessageService } from './bulk-message.service';
 import { SendTextMessageDto, SendMediaMessageDto, SendAudioMessageDto, MessageResponseDto } from './dto';
@@ -13,6 +14,7 @@ import {
   ForwardMessageDto,
   ReactMessageDto,
   DeleteMessageDto,
+  EditMessageDto,
 } from './dto/message-actions.dto';
 import { RequireRole } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
@@ -32,7 +34,8 @@ export class MessageController {
   @ApiQuery({
     name: 'from',
     required: false,
-    description: 'Filter by sender. A phone also matches messages from a lid that resolves to it.',
+    description:
+      'Filter by sender. A phone also matches group messages via the author field and any lid that resolves to it.',
   })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Max messages to return (default 50)' })
   @ApiQuery({ name: 'offset', required: false, type: Number, description: 'Offset for pagination' })
@@ -309,16 +312,23 @@ export class MessageController {
     @Query('limit') limit?: string,
     @Query('includeMedia') includeMedia?: string,
     @Query('deep') deep?: string,
+    @Res({ passthrough: true }) res?: Response,
   ) {
     // Parse the limit defensively: a non-numeric query value (?limit=abc) yields NaN,
     // so fall back to undefined and let the service apply its default + clamp.
     const parsedLimit = limit ? parseInt(limit, 10) : undefined;
+    // A client that disconnects mid-history (includeMedia can mean dozens of multi-MB downloads) must
+    // stop the loop: `close` fires on premature disconnect AND after a normal finish — aborting then is
+    // a no-op because the loop has already run to completion.
+    const abort = new AbortController();
+    res?.on('close', () => abort.abort());
     return this.messageService.getChatHistory(
       sessionId,
       chatId,
       parsedLimit !== undefined && !Number.isNaN(parsedLimit) ? parsedLimit : undefined,
       includeMedia === 'true' || includeMedia === '1',
       deep === 'true' || deep === '1',
+      abort.signal,
     );
   }
 
@@ -360,6 +370,31 @@ export class MessageController {
   ): Promise<{ success: boolean }> {
     await this.messageService.deleteMessage(sessionId, dto);
     return { success: true };
+  }
+
+  // ========== Edit Message ==========
+
+  @Post('edit')
+  @HttpCode(HttpStatus.OK)
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({ summary: 'Edit the text of a message sent by this account' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiResponse({
+    status: 200,
+    description: 'Message edited',
+    type: MessageResponseDto,
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Session not active, invalid request, or the send was blocked by a plugin',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'The message was not sent by this account, or the engine refused the edit',
+  })
+  @ApiResponse({ status: 404, description: 'Message not found' })
+  async edit(@Param('sessionId') sessionId: string, @Body() dto: EditMessageDto): Promise<MessageResponseDto> {
+    return this.messageService.editMessage(sessionId, dto);
   }
 
   // ========== Bulk Messaging ==========
@@ -430,7 +465,7 @@ export class MessageController {
   })
   @ApiResponse({
     status: 400,
-    description: 'Batch already completed or cancelled',
+    description: 'Batch already completed, cancelled, or failed (terminal statuses are exclusive)',
   })
   @ApiResponse({
     status: 404,

@@ -5,7 +5,7 @@ describe('AddTemplateNameUnique migration', () => {
   let ds: DataSource;
 
   beforeEach(async () => {
-    ds = new DataSource({ type: 'sqlite', database: ':memory:' });
+    ds = new DataSource({ type: 'better-sqlite3', database: ':memory:' });
     await ds.initialize();
     // Minimal templates table mirroring the AddTemplates sqlite schema.
     await ds.query(
@@ -81,7 +81,7 @@ describe('AddTemplateNameUnique migration', () => {
     // dedup UPDATE / CREATE UNIQUE INDEX over templates must not be aborted mid-flight.
     const queries: string[] = [];
     const pgRunner = {
-      connection: { options: { type: 'postgres' } },
+      dataSource: { options: { type: 'postgres' } },
       hasTable: jest.fn().mockResolvedValue(true),
       query: jest.fn((sql: string) => {
         queries.push(sql);

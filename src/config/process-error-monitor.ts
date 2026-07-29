@@ -4,6 +4,27 @@ interface FatalLogger {
 }
 
 /**
+ * As FatalLogger, plus the warn level the rejection handler downgrades to.
+ *
+ * `warn` takes structured CONTEXT, not a trace string: unlike `error(message, trace, context)`, the
+ * logger's second `warn` parameter is the context, and a string there replaces the logger name for the
+ * whole line. Passing a stack positionally type-checks and then buries it where the scope should be.
+ */
+interface RejectionLogger extends FatalLogger {
+  warn: (message: string, context?: Record<string, unknown>) => void;
+}
+
+/**
+ * Puppeteer raises this when an isolated world is disposed while an `evaluate` is still waiting for an
+ * execution context — i.e. the page went away underneath it.
+ *
+ * Deliberately duplicated from the whatsapp-web.js adapter's own predicate rather than imported: that
+ * module pulls whatsapp-web.js in eagerly, and this one is loaded during bootstrap, where the engine
+ * must stay lazy. Keep the two in sync.
+ */
+const PAGE_CONTEXT_LOST_REJECTION = /execution context was destroyed/i;
+
+/**
  * Register an `uncaughtExceptionMonitor` that routes an otherwise-fatal uncaught exception through the
  * structured logger BEFORE Node's default handling.
  *
@@ -28,5 +49,40 @@ export function registerUncaughtExceptionMonitor(logger: FatalLogger): void {
     } catch {
       /* never mask the original fatal error */
     }
+  });
+}
+
+/**
+ * Backstop for promise rejections that escaped a local handler. Node terminates the process on an
+ * unhandled rejection by default; for a long-running self-hosted gateway we log it and stay up rather
+ * than let one stray rejection kill every session.
+ *
+ * One class is logged at WARN instead of ERROR: a Puppeteer rejection left behind when the page an
+ * `evaluate` was waiting on goes away. whatsapp-web.js re-runs `inject()` from an async
+ * `framenavigated` listener it never awaits, so a page navigation or an engine teardown turns that
+ * still-pending evaluate into a rejection with no owner (#982). Either way the session recovers on its
+ * own, and an ERROR with a raw Puppeteer stack reads like a crash.
+ *
+ * Deliberately scoped so nothing actionable is muted: the ACTIONABLE variant of the same message — a
+ * browser profile left stale by an upgrade that changed the Chromium binary (#663/#708) — is thrown
+ * from inside `engine.initialize()`, where the adapter catches it and logs its own advisory, so it
+ * never reaches this handler. And only the severity changes: the full reason is still logged.
+ */
+export function registerUnhandledRejectionHandler(logger: RejectionLogger): void {
+  process.on('unhandledRejection', (reason: unknown) => {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    const detail = reason instanceof Error ? reason.stack : String(reason);
+    if (PAGE_CONTEXT_LOST_REJECTION.test(message)) {
+      // The stack goes in the context object, not the second positional slot: `warn`'s second
+      // parameter is the log context, and a string there becomes the line's scope name.
+      logger.warn(
+        'Puppeteer rejection after the page it was evaluating went away (navigation or engine ' +
+          "teardown) — expected; the session recovers on its own. Check the session's own " +
+          'disconnect/failure logs for the outcome.',
+        { reason: detail, action: 'page_context_lost_rejection' },
+      );
+      return;
+    }
+    logger.error('Unhandled promise rejection', detail);
   });
 }

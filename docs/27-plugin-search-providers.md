@@ -1,6 +1,6 @@
 # 27 - Writing a Search-Provider Plugin
 
-> **Status:** The host→plugin search RPC shipped in v0.8.13 (PR #674). A sandboxed plugin can now register
+> **Status:** The host→plugin search RPC shipped in v0.8.14 (PR #674). A sandboxed plugin can now register
 > as a `SearchProvider` and answer `GET /api/search` queries from its own backend (Meilisearch,
 > Elasticsearch, Typesense, OpenSearch, …) while the core stays backend-agnostic. This guide is the
 > plugin-author's contract.
@@ -76,6 +76,22 @@ ctx.registerHook('message:persisted', async (hookCtx) => {
   const { sessionId, message } = hookCtx.data;
   // message carries: id, waMessageId, sessionId, chatId, body, from, to, type, direction, timestamp, …
   await myBackend.index(message);   // fire-and-forget is fine; an error here doesn't break the send/receive
+});
+```
+
+**Outbound rows are re-emitted on every state transition.** An API-originated send first emits the row
+as `PENDING` (usually with `waMessageId` still null), then emits it **again** with the same `id` once it
+reaches its terminal state (`SENT` with the engine id, or `FAILED`). Key your documents by the row `id`
+and treat every emission as an upsert, and your index always converges to the finalized state.
+
+One race remains visible by design: when the engine's own-send echo wins, the redundant PENDING row is
+merged into the echo's row and then dropped. The core emits `message:persisted` for the surviving row
+(upsert it) followed by `message:deleted` for the dropped one — delete that document by its `id`:
+
+```ts
+ctx.registerHook('message:deleted', async (hookCtx) => {
+  const { message } = hookCtx.data;
+  await myBackend.delete(message.id);
 });
 ```
 
@@ -204,5 +220,5 @@ ctx interface is planned; for now the search contract types above are the stable
 
 > See also: [26 - Global Search](./26-global-search.md) (the feature + the built-in provider),
 > [19 - Plugin Architecture](./19-plugin-architecture.md),
-> [23 - Plugin Sandboxing](./23-plugin-sandboxing.md),
+> [30 - Plugin Sandboxing](./30-plugin-sandboxing.md),
 > [06 - API Specification](./06-api-specification.md) §6.4.12 Search.

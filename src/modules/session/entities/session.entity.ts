@@ -9,6 +9,7 @@ export enum SessionStatus {
   AUTHENTICATING = 'authenticating',
   READY = 'ready',
   DISCONNECTED = 'disconnected',
+  ACTION_REQUIRED = 'action_required',
   FAILED = 'failed',
   // Engine intentionally unloaded after inactivity to free RAM.
   // The WhatsApp auth data is kept on disk, so resuming does NOT require a new QR scan.

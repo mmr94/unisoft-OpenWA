@@ -5,16 +5,18 @@ import http from 'http';
 import crypto from 'crypto';
 import { AddressInfo } from 'net';
 import { Test, TestingModule } from '@nestjs/testing';
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { INestApplication } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
+import { applyGlobalValidation } from './../src/config/app-validation';
 import { AuthService } from './../src/modules/auth/auth.service';
 import { ApiKeyRole } from './../src/modules/auth/entities/api-key.entity';
 import { Session } from './../src/modules/session/entities/session.entity';
 import { WebhookService } from './../src/modules/webhook/webhook.service';
+import { HookManager } from './../src/core/hooks';
 
 /**
  * End-to-end coverage for the webhooks module across the seam the unit specs can't reach: the REST
@@ -36,6 +38,8 @@ describe('Webhooks (e2e)', () => {
   let receiver: http.Server;
   let receiverUrl: string;
   const prevSsrf = process.env.WEBHOOK_SSRF_PROTECT;
+  const prevMaxPerSession = process.env.WEBHOOK_MAX_PER_SESSION;
+  const prevMediaInlineMax = process.env.WEBHOOK_MEDIA_INLINE_MAX_BYTES;
 
   // Webhooks carry a CASCADE foreign key to a session row, and dispatch looks them up by sessionId.
   // Persisting one real session per test both satisfies the FK and isolates each case (and prior
@@ -71,14 +75,17 @@ describe('Webhooks (e2e)', () => {
 
   beforeAll(async () => {
     process.env.WEBHOOK_SSRF_PROTECT = 'false';
+    // Small bounds so the payload-bounds cases below exercise them without bulky setups. Read once
+    // at module load, so they must be set before AppModule compiles.
+    process.env.WEBHOOK_MAX_PER_SESSION = '3';
+    process.env.WEBHOOK_MEDIA_INLINE_MAX_BYTES = '1024';
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
     }).compile();
 
     app = moduleFixture.createNestApplication();
-    app.setGlobalPrefix('api');
-    app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+    applyGlobalValidation(app);
     await app.init();
 
     webhookService = app.get(WebhookService);
@@ -106,6 +113,10 @@ describe('Webhooks (e2e)', () => {
     await new Promise<void>(resolve => receiver.close(() => resolve()));
     if (prevSsrf === undefined) delete process.env.WEBHOOK_SSRF_PROTECT;
     else process.env.WEBHOOK_SSRF_PROTECT = prevSsrf;
+    if (prevMaxPerSession === undefined) delete process.env.WEBHOOK_MAX_PER_SESSION;
+    else process.env.WEBHOOK_MAX_PER_SESSION = prevMaxPerSession;
+    if (prevMediaInlineMax === undefined) delete process.env.WEBHOOK_MEDIA_INLINE_MAX_BYTES;
+    else process.env.WEBHOOK_MEDIA_INLINE_MAX_BYTES = prevMediaInlineMax;
     try {
       await app?.close();
     } catch {
@@ -324,6 +335,108 @@ describe('Webhooks (e2e)', () => {
       expect(headers['content-type']).toBe('application/json');
       expect(headers['x-custom']).toBe('ok'); // legitimate custom header preserved
     });
+
+    it('keeps server identity fields on the signed body when a webhook:before hook tampers with them', async () => {
+      const session = await nextSession();
+      const secret = 'sig-secret';
+      await createWebhook(session, { secret });
+
+      const hookManager = app.get(HookManager);
+      const hookId = hookManager.register('e2e-tamper', 'webhook:before', ctx => {
+        const data = ctx.data as { payload: Record<string, unknown> };
+        return Promise.resolve({
+          continue: true,
+          data: {
+            ...data,
+            payload: {
+              ...data.payload,
+              event: 'forged.event',
+              sessionId: 'other-session',
+              timestamp: '1999-01-01T00:00:00.000Z',
+            },
+          },
+        });
+      });
+      try {
+        await webhookService.dispatch(session, 'message.received', { from: 'boss@c.us' });
+        await waitFor(() => received.length === 1);
+
+        const { headers, raw, body } = received[0];
+        // The tampered identity fields were re-asserted to the server's values, so the body still
+        // matches the headers and the signature still verifies over the exact bytes received.
+        expect(body.event).toBe('message.received');
+        expect(body.sessionId).toBe(session);
+        expect(body.timestamp).not.toBe('1999-01-01T00:00:00.000Z');
+        expect(headers['x-openwa-event']).toBe('message.received');
+        const expected = `sha256=${crypto.createHmac('sha256', secret).update(raw).digest('hex')}`;
+        expect(headers['x-openwa-signature']).toBe(expected);
+        expect((body as { data: { from: string } }).data.from).toBe('boss@c.us'); // data stays hook-controlled
+      } finally {
+        hookManager.unregister(hookId);
+      }
+    });
+  });
+
+  // ── payload bounds (per-session cap + inline-media shedding) ──────
+
+  describe('payload bounds', () => {
+    it('rejects the (cap+1)-th webhook with 400 while the grandfathered ones keep working', async () => {
+      const session = await nextSession();
+      // WEBHOOK_MAX_PER_SESSION=3 for this suite (set in beforeAll).
+      for (let i = 0; i < 3; i++) {
+        await createWebhook(session);
+      }
+      const res = await request(app.getHttpServer())
+        .post(`/api/sessions/${session}/webhooks`)
+        .set('X-API-Key', apiKey)
+        .send({ url: receiverUrl, events: ['*'] })
+        .expect(400);
+      expect((res.body as { message: string }).message).toMatch(/Webhook limit reached/);
+
+      // The webhooks registered before the cap are unaffected: every one of them still receives.
+      await webhookService.dispatch(session, 'message.received', { from: 'a@c.us', body: 'hi' });
+      await waitFor(() => received.length === 3);
+    });
+
+    it('delivers over-threshold media as an omitted marker, signed over the exact shed bytes', async () => {
+      const session = await nextSession();
+      const secret = 'media-secret';
+      await createWebhook(session, { secret });
+
+      const base64 = Buffer.alloc(2048, 11).toString('base64'); // 2048 decoded bytes > 1024 inline cap
+      await webhookService.dispatch(session, 'message.received', {
+        from: 'a@c.us',
+        media: { mimetype: 'image/jpeg', filename: 'big.jpg', data: base64 },
+      });
+      await waitFor(() => received.length === 1);
+
+      const { headers, raw, body } = received[0];
+      expect((body as { data: { media: Record<string, unknown> } }).data.media).toEqual({
+        mimetype: 'image/jpeg',
+        filename: 'big.jpg',
+        omitted: true,
+        sizeBytes: 2048,
+      });
+      // The signature verifies over the exact marker-form bytes the receiver got.
+      const expected = `sha256=${crypto.createHmac('sha256', secret).update(raw).digest('hex')}`;
+      expect(headers['x-openwa-signature']).toBe(expected);
+    });
+
+    it('keeps under-threshold media inline end-to-end', async () => {
+      const session = await nextSession();
+      await createWebhook(session);
+
+      const base64 = Buffer.alloc(512, 4).toString('base64'); // 512 decoded bytes < 1024 inline cap
+      await webhookService.dispatch(session, 'message.received', {
+        from: 'a@c.us',
+        media: { mimetype: 'image/jpeg', data: base64 },
+      });
+      await waitFor(() => received.length === 1);
+
+      const media = (received[0].body as { data: { media: { data?: string; omitted?: boolean } } }).data.media;
+      expect(media.data).toBe(base64);
+      expect(media.omitted).toBeUndefined();
+    });
   });
 
   // ── the test endpoint ─────────────────────────────────────────────
@@ -336,7 +449,7 @@ describe('Webhooks (e2e)', () => {
       const res = await request(app.getHttpServer())
         .post(`/api/sessions/${session}/webhooks/${created.id as string}/test`)
         .set('X-API-Key', apiKey)
-        .expect(201);
+        .expect(200);
 
       expect((res.body as { success: boolean }).success).toBe(true);
       await waitFor(() => received.length === 1);

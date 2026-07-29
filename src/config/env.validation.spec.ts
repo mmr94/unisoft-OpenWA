@@ -87,11 +87,43 @@ describe('validateEnv', () => {
     expect(() => validateEnv({ RATE_LIMIT_LONG_LIMIT: '0' })).toThrow(/RATE_LIMIT_LONG_LIMIT/);
     expect(() => validateEnv({ WEBHOOK_TIMEOUT: '0' })).toThrow(/WEBHOOK_TIMEOUT/);
     // 0 stays valid where it has a real meaning: unlimited sessions, no webhook retries, a TTL.
-    expect(() =>
-      validateEnv({ MAX_CONCURRENT_SESSIONS: '0', WEBHOOK_MAX_RETRIES: '0', RATE_LIMIT_SHORT_TTL: '0' }),
-    ).not.toThrow();
+    expect(() => validateEnv({ MAX_CONCURRENT_SESSIONS: '0', RATE_LIMIT_SHORT_TTL: '0' })).not.toThrow();
     // a positive value still passes
     expect(() => validateEnv({ RATE_LIMIT_SHORT_LIMIT: '10', WEBHOOK_TIMEOUT: '10000' })).not.toThrow();
+  });
+
+  it('rejects a non-positive / non-integer in-flight body budget (0 would refuse every body)', () => {
+    expect(() => validateEnv({ INFLIGHT_BODY_BUDGET_BYTES: '0' })).toThrow(/INFLIGHT_BODY_BUDGET_BYTES/);
+    expect(() => validateEnv({ INFLIGHT_BODY_BUDGET_BYTES: '100mb' })).toThrow(/INFLIGHT_BODY_BUDGET_BYTES/);
+    expect(() => validateEnv({ INFLIGHT_BODY_BUDGET_BYTES: '-5' })).toThrow(/INFLIGHT_BODY_BUDGET_BYTES/);
+    expect(() => validateEnv({ INFLIGHT_BODY_BUDGET_BYTES: '104857600' })).not.toThrow();
+  });
+
+  it('rejects a negative/non-integer webhook fan-out knob (0 is a documented escape hatch)', () => {
+    expect(() => validateEnv({ WEBHOOK_MAX_PER_SESSION: '-1' })).toThrow(/WEBHOOK_MAX_PER_SESSION/);
+    expect(() => validateEnv({ WEBHOOK_MAX_PER_SESSION: '1.5' })).toThrow(/WEBHOOK_MAX_PER_SESSION/);
+    expect(() => validateEnv({ WEBHOOK_MEDIA_INLINE_MAX_BYTES: 'abc' })).toThrow(/WEBHOOK_MEDIA_INLINE_MAX_BYTES/);
+    // 0 is meaningful for both: unlimited registrations / never inline media.
+    expect(() => validateEnv({ WEBHOOK_MAX_PER_SESSION: '0', WEBHOOK_MEDIA_INLINE_MAX_BYTES: '0' })).not.toThrow();
+  });
+
+  it('rejects a non-positive / non-integer WEBHOOK_MAX_PAYLOAD_BYTES (0 would reject every dispatch)', () => {
+    expect(() => validateEnv({ WEBHOOK_MAX_PAYLOAD_BYTES: '0' })).toThrow(/WEBHOOK_MAX_PAYLOAD_BYTES/);
+    expect(() => validateEnv({ WEBHOOK_MAX_PAYLOAD_BYTES: 'abc' })).toThrow(/WEBHOOK_MAX_PAYLOAD_BYTES/);
+    expect(() => validateEnv({ WEBHOOK_MAX_PAYLOAD_BYTES: '-5' })).toThrow(/WEBHOOK_MAX_PAYLOAD_BYTES/);
+    expect(() => validateEnv({ WEBHOOK_MAX_PAYLOAD_BYTES: '1048576' })).not.toThrow();
+  });
+
+  it('rejects non-decimal integer spellings that parseInt would silently truncate', () => {
+    // Number('1e6') is a valid integer, but the config readers use parseInt(raw, 10) — which reads
+    // `1e6` as 1 and `0x100` as 0. Validation must reject these so the validated value and the
+    // parsed value can never disagree.
+    expect(() => validateEnv({ WEBHOOK_MEDIA_INLINE_MAX_BYTES: '1e6' })).toThrow(/WEBHOOK_MEDIA_INLINE_MAX_BYTES/);
+    expect(() => validateEnv({ WEBHOOK_MEDIA_INLINE_MAX_BYTES: '0x100' })).toThrow(/WEBHOOK_MEDIA_INLINE_MAX_BYTES/);
+    expect(() => validateEnv({ PORT: '0x50' })).toThrow(/PORT/);
+    expect(() => validateEnv({ RATE_LIMIT_SHORT_TTL: '1e3' })).toThrow(/RATE_LIMIT_SHORT_TTL/);
+    // Plain decimal integers still pass.
+    expect(() => validateEnv({ WEBHOOK_MEDIA_INLINE_MAX_BYTES: '1048576', PORT: '2785' })).not.toThrow();
   });
 
   it('rejects a non-canonical boolean feature flag instead of silently disabling the feature', () => {
@@ -109,6 +141,20 @@ describe('validateEnv', () => {
     // Canonical values, unset, and blank (a compose `${KEY:-}` forward renders '') all pass.
     expect(() => validateEnv({ QUEUE_ENABLED: 'true', MCP_ENABLED: 'false', SERVE_DASHBOARD: 'true' })).not.toThrow();
     expect(() => validateEnv({ QUEUE_ENABLED: '', SERVE_DASHBOARD: '' })).not.toThrow();
+    expect(() => validateEnv({})).not.toThrow();
+  });
+
+  it('rejects a REDIS_ENABLED typo instead of silently downgrading throttler+cache to in-memory', () => {
+    // REDIS_ENABLED is read at boot with `=== 'true'` (throttler storage in app.module.ts,
+    // CacheService), so a typo flips rate limiting + caching to per-process in-memory with zero
+    // diagnostics — a silent behavior/security downgrade on a multi-replica deployment.
+    expect(() => validateEnv({ REDIS_ENABLED: 'ture' })).toThrow(/REDIS_ENABLED/);
+    expect(() => validateEnv({ REDIS_ENABLED: 'True' })).toThrow(/REDIS_ENABLED/);
+    expect(() => validateEnv({ REDIS_ENABLED: '1' })).toThrow(/REDIS_ENABLED/);
+    // Canonical values, blank (compose `${KEY:-}` forward), and unset all pass.
+    expect(() => validateEnv({ REDIS_ENABLED: 'true' })).not.toThrow();
+    expect(() => validateEnv({ REDIS_ENABLED: 'false' })).not.toThrow();
+    expect(() => validateEnv({ REDIS_ENABLED: '' })).not.toThrow();
     expect(() => validateEnv({})).not.toThrow();
   });
 
@@ -143,6 +189,44 @@ describe('validateEnv', () => {
         DATABASE_USERNAME: 'u',
         DATABASE_PASSWORD: 'p',
         DATABASE_NAME: 'main.sqlite',
+      }),
+    ).not.toThrow();
+  });
+
+  it('resolves the main DB path from MAIN_DATABASE_NAME like the runtime (no false-negative/-positive)', () => {
+    // The runtime main path is MAIN_DATABASE_NAME || ./data/main.sqlite (configuration.ts). When it
+    // is overridden, a DATABASE_NAME following it to the same file must still be caught — comparing
+    // against the hardcoded default alone would miss this.
+    expect(() =>
+      validateEnv({
+        DATABASE_TYPE: 'sqlite',
+        MAIN_DATABASE_NAME: '/srv/openwa/main.sqlite',
+        DATABASE_NAME: '/srv/openwa/main.sqlite',
+      }),
+    ).toThrow(/DATABASE_NAME/);
+    // Same collision via a non-normalized spelling (relative/absolute forms of one file).
+    expect(() =>
+      validateEnv({
+        DATABASE_TYPE: 'sqlite',
+        MAIN_DATABASE_NAME: './custom/main.sqlite',
+        DATABASE_NAME: './custom/../custom/main.sqlite',
+      }),
+    ).toThrow(/DATABASE_NAME/);
+    // And the reverse: when MAIN_DATABASE_NAME moves the main DB elsewhere, the DEFAULT main file
+    // is no longer the runtime main DB, so using it for data must NOT be rejected.
+    expect(() =>
+      validateEnv({
+        DATABASE_TYPE: 'sqlite',
+        MAIN_DATABASE_NAME: '/srv/openwa/main.sqlite',
+        DATABASE_NAME: './data/main.sqlite',
+      }),
+    ).not.toThrow();
+    // Distinct overridden paths pass.
+    expect(() =>
+      validateEnv({
+        DATABASE_TYPE: 'sqlite',
+        MAIN_DATABASE_NAME: './data/auth.sqlite',
+        DATABASE_NAME: './data/openwa.sqlite',
       }),
     ).not.toThrow();
   });

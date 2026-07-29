@@ -9,6 +9,8 @@ import com.rmyndharis.openwa.http.HttpMethod;
 import com.rmyndharis.openwa.model.CreateWebhookRequest;
 import com.rmyndharis.openwa.model.UpdateWebhookRequest;
 import com.rmyndharis.openwa.model.WebhookEvent;
+import com.rmyndharis.openwa.model.WebhookFilterCondition;
+import com.rmyndharis.openwa.model.WebhookFilters;
 import com.rmyndharis.openwa.support.MockTransport;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -77,5 +79,44 @@ class WebhooksResourceTest {
         client.webhooks.test("s", "w1");
         assertEquals("http://h/api/sessions/s/webhooks/w1/test", tx.lastRequest().url());
         assertEquals(HttpMethod.POST, tx.lastRequest().method());
+    }
+
+    @Test
+    void createSerializesNewEventTypes() {
+        tx.respond(200, WEBHOOK_JSON);
+        client.webhooks.create(
+            "s",
+            CreateWebhookRequest.builder()
+                .url("https://example.test/hook")
+                .events(List.of(
+                    WebhookEvent.GROUP_JOIN, WebhookEvent.GROUP_LEAVE, WebhookEvent.GROUP_UPDATE,
+                    WebhookEvent.CALL_RECEIVED))
+                .build());
+        assertTrue(tx.lastRequest().body().contains("group.join"));
+        assertTrue(tx.lastRequest().body().contains("group.leave"));
+        assertTrue(tx.lastRequest().body().contains("group.update"));
+        assertTrue(tx.lastRequest().body().contains("call.received"));
+    }
+
+    @Test
+    void createSerializesPolymorphicFilterValues() {
+        tx.respond(200, WEBHOOK_JSON);
+        // The filter value is polymorphic on the wire: string list (id/enum
+        // fields), single string (text fields, optionally caseSensitive), and
+        // boolean (boolean fields).
+        client.webhooks.create(
+            "s",
+            CreateWebhookRequest.builder()
+                .url("https://example.test/hook")
+                .filters(new WebhookFilters(List.of(
+                    new WebhookFilterCondition("sender", "is", List.of("123@c.us")),
+                    new WebhookFilterCondition("body", "contains", "invoice", true),
+                    new WebhookFilterCondition("isGroup", "is", false, null))))
+                .build());
+        String body = tx.lastRequest().body();
+        assertTrue(body.contains("\"value\":[\"123@c.us\"]"), body);
+        assertTrue(body.contains("\"value\":\"invoice\""), body);
+        assertTrue(body.contains("\"caseSensitive\":true"), body);
+        assertTrue(body.contains("\"value\":false"), body);
     }
 }

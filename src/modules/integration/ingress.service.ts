@@ -40,6 +40,7 @@ export interface IngressDeps {
       providerDeliveryId: string;
       route: string;
       payload: { headers: Record<string, string>; query: Record<string, string>; body: string; rawBody: string };
+      payloadHash: string;
       sessionId: string | null;
     }): Promise<boolean>;
   };
@@ -111,7 +112,10 @@ export class IngressService {
       return { status: preflight.status, body: preflight.body };
     }
 
-    const dedupHeader = (route.dedupHeader ?? route.signature.dedupHeader ?? 'x-delivery').toLowerCase();
+    // Standard Webhooks signs and requires webhook-id, so it is the stable, authenticated retry id.
+    // Other schemes retain the existing x-delivery/body-hash behavior for compatibility.
+    const defaultDedupHeader = route.signature.scheme === 'standard-webhooks' ? 'webhook-id' : 'x-delivery';
+    const dedupHeader = (route.dedupHeader ?? route.signature.dedupHeader ?? defaultDedupHeader).toLowerCase();
     const deliveryId = req.headers[dedupHeader] ?? deriveDeliveryId(req);
     const payload = { headers: req.headers, query: req.query, body: req.rawBody, rawBody: req.rawBody };
     const isNew = await this.deps.events.recordOrSkip({
@@ -120,6 +124,8 @@ export class IngressService {
       providerDeliveryId: deliveryId,
       route: req.route,
       payload,
+      // The slim content fingerprint kept after the payload is retired on dispatch (see the entity).
+      payloadHash: createHash('sha256').update(req.rawBody).digest('hex'),
       sessionId: instance.sessionScope,
     });
     if (!isNew) return { status: 200, body: 'duplicate' }; // already persisted/acked
@@ -131,6 +137,7 @@ export class IngressService {
       pluginId: req.pluginId,
       instanceId: req.instanceId,
       route: req.route,
+      method: req.method,
       deliveryId,
       sessionId: instance.sessionScope ?? undefined,
       providerConversationId,

@@ -1,9 +1,19 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import type { Agent } from 'https';
 import * as qrcode from 'qrcode';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 import type * as BaileysLib from '@whiskeysockets/baileys';
-import type { AnyMessageContent, MiscMessageGenerationOptions, WAMessage, WASocket } from '@whiskeysockets/baileys';
+import type {
+  AnyMessageContent,
+  MiscMessageGenerationOptions,
+  WACallEvent,
+  WAMessage,
+  WASocket,
+} from '@whiskeysockets/baileys';
 import { buildIncomingMessageFromBaileys, extractBaileysBody, mapBaileysStatus } from './baileys-message-mapper';
+import { buildEditedMessage } from './message-mapper';
 import { mapBaileysGroup, mapBaileysGroupInfo } from './baileys-group-mapper';
 import type { ILogger } from '@whiskeysockets/baileys/lib/Utils/logger.js';
 import {
@@ -15,8 +25,11 @@ import {
   ContactCard,
   EngineEventCallbacks,
   EngineStatus,
+  EditedMessage,
   Group,
+  GroupEvent,
   GroupInfo,
+  IncomingCallEvent,
   IncomingMessage,
   IWhatsAppEngine,
   Label,
@@ -25,6 +38,7 @@ import {
   MessageReaction,
   MessageResult,
   PaginatedProducts,
+  ParticipantOperationResult,
   PollInput,
   Product,
   ProductQueryOptions,
@@ -36,9 +50,13 @@ import {
   StatusPostOptions,
 } from '../interfaces/whatsapp-engine.interface';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
+import { BadRequestException } from '@nestjs/common';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { MessageNotFoundError } from '../../common/errors/message-not-found.error';
+import { CallNotFoundError } from '../../common/errors/call-not-found.error';
+import { EngineRefusedError } from '../../common/errors/engine-refused.error';
+import { InvalidInviteCodeError } from '../../common/errors/invalid-invite-code.error';
 import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
 import { createLogger } from '../../common/services/logger.service';
 import { BaileysAdapterConfig, BaileysLogger } from '../types/baileys.types';
@@ -55,8 +73,31 @@ import {
 } from './inbound-media-cap';
 import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
 
-/** Linked-device identity shown in WhatsApp (Settings → Linked Devices). */
-const BAILEYS_BROWSER: [string, string, string] = ['OpenWA', 'Chrome', '120.0.0'];
+/** Linked-device identity shown in WhatsApp (Settings → Linked Devices). The display name is
+ * operator-brandable via BAILEYS_BROWSER_NAME; it only applies to pairings made after the change. */
+const BAILEYS_BROWSER: [string, string, string] = [
+  process.env.BAILEYS_BROWSER_NAME?.trim() || 'OpenWA',
+  'Chrome',
+  '120.0.0',
+];
+
+/**
+ * Build the Node-layer agent for a session egress proxy (#859). Both the WhatsApp WebSocket
+ * (`agent`) and media up/downloads (`fetchAgent`) ride it; credentials stay in the URL and are
+ * authenticated on the socket itself, so none of the Chromium CDP auth timing the wwjs engine is
+ * exposed to applies here. The scheme set matches the create-session DTO validator; anything else
+ * (a pre-validation DB row) throws, failing the session closed rather than silently going direct.
+ */
+export function createProxyAgent(proxyUrl: string): Agent {
+  const { protocol } = new URL(proxyUrl);
+  if (protocol === 'http:' || protocol === 'https:') {
+    return new HttpsProxyAgent(proxyUrl);
+  }
+  if (protocol === 'socks4:' || protocol === 'socks5:') {
+    return new SocksProxyAgent(proxyUrl);
+  }
+  throw new Error(`Unsupported proxy protocol for the baileys engine: ${protocol}`);
+}
 
 /** Fully silent logger so Baileys does not spam stdout; diagnostics flow via connection.update. */
 function createSilentLogger(): BaileysLogger {
@@ -141,6 +182,12 @@ export class BaileysAdapter implements IWhatsAppEngine {
   private connectedAt = 0;
   private reconnectAttempts = 0;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
+  /** How long a received call's handle stays rejectable. Calls ring for roughly a minute, so
+   *  two minutes covers the ringing window with margin without pinning dead calls for long. */
+  private static readonly LIVE_CALL_TTL_MS = 2 * 60_000;
+  /** Live incoming calls by call id, holding the raw `from` JID sock.rejectCall() needs — the
+   *  call event is long gone by the time a reject arrives, so it must be cached at event time. */
+  private readonly liveCalls = new Map<string, { callFrom: string; expiresAt: number }>();
   /** Date.now() of the last close that scheduled a reconnect — input to the stability reset. */
   private lastConnectionCloseAt = 0;
   /** Lazily loaded @whiskeysockets/baileys module (ESM-only; loaded on first connect, not at boot). */
@@ -154,13 +201,6 @@ export class BaileysAdapter implements IWhatsAppEngine {
     // Isolate each session's auth state under its own subdirectory of the shared auth dir.
     this.authPath = path.join(config.authDir, config.sessionId);
     this.sessionStore = new BaileysSessionStore(config.lidMappingStore, config.sessionId);
-    if (config.proxyUrl) {
-      // Proxy support is gated for this slice — Baileys proxying needs an http/socks agent (a new dep).
-      this.logger.warn('Proxy configured but not supported by the baileys engine in this slice; ignoring it', {
-        action: 'baileys_proxy_unsupported',
-        sessionId: config.sessionId,
-      });
-    }
   }
 
   // ----- Lifecycle -----
@@ -192,6 +232,15 @@ export class BaileysAdapter implements IWhatsAppEngine {
 
   private async connectInner(): Promise<void> {
     this.setStatus(EngineStatus.INITIALIZING);
+    // Build the egress proxy agent BEFORE any auth-state I/O so an unusable proxy value fails the
+    // session (engine_error) instead of silently connecting direct (#859).
+    let proxyAgent: Agent | undefined;
+    if (this.config.proxyUrl) {
+      proxyAgent = createProxyAgent(this.config.proxyUrl);
+      const { protocol, host } = new URL(this.config.proxyUrl);
+      // Credential-stripped, matching the wwjs adapter's log line (#628).
+      this.logger.log(`Using proxy: ${protocol}//${host}`, { sessionId: this.config.sessionId });
+    }
     const b = await this.loadLib();
     const { state, saveCreds } = await b.useMultiFileAuthState(this.authPath);
     const { version } = await b.fetchLatestBaileysVersion();
@@ -218,7 +267,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
     }
 
     // An internal reconnect (transient drop) overwrites this.sock WITHOUT going through
-    // disconnect/logout/destroy, so the previous socket's WebSocket and the 10 ev listeners we
+    // disconnect/logout/destroy, so the previous socket's WebSocket and the 13 ev listeners we
     // register below would leak on every reconnect. Tear the prior socket down first. Detach OUR
     // connection.update listener BEFORE end(): Baileys' own end() synchronously emits a synthetic
     // connection.update {connection:'close'}, which — if still wired — would re-enter
@@ -236,7 +285,10 @@ export class BaileysAdapter implements IWhatsAppEngine {
         previous.ev.removeAllListeners('chats.update');
         previous.ev.removeAllListeners('messaging-history.set');
         previous.ev.removeAllListeners('lid-mapping.update');
-        previous.end(undefined);
+        previous.ev.removeAllListeners('group-participants.update');
+        previous.ev.removeAllListeners('groups.update');
+        previous.ev.removeAllListeners('call');
+        void previous.end(undefined);
       } catch {
         // end() may already have run from Baileys' own close handler — a safe no-op.
       }
@@ -247,6 +299,9 @@ export class BaileysAdapter implements IWhatsAppEngine {
       version,
       browser: BAILEYS_BROWSER,
       printQRInTerminal: false,
+      // Session egress proxy (#859): the WS and media transfers share one agent; undefined = direct.
+      agent: proxyAgent,
+      fetchAgent: proxyAgent,
       // Enable the initial sync. Baileys defaults `shouldSyncHistoryMessage` to `() => !!syncFullHistory`,
       // so leaving both unset disables ALL history + app-state sync - no contacts, chats, recent history,
       // or lid->phone mappings ever arrive (the address-book app-state sync only runs once history sync is
@@ -295,6 +350,8 @@ export class BaileysAdapter implements IWhatsAppEngine {
       });
       this.sessionStore.upsertChats(updates);
     });
+    sock.ev.on('group-participants.update', event => this.handleGroupParticipantsUpdate(event));
+    sock.ev.on('groups.update', updates => this.handleGroupsUpdate(updates));
     sock.ev.on('messaging-history.set', history => {
       this.sessionStore.upsertContacts(history.contacts);
       this.sessionStore.upsertChats(history.chats);
@@ -317,6 +374,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
     // WhatsApp pushes this when a lid<->phone mapping is learned (renamed from the pre-v7
     // 'chats.phoneNumberShare' event, whose { lid, jid } payload this shape directly replaces).
     sock.ev.on('lid-mapping.update', ({ lid, pn }) => this.sessionStore.addLidMappings([{ lid, pn }]));
+    sock.ev.on('call', calls => this.handleCallEvents(calls));
   }
 
   private handleConnectionUpdate(update: {
@@ -367,6 +425,9 @@ export class BaileysAdapter implements IWhatsAppEngine {
         // Baileys silently retries them instead of emitting a new QR, leaving the session stuck (no QR).
         this.setStatus(EngineStatus.DISCONNECTED);
         this.sock = null;
+        // Cached call handles die with the connection — drop them so a later rejectCall() reports
+        // not-found (404) instead of acting on a dead socket (mirrors disconnect/logout/destroy).
+        this.liveCalls.clear();
         void this.clearAuthState();
         this.callbacks.onDisconnected?.('logged out');
         return;
@@ -378,6 +439,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
         // the operator stops the other instance, then starts this session again (onError = terminal
         // + evict in the session service). Auth state is NOT cleared: the link itself is still valid.
         this.setStatus(EngineStatus.FAILED);
+        this.liveCalls.clear(); // terminal close: dead call handles, like the loggedOut branch above
         this.callbacks.onError?.(
           'Connection replaced by another instance (440) — stop the other instance, then start this session again',
         );
@@ -391,6 +453,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
         // 401): this is an account-level refusal, not dead credentials — the operator keeps the auth
         // files for inspection and can retry manually once the account issue is resolved.
         this.setStatus(EngineStatus.FAILED);
+        this.liveCalls.clear(); // terminal close: dead call handles, like the loggedOut branch above
         this.callbacks.onError?.(
           'Account rejected by WhatsApp (403) — the number is likely banned or blocked; reconnecting will not help',
         );
@@ -401,8 +464,15 @@ export class BaileysAdapter implements IWhatsAppEngine {
       // backoff and NO attempt ceiling — a long network outage must
       // not kill the session. The counter resets on 'open' and via the stability window below.
       // Do NOT fire onDisconnected here; this is a transient drop, not a terminal disconnect.
-      // connect() calls setStatus(INITIALIZING) which fires onStateChanged — that is the correct signal.
       this.logger.log('Baileys connection dropped; reconnecting', { statusCode });
+
+      // The socket is dead NOW, but the reconnect attempt only runs after the backoff delay below
+      // (up to 60 s + jitter; connectInner's own setStatus(INITIALIZING) fires just before the new
+      // socket is created). Staying READY across that window makes probeLiveness() report a live
+      // session and lets sends fail against the dead socket, so drop to INITIALIZING here — the
+      // 'open' branch restores READY. setStatus no-ops on an unchanged status, so the duplicate
+      // closes Baileys can emit per drop do not flap onStateChanged.
+      this.setStatus(EngineStatus.INITIALIZING);
 
       // Duplicate close while a reconnect timer is already pending — ignore it WITHOUT burning an
       // attempt (Baileys can emit more than one close per drop; the increment must come after this).
@@ -467,8 +537,11 @@ export class BaileysAdapter implements IWhatsAppEngine {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
-    this.sock?.end(undefined);
+    void this.sock?.end(undefined);
     this.sock = null;
+    // Cached call handles die with the socket — drop them so a later rejectCall() reports
+    // not-found instead of acting on a closed connection.
+    this.liveCalls.clear();
     this.setStatus(EngineStatus.DISCONNECTED);
     return Promise.resolve();
   }
@@ -479,15 +552,32 @@ export class BaileysAdapter implements IWhatsAppEngine {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
+    // Without a socket the unlink cannot be sent, and `this.sock?.logout()` would resolve as though it
+    // had been — reporting a confirmed unlink, writing the audit row, and then wiping the on-disk
+    // credentials below, leaving the device linked server-side with no way left to retry. Fail instead
+    // so the caller surfaces it and the credentials survive. Reachable: a WhatsApp-side logout nulls
+    // the socket while the engine stays registered for the whole reconnect backoff.
+    if (!this.sock) {
+      throw new Error('No live WhatsApp socket — the unlink was not sent');
+    }
+
     try {
-      await this.sock?.logout();
+      await this.sock.logout();
     } catch (err) {
+      // End the socket so the session still dies locally, but keep the on-disk creds: wiping
+      // them now would leave the device linked server-side with no local way to retry the
+      // unlink. Rethrow so the caller learns the unlink was not confirmed.
       this.logger.warn('Baileys logout failed; ending socket', {
         error: err instanceof Error ? err.message : String(err),
       });
-      this.sock?.end(undefined);
+      void this.sock?.end(undefined);
+      this.sock = null;
+      this.liveCalls.clear();
+      this.setStatus(EngineStatus.DISCONNECTED);
+      throw err;
     }
     this.sock = null;
+    this.liveCalls.clear();
     this.setStatus(EngineStatus.DISCONNECTED);
     await this.config.messageStore?.clearSession(this.config.dbSessionId).catch(() => undefined);
     // Wipe the multi-file auth dir so a fresh link starts clean — stale creds would otherwise be
@@ -517,8 +607,9 @@ export class BaileysAdapter implements IWhatsAppEngine {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
-    this.sock?.end(undefined);
+    void this.sock?.end(undefined);
     this.sock = null;
+    this.liveCalls.clear();
     this.setStatus(EngineStatus.DISCONNECTED);
     return Promise.resolve();
   }
@@ -538,7 +629,8 @@ export class BaileysAdapter implements IWhatsAppEngine {
   /**
    * Cheap local liveness check for the session watchdog. Genuine dead-connection detection is owned
    * by Baileys' built-in keepalive, which surfaces a close event (408) within ~35 s of a silent
-   * drop and drives the reconnect path above — so READY + a live socket is sufficient here.
+   * drop — and the close handler above drops the status to INITIALIZING for the whole reconnect
+   * backoff, so READY + a live socket is sufficient here.
    */
   // eslint-disable-next-line @typescript-eslint/require-await
   async probeLiveness(): Promise<boolean> {
@@ -733,6 +825,31 @@ export class BaileysAdapter implements IWhatsAppEngine {
     );
   }
 
+  async editMessage(chatId: string, messageId: string, body: string): Promise<MessageResult> {
+    this.ensureReady();
+    const target = await this.requireStored(messageId);
+    // Only the account's own messages are editable: WhatsApp refuses the edit of an inbound message
+    // but the send would still resolve, dressing the refusal up as success (and the service layer
+    // would then "update" the stored body). Refuse first — mirrors the wwjs null-edit guard.
+    if (target.key.fromMe !== true) {
+      throw new EngineRefusedError(
+        `the edit of message ${messageId} was rejected — only the account's own messages can be edited`,
+      );
+    }
+    // The stored key must belong to the requested chat — editing with another chat's key is a
+    // not-found here, not a cross-chat write. Both sides are neutralized so @c.us/@s.whatsapp.net
+    // (and a known lid<->pn twin) compare equal.
+    if (this.sessionStore.toNeutralJid(target.key.remoteJid ?? '') !== this.sessionStore.toNeutralJid(chatId)) {
+      throw new MessageNotFoundError(messageId, chatId);
+    }
+    // An edit keeps the original message id, so it is neither re-persisted nor echoed as a new send.
+    // The destination is resolved like any other send: a lid-migrated contact rejects PN-addressed
+    // sends with ack error 463 (see toDeliverableJid).
+    const jid = await this.toDeliverableJid(chatId);
+    const sent = await this.sock!.sendMessage(jid, { text: body, edit: target.key });
+    return { id: sent?.key?.id ?? messageId, timestamp: this.toUnixSeconds(sent?.messageTimestamp) };
+  }
+
   // ----- Groups -----
 
   async getGroups(): Promise<Group[]> {
@@ -750,12 +867,38 @@ export class BaileysAdapter implements IWhatsAppEngine {
       const metadata = await this.sock!.groupMetadata(groupId);
       return mapBaileysGroupInfo(metadata, jid => this.sessionStore.toNeutralJid(jid));
     } catch (err) {
-      this.logger.debug('groupMetadata failed; treating as not-found', {
-        groupId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return null; // not a group / not found
+      // Only a SERVER refusal may become null (→ service 404): the group does not exist or the
+      // account cannot see it. Anything else — a dropped socket, a timeout, a protocol error —
+      // folded into null makes a dead transport look like a missing group, so it propagates.
+      const code = BaileysAdapter.refusedStatusCode(err);
+      if (code === 401 || code === 403 || code === 404) {
+        this.logger.debug('groupMetadata refused; treating as not-found', {
+          groupId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return null; // not a group / not visible to this account
+      }
+      throw err;
     }
+  }
+
+  /**
+   * WA error code of a SERVER-refused Baileys query, or undefined for a transport/local failure.
+   * Baileys carries a refusal two ways: `assertNodeErrorFree` puts the numeric WA code on Boom's
+   * `data` (WABinary/generic-utils.js:57), and `extractGroupMetadata` puts it on `output.statusCode`
+   * with the error node as `data` (Socket/groups.js:280). Transport deaths ('Connection Closed',
+   * 'Timed Out') are LOCAL Booms with DisconnectReason statusCodes (408/428) and no server error
+   * node — so a numeric `data` (or an object `data` alongside a statusCode) is the discriminator.
+   */
+  private static refusedStatusCode(error: unknown): number | undefined {
+    const err = error as { data?: unknown; output?: { statusCode?: unknown } } | null | undefined;
+    if (typeof err?.data === 'number') {
+      return err.data;
+    }
+    if (err?.data !== undefined && typeof err.output?.statusCode === 'number') {
+      return err.output.statusCode;
+    }
+    return undefined;
   }
 
   async createGroup(name: string, participants: string[]): Promise<Group> {
@@ -764,24 +907,53 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return mapBaileysGroup(metadata, this.normalizedSelfJid(), jid => this.sessionStore.toNeutralJid(jid));
   }
 
-  async addParticipants(groupId: string, participants: string[]): Promise<void> {
-    this.ensureReady();
-    await this.sock!.groupParticipantsUpdate(groupId, this.toEngineParticipants(participants), 'add');
+  async addParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.runParticipantsUpdate(groupId, participants, 'add');
   }
 
-  async removeParticipants(groupId: string, participants: string[]): Promise<void> {
-    this.ensureReady();
-    await this.sock!.groupParticipantsUpdate(groupId, this.toEngineParticipants(participants), 'remove');
+  async removeParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.runParticipantsUpdate(groupId, participants, 'remove');
   }
 
-  async promoteParticipants(groupId: string, participants: string[]): Promise<void> {
-    this.ensureReady();
-    await this.sock!.groupParticipantsUpdate(groupId, this.toEngineParticipants(participants), 'promote');
+  async promoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.runParticipantsUpdate(groupId, participants, 'promote');
   }
 
-  async demoteParticipants(groupId: string, participants: string[]): Promise<void> {
+  async demoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.runParticipantsUpdate(groupId, participants, 'demote');
+  }
+
+  /**
+   * Baileys `groupParticipantsUpdate` resolves a per-participant `[{status, jid}]` array where
+   * `status` is the server's error attr or '200' (Socket/groups.js:153-155) — discarding it turned
+   * every not-admin/not-registered/already-member refusal into a reported success. Map the entries
+   * verbatim; THROW only when the operation failed for every requested participant (a refusal of
+   * the operation itself → HTTP 403) or the server returned no outcome at all.
+   */
+  private async runParticipantsUpdate(
+    groupId: string,
+    participants: string[],
+    action: 'add' | 'remove' | 'promote' | 'demote',
+  ): Promise<ParticipantOperationResult[]> {
     this.ensureReady();
-    await this.sock!.groupParticipantsUpdate(groupId, this.toEngineParticipants(participants), 'demote');
+    const raw = await this.sock!.groupParticipantsUpdate(groupId, this.toEngineParticipants(participants), action);
+    const results: ParticipantOperationResult[] = (raw ?? []).map(entry => ({
+      id: entry.jid ? this.sessionStore.toNeutralJid(entry.jid) : '',
+      success: entry.status === '200',
+      status: Number.isFinite(Number(entry.status)) ? Number(entry.status) : undefined,
+    }));
+    if (results.length === 0) {
+      throw new EngineRefusedError(
+        `groupParticipantsUpdate(${action}) returned no per-participant outcome for group ${groupId}`,
+      );
+    }
+    if (results.every(r => !r.success)) {
+      const detail = results.map(r => `${r.id || '?'} (${r.status ?? '?'})`).join(', ');
+      throw new EngineRefusedError(
+        `${action}Participants failed for all ${results.length} participant(s) in group ${groupId}: ${detail}`,
+      );
+    }
+    return results;
   }
 
   /**
@@ -827,6 +999,45 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return (await this.sock!.groupRevokeInvite(groupId)) ?? '';
   }
 
+  async joinGroupViaInviteCode(inviteCode: string): Promise<string> {
+    this.ensureReady();
+    // Baileys resolves undefined when the invite is invalid/expired/revoked — no group id surfaces —
+    // and rejects with an IQ error (e.g. not-authorized / gone) for the same client-facing cause.
+    // Both map to a 400. A transport failure (dropped socket, timeout) is NOT a refused invite:
+    // folding it into the 400 makes a dead connection look like a bad code, so it propagates.
+    let jid: string | undefined;
+    try {
+      jid = await this.sock!.groupAcceptInvite(inviteCode);
+    } catch (error) {
+      const code = BaileysAdapter.refusedStatusCode(error);
+      if (code === undefined || code < 400 || code >= 500) {
+        throw error;
+      }
+      this.logger.warn('Group invite refused', { error: String(error) });
+      jid = undefined;
+    }
+    if (!jid) {
+      throw new InvalidInviteCodeError();
+    }
+    // The returned group JID crosses the engine boundary, so it is neutralized like every other emission.
+    return this.sessionStore.toNeutralJid(jid);
+  }
+
+  async setGroupMessagesAdminsOnly(groupId: string, adminsOnly: boolean): Promise<void> {
+    this.ensureReady();
+    await this.sock!.groupSettingUpdate(groupId, adminsOnly ? 'announcement' : 'not_announcement');
+  }
+
+  async setGroupInfoAdminsOnly(groupId: string, adminsOnly: boolean): Promise<void> {
+    this.ensureReady();
+    await this.sock!.groupSettingUpdate(groupId, adminsOnly ? 'locked' : 'unlocked');
+  }
+
+  async setGroupEphemeral(groupId: string, durationSec: number): Promise<void> {
+    this.ensureReady();
+    await this.sock!.groupToggleEphemeral(groupId, durationSec);
+  }
+
   async getProfilePicture(contactId: string): Promise<string | null> {
     this.ensureReady();
     try {
@@ -848,6 +1059,30 @@ export class BaileysAdapter implements IWhatsAppEngine {
   async unblockContact(contactId: string): Promise<void> {
     this.ensureReady();
     await this.sock!.updateBlockStatus(contactId, 'unblock');
+  }
+
+  // ----- Profile (own account) -----
+
+  async setProfileName(name: string): Promise<void> {
+    this.ensureReady();
+    await this.sock!.updateProfileName(name);
+  }
+
+  async setProfileStatus(status: string): Promise<void> {
+    this.ensureReady();
+    await this.sock!.updateProfileStatus(status);
+  }
+
+  async setProfilePicture(media: MediaInput): Promise<void> {
+    this.ensureReady();
+    const selfJid = this.normalizedSelfJid();
+    if (!selfJid) {
+      throw new Error('cannot set the profile picture: the own JID is not known yet');
+    }
+    // updateProfilePicture takes a WAMediaUpload; resolveMediaBuffer covers Buffer | base64 | URL,
+    // the same conversion the media sends use.
+    const { data } = await this.resolveMediaBuffer(media);
+    await this.sock!.updateProfilePicture(selfJid, data);
   }
 
   // ----- Contacts & chats -----
@@ -918,7 +1153,13 @@ export class BaileysAdapter implements IWhatsAppEngine {
   getMessageReactions(_chatId: string, _messageId: string): Promise<MessageReaction[]> {
     return this.unsupported('getMessageReactions');
   }
-  getChatHistory(_chatId: string, _limit?: number, _includeMedia?: boolean): Promise<IncomingMessage[]> {
+  getChatHistory(
+    _chatId: string,
+    _limit?: number,
+    _includeMedia?: boolean,
+    _mediaMaxBytes?: number,
+    _signal?: AbortSignal,
+  ): Promise<IncomingMessage[]> {
     return this.unsupported('getChatHistory');
   }
   getLabels(): Promise<Label[]> {
@@ -1163,6 +1404,48 @@ export class BaileysAdapter implements IWhatsAppEngine {
           this.callbacks.onMessageRevoked?.(revoked);
           return;
         }
+        if (pm?.type === b.proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
+          // MESSAGE_EDIT wraps the message's latest content. Normalize that INNER content separately
+          // so captions, type, PTT, media presence and mentions describe the edited value rather than
+          // the outer protocol envelope.
+          const normalizedEdited = b.normalizeMessageContent(pm.editedMessage ?? undefined) ?? pm.editedMessage ?? {};
+          const editedContentType = b.getContentType(normalizedEdited);
+          const editedSubMessage =
+            normalizedEdited.extendedTextMessage ??
+            normalizedEdited.imageMessage ??
+            normalizedEdited.videoMessage ??
+            normalizedEdited.audioMessage ??
+            normalizedEdited.documentMessage ??
+            normalizedEdited.stickerMessage ??
+            normalizedEdited.locationMessage;
+          const contextInfo = editedSubMessage?.contextInfo;
+          const base = buildIncomingMessageFromBaileys(
+            {
+              id: pm.key?.id ?? '',
+              remoteJid,
+              fromMe: msg.key.fromMe === true,
+              participant: msg.key.participant ?? undefined,
+              body: extractBaileysBody(normalizedEdited),
+              contentType: editedContentType,
+              isPtt: normalizedEdited.audioMessage?.ptt === true,
+              timestamp: this.toEditUnixSeconds(pm.timestampMs, msg.messageTimestamp),
+              selfJid: this.normalizedSelfJid(),
+              mentionedJids: contextInfo?.mentionedJid ?? undefined,
+            },
+            jid => this.sessionStore.toNeutralJid(jid),
+          );
+          const hasMedia =
+            editedContentType === 'imageMessage' ||
+            editedContentType === 'videoMessage' ||
+            editedContentType === 'audioMessage' ||
+            editedContentType === 'documentMessage' ||
+            editedContentType === 'documentWithCaptionMessage' ||
+            editedContentType === 'stickerMessage';
+          const edited: EditedMessage = buildEditedMessage(base, hasMedia);
+          this.sessionStore.recordMessageEdit(remoteJid, edited.messageId, edited.body);
+          this.callbacks.onMessageEdited?.(edited);
+          return;
+        }
         // Other protocol messages (ephemeral, history sync, etc.) — skip silently.
         return;
       }
@@ -1210,6 +1493,215 @@ export class BaileysAdapter implements IWhatsAppEngine {
         this.callbacks.onMessageAck?.(u.key.id, status);
       }
     }
+  }
+
+  /**
+   * Baileys `group-participants.update`: a membership change. Only add/remove map to the neutral
+   * join/leave kinds — promote/demote (and 'modify', a phone-number-change rewrite) change no
+   * membership and are skipped. The event carries no timestamp, so it is stamped at receipt.
+   */
+  private handleGroupParticipantsUpdate(event: {
+    id?: string;
+    author?: string;
+    authorPn?: string;
+    participants?: unknown[];
+    action?: string;
+  }): void {
+    const kind = event.action === 'add' ? 'join' : event.action === 'remove' ? 'leave' : undefined;
+    if (!kind || !event.id) {
+      return;
+    }
+    const participantIds = (Array.isArray(event.participants) ? event.participants : [])
+      .map(entry => this.toNeutralGroupParticipantId(entry))
+      .filter((jid): jid is string => jid !== null);
+    const payload: GroupEvent = {
+      kind,
+      groupId: this.sessionStore.toNeutralJid(event.id),
+      participantIds,
+      timestamp: Math.floor(Date.now() / 1000),
+    };
+    // authorPn is the phone-dialect twin of a lid author: prefer it so the neutral actor id does
+    // not depend on whether the lid->pn mapping happens to be learned yet.
+    const actor = event.authorPn ?? event.author;
+    if (actor) {
+      payload.actorId = this.sessionStore.toNeutralJid(actor);
+    }
+    this.callbacks.onGroupEvent?.(payload);
+  }
+
+  /**
+   * Baileys `groups.update`: partial group metadata. Each entry becomes one neutral 'update'
+   * GroupEvent with `changes` filled from whichever of subject/desc/announce/restrict it carries
+   * (desc → description, restrict → locked). Entries about fields the neutral shape does not model
+   * (inviteCode, memberAddMode, joinApprovalMode, ...) still emit with empty changes — parity with
+   * the wwebjs adapter, which emits uninterpretable updates the same way rather than dropping them.
+   *
+   * The same event also carries FULL metadata snapshots: groupFetchAllParticipating() emits its
+   * entire result set through it (Socket/groups.js:56 `sock.ev.emit('groups.update', ...)`), and
+   * this adapter calls that on every connect (hydrateNames) and every REST getGroups(). Real deltas
+   * (Utils/process-message.js emitGroupUpdate) carry only `{id, ...oneChangedField, author?}`;
+   * snapshots are recognized by their full-metadata markers (participants/creation/subjectTime/
+   * owner/size) and skipped — otherwise every reconnect / GET /groups would flood consumers with
+   * bogus group.update webhooks whose `changes` were fabricated from the snapshot.
+   */
+  private handleGroupsUpdate(
+    updates: Array<{
+      id?: string;
+      subject?: string;
+      desc?: string;
+      announce?: boolean;
+      restrict?: boolean;
+      author?: string;
+      authorPn?: string;
+      // Full-snapshot markers (extractGroupMetadata); the values are unused — presence is the signal.
+      participants?: unknown;
+      creation?: unknown;
+      subjectTime?: unknown;
+      owner?: unknown;
+      size?: unknown;
+    }>,
+  ): void {
+    for (const update of Array.isArray(updates) ? updates : []) {
+      if (!update?.id) {
+        continue;
+      }
+      // Skip full-metadata snapshots (see the docblock): only real deltas become GroupEvents.
+      if ('participants' in update || 'creation' in update || 'subjectTime' in update || 'owner' in update) {
+        continue;
+      }
+      const changes: NonNullable<GroupEvent['changes']> = {};
+      if (typeof update.subject === 'string') changes.subject = update.subject;
+      if (typeof update.desc === 'string') changes.description = update.desc;
+      if (typeof update.announce === 'boolean') changes.announce = update.announce;
+      if (typeof update.restrict === 'boolean') changes.locked = update.restrict;
+      const payload: GroupEvent = {
+        kind: 'update',
+        groupId: this.sessionStore.toNeutralJid(update.id),
+        participantIds: [],
+        changes,
+        timestamp: Math.floor(Date.now() / 1000),
+      };
+      const actor = update.authorPn ?? update.author;
+      if (actor) {
+        payload.actorId = this.sessionStore.toNeutralJid(actor);
+      }
+      this.callbacks.onGroupEvent?.(payload);
+    }
+  }
+
+  /**
+   * Baileys `call` events carry the whole call lifecycle; only the `offer` status is a NEW incoming
+   * call (ringing/preaccept/timeout/reject/accept/terminate are progress and hang-up updates and
+   * are skipped). Offline-replayed offers (missed-while-disconnected) and the account's own
+   * outgoing calls are skipped too. The raw `from` JID is cached keyed by call id —
+   * sock.rejectCall() needs it verbatim later, when the event itself is long gone.
+   */
+  private handleCallEvents(calls: WACallEvent[]): void {
+    for (const call of Array.isArray(calls) ? calls : []) {
+      if (!call || call.status !== 'offer' || !call.id || !call.from) {
+        continue;
+      }
+      // Baileys replays offers for calls missed while disconnected with offline: true
+      // (Socket/messages-recv.js:1458 `offline: !!attrs.offline`; WACallEvent.offline is
+      // non-optional). Those calls are long dead — emitting call.received (and, with
+      // autoRejectCalls, rejecting a stale call) would be wrong, so drop them before caching.
+      if (call.offline) {
+        continue;
+      }
+      // WACallEvent has no fromMe flag, but WhatsApp can relay the account's own outgoing-call
+      // signaling — skip a call whose from/chatId is ourselves (the wwjs adapter's call.fromMe
+      // guard). Null-safe: with no socket user there is no own id to compare, so nothing is skipped.
+      const selfJid = this.normalizedSelfJid();
+      if (selfJid) {
+        const self = this.sessionStore.toNeutralJid(selfJid);
+        if (
+          this.sessionStore.toNeutralJid(call.from) === self ||
+          this.sessionStore.toNeutralJid(call.chatId) === self
+        ) {
+          continue;
+        }
+      }
+      // Baileys maps both the `offer` and `offer_notice` wire tags onto status 'offer' carrying the
+      // same call-id, so a single call can reach this loop more than once. Cache first and emit
+      // only for an id not already live, otherwise one call surfaces as several `call.received`
+      // events.
+      if (!this.cacheLiveCall(call.id, call.from)) {
+        continue;
+      }
+      const payload: IncomingCallEvent = {
+        callId: call.id,
+        // callerPn is the phone-dialect twin of a lid caller: prefer it so the neutral caller id
+        // does not depend on whether the lid->pn mapping happens to be learned yet (same rule as
+        // the group actor ids above).
+        from: this.sessionStore.toNeutralJid(call.callerPn ?? call.from),
+        isVideo: call.isVideo === true,
+        isGroup: call.isGroup === true,
+        // The event carries a real Date; fall back to receipt time when absent/unparseable.
+        timestamp:
+          call.date instanceof Date && !Number.isNaN(call.date.getTime())
+            ? Math.floor(call.date.getTime() / 1000)
+            : Math.floor(Date.now() / 1000),
+      };
+      this.callbacks.onCall?.(payload);
+    }
+  }
+
+  /**
+   * Cache a ringing call's raw caller JID for a later rejectCall(). Lazy expiry: inserting a new
+   * call drops already-expired entries, so a session that receives calls but never rejects them
+   * can't grow the map without bound; an entry that never sees another call is tiny and is dropped
+   * on teardown (disconnect/logout/destroy) or at the next call. No per-entry timer to clean up.
+   *
+   * Returns true when `callId` was not already ringing, which is what makes `call.received` fire
+   * once per call rather than once per upstream offer tag. A repeat offer still refreshes the
+   * entry, so a long-ringing call stays rejectable for a full TTL from the most recent signal.
+   */
+  private cacheLiveCall(callId: string, callFrom: string): boolean {
+    const now = Date.now();
+    for (const [id, entry] of this.liveCalls) {
+      if (entry.expiresAt <= now) {
+        this.liveCalls.delete(id);
+      }
+    }
+    const isNewCall = !this.liveCalls.has(callId);
+    this.liveCalls.set(callId, { callFrom, expiresAt: now + BaileysAdapter.LIVE_CALL_TTL_MS });
+    return isNewCall;
+  }
+
+  /**
+   * Reject a currently-ringing call. The entry is evicted on ANY attempt (a rejected/ended call
+   * will not become rejectable again); an unknown id or an expired entry maps to CallNotFoundError
+   * (HTTP 404). A failure of the library's rejectCall() itself propagates as-is.
+   */
+  async rejectCall(callId: string): Promise<void> {
+    const entry = this.liveCalls.get(callId);
+    this.liveCalls.delete(callId);
+    if (!entry || entry.expiresAt <= Date.now()) {
+      throw new CallNotFoundError(callId);
+    }
+    if (!this.sock) {
+      throw new EngineNotReadyError('Cannot reject a call before the engine is initialized.');
+    }
+    await this.sock.rejectCall(callId, entry.callFrom);
+  }
+
+  /**
+   * Coerce one `group-participants.update` entry to a neutral user id. Since Baileys v7 the entries
+   * are parsed JSON objects (`{ id, phoneNumber?, lid?, ... }`, see Socket/messages-recv.js), not
+   * plain JID strings: prefer the phone JID when present (a lid `id` with a known phone resolves to
+   * the same neutral @c.us via the mapping, but the inline phoneNumber needs no lookup), then the
+   * bare id, then the lid. Plain-string entries (the pre-v7 shape) pass through the same normalizer.
+   */
+  private toNeutralGroupParticipantId(entry: unknown): string | null {
+    if (typeof entry === 'string') {
+      return entry ? this.sessionStore.toNeutralJid(entry) : null;
+    }
+    if (entry && typeof entry === 'object') {
+      const e = entry as { phoneNumber?: unknown; id?: unknown; lid?: unknown };
+      const jid = [e.phoneNumber, e.id, e.lid].find((v): v is string => typeof v === 'string' && v.length > 0);
+      return jid ? this.sessionStore.toNeutralJid(jid) : null;
+    }
+    return null;
   }
 
   /**
@@ -1384,6 +1876,9 @@ export class BaileysAdapter implements IWhatsAppEngine {
       normalizedForContext.documentMessage ??
       normalizedForContext.stickerMessage ??
       normalizedForContext.locationMessage;
+    // A text status's styling rides on the extended-text content (proto backgroundArgb/font) —
+    // surface it so the store/viewer can render the story the way it was posted.
+    const extText = normalizedForContext.extendedTextMessage;
     const contextInfo = (
       subForContext as
         | {
@@ -1431,6 +1926,8 @@ export class BaileysAdapter implements IWhatsAppEngine {
         quotedMessage,
         ephemeralDuration: contextInfo?.expiration ?? undefined,
         mentionedJids: contextInfo?.mentionedJid ?? undefined,
+        backgroundArgb: typeof extText?.backgroundArgb === 'number' ? extText.backgroundArgb : undefined,
+        font: typeof extText?.font === 'number' ? extText.font : undefined,
       },
       jid => this.sessionStore.toNeutralJid(jid),
     );
@@ -1561,6 +2058,16 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return typeof ts === 'number' ? ts : ts.toNumber();
   }
 
+  /** Protocol-message edit timestamps are milliseconds; the enclosing message timestamp is seconds. */
+  private toEditUnixSeconds(
+    timestampMs: number | { toNumber(): number } | null | undefined,
+    fallback: number | { toNumber(): number } | null | undefined,
+  ): number {
+    if (timestampMs == null) return this.toUnixSeconds(fallback);
+    const milliseconds = typeof timestampMs === 'number' ? timestampMs : timestampMs.toNumber();
+    return Number.isFinite(milliseconds) ? Math.floor(milliseconds / 1000) : this.toUnixSeconds(fallback);
+  }
+
   /** Resolve a MediaInput's data (Buffer | base64 string | http(s) URL) to bytes + mimetype. */
   private async resolveMediaBuffer(media: MediaInput): Promise<{ data: Buffer; mimetype: string }> {
     if (Buffer.isBuffer(media.data)) {
@@ -1568,8 +2075,12 @@ export class BaileysAdapter implements IWhatsAppEngine {
     }
     if (/^https?:\/\//i.test(media.data)) {
       const fetched = await loadRemoteMediaBuffer(media.data);
-      // Caller's declared mimetype wins; fall back to the response content-type.
-      return { data: fetched.data, mimetype: media.mimetype || fetched.mimetype };
+      // A generic placeholder mimetype (buildMediaInput's 'application/octet-stream' default when the
+      // caller supplied none) carries no real signal — defer to the fetched response content-type,
+      // which was sniffed from the actual bytes. This fixes URL-based sends where the caller has no
+      // mimetype to pass through the conversation-send facade (e.g. chatwoot-adapter outbound relay).
+      const callerMimetype = media.mimetype && media.mimetype !== 'application/octet-stream' ? media.mimetype : null;
+      return { data: fetched.data, mimetype: callerMimetype ?? fetched.mimetype };
     }
     return { data: Buffer.from(media.data, 'base64'), mimetype: media.mimetype };
   }
@@ -1680,6 +2191,12 @@ export class BaileysAdapter implements IWhatsAppEngine {
    */
   private async postStatus(content: AnyMessageContent, options: StatusPostOptions): Promise<StatusResult> {
     this.ensureReady();
+    // Baileys posts to exactly the statusJidList allow-list, so unlike whatsapp-web.js (which
+    // broadcasts) an absent/empty recipients list would publish to nobody — reject it as a client
+    // error here rather than send a status no contact can see.
+    if (!options.recipients?.length) {
+      throw new BadRequestException('recipients is required to post a status on the Baileys engine');
+    }
     const statusJidList = options.recipients.map(r => this.sessionStore.toEngineJid(r));
     const sent = await this.sock!.sendMessage('status@broadcast', content, {
       statusJidList,

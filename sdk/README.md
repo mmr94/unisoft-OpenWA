@@ -3,7 +3,7 @@
 Official client libraries for the [OpenWA](https://github.com/rmyndharis/OpenWA)
 WhatsApp API Gateway.
 
-All four SDKs are **hand-written** against the exact API surface (paths, DTOs,
+All five SDKs are **hand-written** against the exact API surface (paths, DTOs,
 response shapes) and **unit-tested with mocked HTTP transports** that assert on
 the precise request URL, method, and body — so drift is caught at test time.
 The wire types live in a dedicated module (`types.ts` / `types.py` / `model/`)
@@ -16,24 +16,28 @@ hand-written resource methods.
 | Python                  | [`rmyndharis-openwa`](python/)      | sync (httpx), PEP 561 typed |
 | PHP                     | [`rmyndharis/openwa`](php/)         | sync (Guzzle, PHP 8.1+)     |
 | Java                    | [`com.rmyndharis:openwa`](java/)    | sync (java.net.http + Gson, Java 17) |
+| Go                      | [`github.com/rmyndharis/OpenWA/sdk/go`](go/) | stdlib-only, context-first, injectable transport (Go 1.22+) |
 
 ## Coverage
 
-All three SDKs expose the same fluent resource surface:
+All five SDKs expose the same fluent resource surface:
 
 | Resource   | Methods                                                                                                                                                                                |
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sessions` | list, get, create, delete, start, stop, forceKill, getQrCode, requestPairingCode, stats                                                                                                |
-| `messages` | list, sendText, sendImage/Video/Audio/Document/Sticker, sendLocation, sendContact, sendTemplate, reply, forward, react, delete, history, reactions, sendBulk, batchStatus, cancelBatch |
-| `contacts` | list, get, check, profilePicture, phone, block, unblock                                                                                                                                |
-| `groups`   | list, get, create, add/remove/promote/demoteParticipants, setSubject, setDescription, leave, inviteCode, revokeInviteCode                                                              |
+| `sessions` | list, get, create, delete, start, stop, logout, forceKill, getQrCode, requestPairingCode, stats                                                                                        |
+| `messages` | list, sendText, sendImage/Video/Audio/Document/Sticker, sendLocation, sendContact, sendTemplate, sendPoll, reply, forward, react, delete, editMessage, history, reactions, sendBulk, batchStatus, cancelBatch |
+| `contacts` | list, get, check, profilePicture, profilePictures, phone, block, unblock                                                                                                                                |
+| `groups`   | list, get, create, joinGroup, add/remove/promote/demoteParticipants, setSubject, setDescription, get/updateGroupSettings, leave, inviteCode, revokeInviteCode                          |
 | `webhooks` | list, get, create, update, delete, test                                                                                                                                                |
 | `chats`    | list, markRead, markUnread, delete, sendState                                                                                                                                          |
 | `labels`   | list, get, forChat, addToChat, removeFromChat _(WhatsApp Business)_                                                                                                                    |
 | `channels` | list, get, messages, subscribe, unsubscribe _(Newsletters)_                                                                                                                            |
 | `catalog`  | info, products, product, sendProduct, sendCatalog _(WhatsApp Business)_                                                                                                                |
-| `status`   | list, fromContact, sendText, sendImage, sendVideo, delete _(Stories)_                                                                                                                  |
+| `status`   | list, fromContact, media, sendText, sendImage, sendVideo, delete _(Stories)_                                                                                                            |
+| `search`   | search _(Operator)_                                                                                                                                                                  |
 | `templates`| list, get, create, update, delete                                                                                                                                                     |
+| `profile`  | setProfileName, setProfileStatus, setProfilePicture _(OPERATOR)_                                                                                                                       |
+| `calls`    | rejectCall _(OPERATOR)_                                                                                                                                                                |
 | `health`   | check, live, ready                                                                                                                                                                     |
 
 > ⚠️ Endpoints requiring an `OPERATOR`-level API key are noted in the inline
@@ -160,15 +164,52 @@ Requires Java 17+. Errors are a typed, unchecked hierarchy — branch with
 custom `HttpTransport` that records the request — no network. See
 [`java/README.md`](java/README.md) for the full guide.
 
+## Go
+
+```bash
+go get github.com/rmyndharis/OpenWA/sdk/go
+```
+
+```go
+import (
+    "context"
+    "fmt"
+    "log"
+
+    openwa "github.com/rmyndharis/OpenWA/sdk/go"
+)
+
+client, err := openwa.New("http://localhost:2785", "owa_k1_…")
+if err != nil {
+    log.Fatal(err)
+}
+
+ctx := context.Background()
+client.Sessions.Start(ctx, "my-session")
+res, err := client.Messages.SendText(ctx, "my-session", openwa.SendTextRequest{
+    ChatID: "628123456789@c.us",
+    Text:   "Hello from the OpenWA Go SDK!",
+})
+fmt.Println(res.MessageID)
+```
+
+Requires Go 1.22+. Stdlib-only, context-first. Errors are typed — match with
+`errors.Is(err, openwa.ErrConflict)` or unwrap `*openwa.APIError` with
+`errors.As`. Inject an `http.RoundTripper` with `openwa.WithTransport(...)` for
+testing, retry, tracing, or metrics. See [`go/README.md`](go/README.md).
+
 ## Reliability & security
 
 - **Use HTTPS in production.** The API key is sent as `X-API-Key` on every
   request and is bearer-equivalent — never send it over plaintext `http://`
   outside local development.
-- **No automatic retries.** A failed request raises/throws immediately; wrap
-  calls in your own backoff if you need retries (especially for `429`). The
-  injectable transport (`fetch` / `transport` / `httpClient`) is the extension
-  point for retry or observability middleware.
+- **No automatic retries by default.** A failed request raises/throws
+  immediately; wrap calls in your own backoff if you need retries (especially
+  for `429`). The injectable transport (`fetch` / `transport` / `httpClient`) is
+  the extension point for retry or observability middleware. The Go client is
+  the exception: it ships an opt-in policy (`WithRetry(DefaultRetryPolicy())`)
+  that handles `429`/`5xx`, honors `Retry-After`, and rewinds request bodies —
+  still off unless you ask for it.
 - **Redirects are never followed.** A `3xx` surfaces to the caller rather than
   being followed, so the API key is never re-sent to a redirect target.
 - **Default per-request timeout** is 30s (configurable). Path segments (chat /
@@ -186,6 +227,8 @@ cd sdk/python && python -m pytest -q
 cd sdk/php && composer install && ./vendor/bin/phpunit
 # Java
 cd sdk/java && mvn -B verify
+# Go
+cd sdk/go && go test -race ./... && go vet ./...
 ```
 
 Each test suite mocks the HTTP layer and asserts on the exact path, so the

@@ -13,6 +13,7 @@ import type {
   BulkMessageResponse,
   ChatHistoryMessage,
   DeleteMessageRequest,
+  EditMessageRequest,
   ForwardMessageRequest,
   ListMessagesQuery,
   MessageHistoryQuery,
@@ -24,7 +25,9 @@ import type {
   SendBulkRequest,
   SendContactRequest,
   SendLocationRequest,
+  SendAudioRequest,
   SendMediaRequest,
+  SendPollRequest,
   SendTemplateRequest,
   SendTextRequest,
   SuccessResult,
@@ -62,7 +65,7 @@ export class MessagesResource {
   }
 
   /** Send an audio file (url or base64). */
-  sendAudio(sessionId: string, body: SendMediaRequest): Promise<MessageResponse> {
+  sendAudio(sessionId: string, body: SendAudioRequest): Promise<MessageResponse> {
     return this.client.sendMedia(sessionId, 'send-audio', body);
   }
 
@@ -103,6 +106,15 @@ export class MessagesResource {
     });
   }
 
+  /** Send a native WhatsApp poll (2–12 options). */
+  sendPoll(sessionId: string, body: SendPollRequest): Promise<MessageResponse> {
+    return this.client.request<MessageResponse>({
+      method: 'POST',
+      path: `/api/sessions/${encodeSegment(sessionId)}/messages/send-poll`,
+      body,
+    });
+  }
+
   /** Reply to a specific message. */
   reply(sessionId: string, body: ReplyMessageRequest): Promise<MessageResponse> {
     return this.client.request<MessageResponse>({
@@ -135,6 +147,15 @@ export class MessagesResource {
     return this.client.request<SuccessResult>({
       method: 'POST',
       path: `/api/sessions/${encodeSegment(sessionId)}/messages/delete`,
+      body,
+    });
+  }
+
+  /** Edit the text of an own message (404 if the message is not found). */
+  editMessage(sessionId: string, body: EditMessageRequest): Promise<MessageResponse> {
+    return this.client.request<MessageResponse>({
+      method: 'POST',
+      path: `/api/sessions/${encodeSegment(sessionId)}/messages/edit`,
       body,
     });
   }

@@ -12,18 +12,22 @@ export type WSServerMessageType = 'subscribed' | 'unsubscribed' | 'event' | 'err
 
 // Valid event types that can be subscribed to over the socket. Every entry here MUST have a
 // matching EventsGateway.emit* producer — the drift guard in events.gateway.spec asserts this.
-// (group.* are NOT listed: they have no engine emit source and were never delivered; they stay
-// reserved on the webhook side via WEBHOOK_RESERVED_EVENTS.)
 export const SUBSCRIBABLE_EVENTS = [
   'message.received',
   'message.sent',
   'message.ack',
   'message.revoked',
   'message.reaction',
+  'message.edited',
   'session.status',
   'session.qr',
   'session.authenticated',
   'session.disconnected',
+  'group.join',
+  'group.leave',
+  'group.update',
+  'call.received',
+  'status.received',
 ] as const;
 
 export type SubscribableEvent = (typeof SUBSCRIBABLE_EVENTS)[number] | '*';

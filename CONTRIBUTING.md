@@ -78,6 +78,26 @@ Use the **Bug report** or **Feature request** issue templates — the structured
 (version, deployment, engine, logs, reproduction) make triage much faster. For security
 vulnerabilities, see [`SECURITY.md`](SECURITY.md) — please do **not** open a public issue.
 
+### Issues vs. Discussions — pick the right channel
+
+A large share of opened issues turn out to be configuration, provider, or environment
+questions rather than defects in OpenWA. Routing them correctly upfront saves everyone
+(time to answer, time to triage, cleaner issue history). When in doubt, open a Discussion
+first — it can always be promoted to an Issue if a real defect is confirmed.
+
+| Open an **Issue** (here)                                                 | Open a **Discussion**                                                       |
+| ------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
+| Reproducible defect in OpenWA code with clear steps, expected vs. actual | Setup / configuration help ("my proxy doesn't work, how do I configure X?") |
+| Crash, panic, wrong API response, regression after upgrade               | Provider-specific quirks (webshare, IPRoyal, brightdata, Twilio, etc.)      |
+| Documented behavior contradicted by actual behavior                      | "Is X possible?" / "What's the best way to Y?"                              |
+| Security issue (use `SECURITY.md` instead)                               | Hosting-platform / network / firewall questions                             |
+
+When an Issue lands in the gray zone, maintainers will label it `needs-info`,
+`not-a-bug`, or `move-to-discussions`. If after follow-up it turns out to be
+environmental or provider-side, it will be closed and we'll continue in Discussions.
+The full table and label reference live in
+[`docs/20-community-guidelines.md`](docs/20-community-guidelines.md#issue-vs-discussions).
+
 ## Code of conduct
 
 This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). By participating,

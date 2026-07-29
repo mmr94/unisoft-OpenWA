@@ -2,28 +2,33 @@ import { Injectable, BadRequestException, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+import { QueryDeepPartialEntity } from 'typeorm';
 import { SessionService } from '../session/session.service';
 import { SendTextMessageDto, SendMediaMessageDto, SendAudioMessageDto, MessageResponseDto } from './dto';
 import { SendTemplateMessageDto } from './dto/send-template.dto';
-import { assertBase64WithinMediaCap } from './media-cap.util';
+import { assertBase64WithinMediaCap, stripBase64DataUri } from './media-cap.util';
 import { MediaInput, IWhatsAppEngine, MessageResult } from '../../engine/interfaces/whatsapp-engine.interface';
 import { Message, MessageDirection, MessageStatus } from './entities/message.entity';
-import { HookManager } from '../../core/hooks';
+import { HookManager, applySendingGate } from '../../core/hooks';
 import { TemplateService } from '../template/template.service';
 import { renderTemplate } from '../../common/utils/template-render';
 import { createLogger } from '../../common/services/logger.service';
 import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/security/ssrf-guard';
-import { userPart } from '../../engine/identity/wa-id';
+import { parseWaId } from '../../engine/identity/wa-id';
 import { resolveFeatureFlags } from '../../config/feature-flags';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
+import { isUniqueConstraintError } from '../../common/utils/unique-constraint.util';
 
 export interface GetMessagesOptions {
   chatId?: string;
-  /** Filter by sender. A phone matches stored `@c.us`/`@s.whatsapp.net` ids AND any lid resolving to it. */
+  /** Filter by sender. A phone matches stored `@c.us`/`@s.whatsapp.net` ids AND any lid resolving to it. Group messages match on `author` (the real sender) as well as `from` (which holds the group JID). */
   from?: string;
   limit?: number;
   offset?: number;
 }
+
+/** Default cap on a rendered template's final text; overridable via TEMPLATE_RENDER_MAX_CHARS. */
+export const DEFAULT_TEMPLATE_RENDER_MAX_CHARS = 64 * 1024;
 
 /**
  * Outbound sends are executed directly against the WhatsApp engine, not via a BullMQ queue.
@@ -91,20 +96,12 @@ export class MessageService {
   /**
    * Run the pre-send `message:sending` plugin gate for one outbound message and return the
    * (possibly plugin-modified) input, or throw BadRequestException if a plugin blocked the send.
-   * Centralised so EVERY public sender — text, media, and extended (location/contact/poll/sticker/
-   * reply/forward) — passes through the same moderation chokepoint, instead of only `sendText`.
+   * Centralised so EVERY public sender — text, media, extended (location/contact/poll/sticker/
+   * reply/forward) and edit — passes through the same moderation chokepoint, instead of only
+   * `sendText`. The implementation is shared with StatusService via core/hooks/sending-gate.
    */
-  private async applySendingGate<T extends object>(sessionId: string, type: string, input: T): Promise<T> {
-    const { continue: shouldContinue, data: hookData } = await this.hookManager.execute(
-      'message:sending',
-      { sessionId, input, type },
-      { sessionId, source: 'MessageService' },
-    );
-    if (!shouldContinue) {
-      throw new BadRequestException('Message sending blocked by plugin');
-    }
-    // Use the potentially plugin-modified input.
-    return (hookData as { input: T }).input;
+  private applySendingGate<T extends object>(sessionId: string, type: string, input: T): Promise<T> {
+    return applySendingGate(this.hookManager, sessionId, type, input, 'MessageService');
   }
 
   /**
@@ -147,6 +144,10 @@ export class MessageService {
    * existing {@link sendText} path so plugin hooks, persistence, and status
    * tracking are reused. Throws NotFoundException when the template cannot be
    * resolved by id or name.
+   *
+   * The FINAL rendered text is capped at template.renderMaxChars (default 64 KiB): caller-supplied
+   * variables can inflate a small template unboundedly, so an over-cap render is rejected with a
+   * 400 naming the limit rather than truncated silently or pushed to the engine/DB as-is.
    */
   async sendTemplate(sessionId: string, dto: SendTemplateMessageDto): Promise<MessageResponseDto> {
     const template = await this.templateService.resolve(sessionId, {
@@ -159,6 +160,15 @@ export class MessageService {
       .filter((segment): segment is string => segment != null && segment.length > 0)
       .map(segment => renderTemplate(segment, vars));
     const text = segments.join('\n\n');
+
+    const maxChars =
+      this.configService?.get<number>('template.renderMaxChars', DEFAULT_TEMPLATE_RENDER_MAX_CHARS) ??
+      DEFAULT_TEMPLATE_RENDER_MAX_CHARS;
+    if (text.length > maxChars) {
+      throw new BadRequestException(
+        `Rendered template is ${text.length} characters, over the ${maxChars}-character limit`,
+      );
+    }
 
     return this.sendText(sessionId, { chatId: dto.chatId, text });
   }
@@ -174,7 +184,7 @@ export class MessageService {
       body: finalDto.caption || '',
       type: 'image',
       metadata: {
-        media: { mimetype: finalDto.mimetype, filename: finalDto.filename, data: finalDto.base64 || finalDto.url },
+        media: { mimetype: finalDto.mimetype, filename: finalDto.filename, data: media.data },
       },
     });
 
@@ -198,7 +208,7 @@ export class MessageService {
       body: finalDto.caption || '',
       type: 'video',
       metadata: {
-        media: { mimetype: finalDto.mimetype, filename: finalDto.filename, data: finalDto.base64 || finalDto.url },
+        media: { mimetype: finalDto.mimetype, filename: finalDto.filename, data: media.data },
       },
     });
 
@@ -231,7 +241,7 @@ export class MessageService {
       chatId: finalDto.chatId,
       type: finalDto.ptt ? 'voice' : 'audio',
       metadata: {
-        media: { mimetype: audioDto.mimetype, filename: finalDto.filename, data: finalDto.base64 || finalDto.url },
+        media: { mimetype: audioDto.mimetype, filename: finalDto.filename, data: media.data },
       },
     });
 
@@ -255,7 +265,7 @@ export class MessageService {
       body: finalDto.caption || finalDto.filename || '',
       type: 'document',
       metadata: {
-        media: { mimetype: finalDto.mimetype, filename: finalDto.filename, data: finalDto.base64 || finalDto.url },
+        media: { mimetype: finalDto.mimetype, filename: finalDto.filename, data: media.data },
       },
     });
 
@@ -302,7 +312,17 @@ export class MessageService {
       // Resolve the filter through the lid->phone table so a phone matches not just the stored
       // `<phone>@c.us` id but also any lid that resolves to the same person - turning the prior
       // silent miss (a lid-stored author vs a phone filter) into a hit.
-      query.andWhere('message.from IN (:...froms)', { froms: this.resolveJidCandidates(from) });
+      // A group message stores the real sender in `author` (`from` holds the group JID), so match
+      // BOTH columns against the same candidate set or the filter skips every group message the
+      // person wrote. Query plan: neither `from` nor `author` is indexed - the predicate applies
+      // within the (sessionId, createdAt)-narrowed scan exactly as the from-only filter did, so the
+      // OR costs nothing the old plan didn't already pay. No new index: per-session narrowing
+      // dominates selectivity and a single btree cannot serve an OR across two columns anyway.
+      const froms = this.resolveJidCandidates(from);
+      query.andWhere('(message.from IN (:...froms) OR message.author IN (:...authorFroms))', {
+        froms,
+        authorFroms: froms,
+      });
     }
 
     const [messages, total] = await query.getManyAndCount();
@@ -310,12 +330,32 @@ export class MessageService {
   }
 
   /**
-   * Expand a JID filter into every stored id that refers to the same chat/person: the literal input (so
-   * an exact group/lid filter still matches), the user-part in both user dialects (`@c.us` /
+   * Expand a user JID filter into every stored id that refers to the same person: the literal input
+   * (so an exact lid filter still matches), the user-part in both user dialects (`@c.us` /
    * `@s.whatsapp.net`), and every lid the resolution table maps to that phone.
+   *
+   * Scoped by chat kind. For a non-user kind (group/status/newsletter/broadcast) the stored id can
+   * only ever be the literal JID, so no candidates are generated: expanding a group or channel id's
+   * digits into the user dialects (or probing the lid table with them) could mis-resolve the filter
+   * onto an unrelated entity whose phone digits happen to match — fail closed on the literal id.
+   * A `@lid` input forward-resolves to its phone instead of minting `<lid-digits>@c.us` (the lid's
+   * digits are NOT a phone), so rows stored under the resolved form still match a raw-lid filter.
    */
   private resolveJidCandidates(value: string): string[] {
-    const phone = userPart(value);
+    const parsed = parseWaId(value);
+    if (parsed.kind !== 'user' && parsed.kind !== 'lid' && parsed.kind !== 'unknown') {
+      return [value];
+    }
+    if (parsed.kind === 'lid') {
+      const candidates = new Set<string>([value]);
+      const resolved = this.lidMappingStore.getCached(parsed.userPart);
+      if (resolved) {
+        candidates.add(`${resolved}@c.us`);
+        candidates.add(`${resolved}@s.whatsapp.net`);
+      }
+      return [...candidates];
+    }
+    const phone = parsed.userPart;
     const candidates = new Set<string>([value, `${phone}@c.us`, `${phone}@s.whatsapp.net`]);
     for (const lid of this.lidMappingStore.lidsForPhone(phone)) {
       candidates.add(`${lid}@lid`);
@@ -417,7 +457,7 @@ export class MessageService {
       chatId: finalDto.chatId,
       type: 'sticker',
       metadata: {
-        media: { mimetype: finalDto.mimetype, filename: finalDto.filename, data: finalDto.base64 || finalDto.url },
+        media: { mimetype: finalDto.mimetype, filename: finalDto.filename, data: media.data },
       },
     });
 
@@ -524,7 +564,13 @@ export class MessageService {
     const session = await this.sessionService.findOne(sessionId);
     const message = this.messageRepository.create({
       sessionId,
-      waMessageId: data.waMessageId,
+      // An engine that sent a message but could not read its id back reports an empty id (see the
+      // whatsapp-web.js adapter's `toMessageResult`). Store NULL rather than '': the
+      // (sessionId, waMessageId) unique index is not partial, so a second id-less send in the same
+      // session collides on '' while NULLs stay exempt — and in the bulk path that violation is
+      // swallowed into a warning, losing the row silently. Normalizing at this one chokepoint covers
+      // every caller instead of relying on each to remember.
+      waMessageId: data.waMessageId || undefined,
       chatId: data.chatId,
       from: session?.phone || 'me',
       to: data.chatId,
@@ -536,12 +582,20 @@ export class MessageService {
       metadata: data.metadata,
     });
     const saved = await this.messageRepository.save(message);
-    // Fire-and-forget: a plugin handler must never break the send path. The built-in FTS search provider
-    // is DB-synced and does NOT consume this; it exists for plugin providers (Spec 2) + general use.
-    void this.hookManager
-      .execute('message:persisted', { sessionId, message: saved }, { sessionId, source: 'MessageService' })
-      .catch(() => undefined);
+    this.emitPersisted(sessionId, saved);
     return saved;
+  }
+
+  // Fire-and-forget: a plugin handler must never break the send path. The built-in FTS search provider
+  // is DB-synced and does NOT consume this; it exists for plugin providers (Spec 2) + general use.
+  // Emitted for EVERY persisted state of an outbound row — the initial PENDING write AND each later
+  // transition (SENT / FAILED / merge) — so a provider's copy never stays stuck at PENDING (#906).
+  // The payload is a shallow snapshot: the same entity instance is mutated as the send progresses
+  // (PENDING → SENT/FAILED), and fire-and-forget execution must still see the state at emission time.
+  private emitPersisted(sessionId: string, message: Message): void {
+    void this.hookManager
+      .execute('message:persisted', { sessionId, message: { ...message } }, { sessionId, source: 'MessageService' })
+      .catch(() => undefined);
   }
 
   /**
@@ -556,6 +610,8 @@ export class MessageService {
     }
     message.status = MessageStatus.FAILED;
     await this.messageRepository.save(message);
+    // Reconcile the earlier PENDING emission (#906): a provider must see the terminal FAILED state.
+    this.emitPersisted(message.sessionId, message);
   }
 
   /**
@@ -565,17 +621,59 @@ export class MessageService {
    * `message:failed`. Log and return success instead.
    */
   private async persistSentState(message: Message, result: MessageResult): Promise<MessageResponseDto> {
-    // A forward whose engine couldn't recover the sent copy's id returns an empty id — leave waMessageId
-    // unset (NULL) so no ack mis-matches it. Every other send path carries a real id.
+    // A send whose engine couldn't read the sent message's id back reports an empty id — a forward that
+    // can't recover the copy, or a WhatsApp Web build that renamed the id field out from under the
+    // engine. Leave waMessageId unset (NULL) so no ack mis-matches it.
     if (result.id) message.waMessageId = result.id;
     message.status = MessageStatus.SENT;
     message.timestamp = result.timestamp;
     try {
       await this.messageRepository.save(message);
+      // Reconcile the earlier PENDING emission with the finalized row (#906).
+      this.emitPersisted(message.sessionId, message);
     } catch (persistError) {
-      this.logger.warn(`Persisting SENT state failed after a successful send (id=${result.id})`, {
-        error: persistError instanceof Error ? persistError.message : String(persistError),
-      });
+      if (result.id && isUniqueConstraintError(persistError)) {
+        // The engine's own-send echo (onMessageCreate) won the race and already persisted a row with
+        // this waMessageId. That row carries only a media-less marker — merge our SENT state AND our
+        // metadata (the actual media payload) onto it BEFORE dropping this redundant PENDING row, or
+        // the payload-bearing row is the one that gets deleted and the media is gone after a reload.
+        // Best-effort throughout: the send itself already succeeded.
+        this.logger.debug(
+          `Send echo already persisted ${result.id}; merging state and dropping the redundant pending row`,
+          {
+            messageId: message.id,
+          },
+        );
+        const patch: QueryDeepPartialEntity<Message> = { status: MessageStatus.SENT, timestamp: result.timestamp };
+        if (message.metadata) {
+          patch.metadata = message.metadata as QueryDeepPartialEntity<Record<string, unknown>>;
+        }
+        await this.messageRepository
+          .update({ sessionId: message.sessionId, waMessageId: result.id }, patch)
+          .catch(err =>
+            this.logger.warn(`Merging SENT state onto the echo-persisted row failed (id=${result.id})`, {
+              error: err instanceof Error ? err.message : String(err),
+            }),
+          );
+        await this.messageRepository.delete({ id: message.id }).catch(() => undefined);
+        // Reconcile provider indexes (#906): upsert the surviving echo row (now carrying our SENT
+        // state + media) and drop the ghost PENDING document this redundant row produced earlier.
+        const surviving = await this.messageRepository
+          .findOne({ where: { sessionId: message.sessionId, waMessageId: result.id } })
+          .catch(() => null);
+        if (surviving) this.emitPersisted(message.sessionId, surviving);
+        void this.hookManager
+          .execute(
+            'message:deleted',
+            { sessionId: message.sessionId, message: { ...message } },
+            { sessionId: message.sessionId, source: 'MessageService' },
+          )
+          .catch(() => undefined);
+      } else {
+        this.logger.warn(`Persisting SENT state failed after a successful send (id=${result.id})`, {
+          error: persistError instanceof Error ? persistError.message : String(persistError),
+        });
+      }
     }
     return { messageId: result.id, timestamp: result.timestamp };
   }
@@ -607,12 +705,25 @@ export class MessageService {
    * engine to fetch an unbounded number of messages. When `deep` is true the ceiling is raised to 2000
    * (for reaching weeks/months back on whatsapp-web.js, which can load earlier messages on demand) and
    * media is forced off — downloading base64 for up to 2000 messages would be an enormous, slow payload.
+   *
+   * An optional `signal` (HTTP client disconnect) is threaded to the engine, which checks it between
+   * media downloads. Callers without cancellation keep the exact three-argument engine call shape.
    */
-  async getChatHistory(sessionId: string, chatId: string, limit = 50, includeMedia = false, deep = false) {
+  async getChatHistory(
+    sessionId: string,
+    chatId: string,
+    limit = 50,
+    includeMedia = false,
+    deep = false,
+    signal?: AbortSignal,
+  ) {
     const engine = await this.getEngine(sessionId);
     const ceiling = deep ? MessageService.MAX_DEEP_CHAT_HISTORY_LIMIT : MessageService.MAX_CHAT_HISTORY_LIMIT;
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(Math.trunc(limit), 1), ceiling) : 50;
-    return engine.getChatHistory(chatId, safeLimit, deep ? false : includeMedia);
+    const media = deep ? false : includeMedia;
+    return signal
+      ? engine.getChatHistory(chatId, safeLimit, media, undefined, signal)
+      : engine.getChatHistory(chatId, safeLimit, media);
   }
 
   // ========== Delete Message ==========
@@ -631,6 +742,26 @@ export class MessageService {
     } catch (err) {
       this.logger.warn(`Failed to flag deleted message ${dto.messageId} as revoked`, { error: String(err) });
     }
+  }
+
+  // ========== Edit Message ==========
+
+  async editMessage(
+    sessionId: string,
+    dto: { chatId: string; messageId: string; body: string },
+  ): Promise<MessageResponseDto> {
+    const engine = await this.getEngine(sessionId);
+    // An edit replaces the text the recipient sees, so it is content leaving the account and goes
+    // through the same moderation chokepoint as every other sender. A plugin can rewrite `body`
+    // here exactly as it can for a first send.
+    const finalDto = await this.applySendingGate(sessionId, 'edit', dto);
+    const result = await engine.editMessage(finalDto.chatId, finalDto.messageId, finalDto.body);
+
+    // Best-effort: reflect the new body in the stored copy (mirrors deleteMessage's revoked flag),
+    // serialized with the inbound edit/reaction writers through the session's per-message mutation
+    // queue. A missing row must not fail the request — the engine edit already succeeded.
+    await this.sessionService.recordOutboundMessageEdit(sessionId, finalDto.messageId, finalDto.body);
+    return { messageId: result.id, timestamp: result.timestamp };
   }
 
   /**
@@ -703,17 +834,18 @@ export class MessageService {
   }
 
   private buildMediaInput(dto: SendMediaMessageDto): MediaInput {
-    if (!dto.url && !dto.base64) {
+    const base64 = stripBase64DataUri(dto.base64);
+    if (!dto.url && !base64) {
       throw new BadRequestException('Either url or base64 must be provided');
     }
 
-    if (dto.base64 && !dto.mimetype) {
+    if (base64 && !dto.mimetype) {
       throw new BadRequestException('mimetype is required when using base64 data');
     }
 
     // Bound an outbound base64 payload to the same byte cap as URL/inbound media, before it is
     // persisted or handed to the engine. URL media is already capped while streaming.
-    assertBase64WithinMediaCap(dto.base64);
+    assertBase64WithinMediaCap(base64);
 
     return {
       mimetype: dto.mimetype || 'application/octet-stream',
@@ -721,7 +853,7 @@ export class MessageService {
       // `url` (e.g. a Swagger/example default left in the body) must not be fetched in its place.
       // Aligns the send selection with the base64-first persisted metadata and the url field's
       // `@ValidateIf((o) => !o.base64)` (which skips @IsUrl when base64 is present) — #670.
-      data: dto.base64 || dto.url!,
+      data: base64 || dto.url!,
       filename: dto.filename,
       caption: dto.caption,
       mentions: dto.mentions,

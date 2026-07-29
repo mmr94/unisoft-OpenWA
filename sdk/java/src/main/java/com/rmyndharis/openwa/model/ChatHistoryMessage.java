@@ -19,6 +19,7 @@ public record ChatHistoryMessage(
     boolean fromMe,
     boolean isGroup,
     Boolean isStatusBroadcast,
+    String kind,
     /** For group messages, the participant who sent it ({@code from} is the group JID). */
     String author,
     List<String> mentionedIds,
