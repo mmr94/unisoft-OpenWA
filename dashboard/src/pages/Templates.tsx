@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, Check, Copy, FileText, Loader2, Plus, Search, Trash2, X } from 'lucide-react';
+import { Copy, FileText, Loader2, Plus, Search, Trash2 } from 'lucide-react';
 import { type MessageTemplate, type TemplatePayload } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { useRole } from '../hooks/useRole';
+import { useToast } from '../hooks/useToast';
 import {
   useCreateTemplateMutation,
   useDeleteTemplateMutation,
@@ -60,11 +61,14 @@ export function Templates() {
   const [form, setForm] = useState<TemplateForm>(emptyForm);
   const [editingTemplate, setEditingTemplate] = useState<MessageTemplate | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<MessageTemplate | null>(null);
-  const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const toast = useToast();
   const [previewValues, setPreviewValues] = useState<Record<string, string>>({});
   const [searchTerm, setSearchTerm] = useState('');
 
-  const { data: templates = [], isLoading: loadingTemplates } = useTemplatesQuery(selectedSessionId, !!selectedSessionId);
+  const { data: templates = [], isLoading: loadingTemplates } = useTemplatesQuery(
+    selectedSessionId,
+    !!selectedSessionId,
+  );
   const createMutation = useCreateTemplateMutation();
   const updateMutation = useUpdateTemplateMutation();
   const deleteMutation = useDeleteTemplateMutation();
@@ -88,12 +92,6 @@ export function Templates() {
       setSelectedSessionId(sessions[0].id);
     }
   }, [selectedSessionId, sessions]);
-
-  useEffect(() => {
-    if (!toast) return;
-    const timer = setTimeout(() => setToast(null), 4000);
-    return () => clearTimeout(timer);
-  }, [toast]);
 
   useEffect(() => {
     setPreviewValues(current => {
@@ -132,22 +130,21 @@ export function Templates() {
           id: editingTemplate.id,
           data: toPayload(form),
         });
-        setToast({ type: 'success', message: t('templates.toasts.updated') });
+        toast.success(t('templates.toasts.updated'));
       } else {
         await createMutation.mutateAsync({
           sessionId: selectedSessionId,
           data: toPayload(form),
         });
-        setToast({ type: 'success', message: t('templates.toasts.created') });
+        toast.success(t('templates.toasts.created'));
       }
       resetForm();
     } catch (err) {
-      setToast({
-        type: 'error',
-        message: t(editingTemplate ? 'templates.toasts.updateFailed' : 'templates.toasts.createFailed', {
+      toast.error(
+        t(editingTemplate ? 'templates.toasts.updateFailed' : 'templates.toasts.createFailed', {
           message: err instanceof Error ? err.message : t('common.unknownError'),
         }),
-      });
+      );
     }
   };
 
@@ -155,22 +152,21 @@ export function Templates() {
     if (!selectedSessionId || !deleteTarget) return;
     try {
       await deleteMutation.mutateAsync({ sessionId: selectedSessionId, id: deleteTarget.id });
-      setToast({ type: 'success', message: t('templates.toasts.deleted') });
+      toast.success(t('templates.toasts.deleted'));
       if (editingTemplate?.id === deleteTarget.id) resetForm();
       setDeleteTarget(null);
     } catch (err) {
-      setToast({
-        type: 'error',
-        message: t('templates.toasts.deleteFailed', {
+      toast.error(
+        t('templates.toasts.deleteFailed', {
           message: err instanceof Error ? err.message : t('common.unknownError'),
         }),
-      });
+      );
     }
   };
 
   const copyName = async (name: string) => {
     if (await copyToClipboard(name)) {
-      setToast({ type: 'success', message: t('templates.toasts.copied') });
+      toast.success(t('templates.toasts.copied'));
     }
   };
 
@@ -184,22 +180,13 @@ export function Templates() {
 
   return (
     <div className="templates-page">
-      {toast && (
-        <div className={`toast ${toast.type}`}>
-          {toast.type === 'success' ? <Check size={18} /> : <AlertTriangle size={18} />}
-          <span>{toast.message}</span>
-          <button className="toast-close" onClick={() => setToast(null)} aria-label={t('common.close')}>
-            <X size={16} />
-          </button>
-        </div>
-      )}
-
       <PageHeader
         title={t('templates.title')}
         subtitle={t('templates.subtitle')}
         actions={
           <select
             className="templates-session-select"
+            aria-label={t('templates.sessionSelect')}
             value={selectedSessionId}
             onChange={event => {
               setSelectedSessionId(event.target.value);
@@ -318,8 +305,9 @@ export function Templates() {
 
             <div className="template-form">
               <div className="form-group">
-                <label>{t('common.name')}</label>
+                <label htmlFor="tpl-1">{t('common.name')}</label>
                 <input
+                  id="tpl-1"
                   value={form.name}
                   onChange={event => setForm({ ...form, name: event.target.value })}
                   placeholder={t('templates.namePlaceholder')}
@@ -329,8 +317,9 @@ export function Templates() {
 
               <div className="template-message-fields">
                 <div className="form-group">
-                  <label>{t('templates.header')}</label>
+                  <label htmlFor="tpl-2">{t('templates.header')}</label>
                   <input
+                    id="tpl-2"
                     value={form.header}
                     onChange={event => setForm({ ...form, header: event.target.value })}
                     placeholder={t('templates.headerPlaceholder')}
@@ -339,8 +328,9 @@ export function Templates() {
                 </div>
 
                 <div className="form-group body-field">
-                  <label>{t('templates.body')}</label>
+                  <label htmlFor="tpl-3">{t('templates.body')}</label>
                   <textarea
+                    id="tpl-3"
                     value={form.body}
                     onChange={event => setForm({ ...form, body: event.target.value })}
                     placeholder={t('templates.bodyPlaceholder')}
@@ -350,8 +340,9 @@ export function Templates() {
                 </div>
 
                 <div className="form-group">
-                  <label>{t('templates.footer')}</label>
+                  <label htmlFor="tpl-4">{t('templates.footer')}</label>
                   <input
+                    id="tpl-4"
                     value={form.footer}
                     onChange={event => setForm({ ...form, footer: event.target.value })}
                     placeholder={t('templates.footerPlaceholder')}
@@ -371,7 +362,9 @@ export function Templates() {
                   type="button"
                 >
                   {isSaving ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} />}
-                  {canWrite ? t(editingTemplate ? 'templates.saveChanges' : 'templates.createTemplate') : t('templates.viewOnly')}
+                  {canWrite
+                    ? t(editingTemplate ? 'templates.saveChanges' : 'templates.createTemplate')
+                    : t('templates.viewOnly')}
                 </button>
               </div>
             </div>

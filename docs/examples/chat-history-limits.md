@@ -31,7 +31,7 @@ The endpoint is intentionally bounded:
 ## How Deep It Can Reach
 
 By default the live history endpoint returns at most the **100 most recent** messages per request (the
-`limit` clamp above). The `whatsapp-web.js` engine *can* load older messages on demand — internally it
+`limit` clamp above). The `whatsapp-web.js` engine _can_ load older messages on demand — internally it
 drives WhatsApp Web's "load earlier messages" mechanism — so reaching further back is bounded by
 **OpenWA's cap**, not by what WhatsApp Web is willing to expose.
 

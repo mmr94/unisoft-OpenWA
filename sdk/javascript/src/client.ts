@@ -25,6 +25,7 @@
 
 import { request, requestBytes, encodeSegment, warnIfInsecureHttpUrl, type BinaryResponse, type ClientConfig, type FetchLike, type RequestOptions } from './http.js';
 import { CallsResource } from './resources/calls.js';
+import { MediaResource } from './resources/media.js';
 import { CatalogResource } from './resources/catalog.js';
 import { ChannelsResource } from './resources/channels.js';
 import { ChatsResource } from './resources/chats.js';
@@ -89,6 +90,7 @@ export class OpenWAClient {
   readonly search = new SearchResource(this);
   readonly profile = new ProfileResource(this);
   readonly calls = new CallsResource(this);
+  readonly media = new MediaResource(this);
 
   // ── Auth ─────────────────────────────────────────────────────────
 

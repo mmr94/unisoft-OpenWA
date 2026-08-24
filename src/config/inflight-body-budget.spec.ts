@@ -1,5 +1,10 @@
 import { EventEmitter } from 'events';
-import { Request, Response } from 'express';
+import { readFileSync } from 'fs';
+import { resolve } from 'path';
+import { createServer, request as httpRequest, Server } from 'http';
+import { AddressInfo } from 'net';
+import { gzipSync } from 'zlib';
+import express, { Request, Response, json } from 'express';
 import {
   createInflightBodyBudget,
   parseBodyLimitBytes,
@@ -13,7 +18,10 @@ const MB = 1024 * 1024;
 const makeReq = (headers: Record<string, string> = {}): Request & EventEmitter => {
   const req = new EventEmitter() as unknown as Request & EventEmitter;
   (req as unknown as { headers: Record<string, string> }).headers = headers;
-  (req as unknown as { socket: { bytesRead: number } }).socket = { bytesRead: 0 };
+  (req as unknown as { socket: { bytesRead: number; remoteAddress: string } }).socket = {
+    bytesRead: 0,
+    remoteAddress: '203.0.113.7',
+  };
   (req as unknown as { destroy: jest.Mock }).destroy = jest.fn();
   return req;
 };
@@ -89,7 +97,7 @@ describe('resolveInflightBodyBudgetBytes', () => {
 
 describe('createInflightBodyBudget middleware', () => {
   it('admits a request under budget and reserves its declared Content-Length', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const req = makeReq({ 'content-length': '400' });
     const { next, state } = run(budget, req);
 
@@ -99,14 +107,14 @@ describe('createInflightBodyBudget middleware', () => {
   });
 
   it('does not attach a data listener when a Content-Length was declared (stream left untouched)', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const req = makeReq({ 'content-length': '400' });
     run(budget, req);
     expect(req.listenerCount('data')).toBe(0);
   });
 
   it('admits a request that lands exactly on the budget', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     run(budget, makeReq({ 'content-length': '600' }));
     const { next } = run(budget, makeReq({ 'content-length': '400' }));
     expect(next).toHaveBeenCalledTimes(1);
@@ -114,7 +122,7 @@ describe('createInflightBodyBudget middleware', () => {
   });
 
   it('rejects with 503 + Retry-After, without reading the body, when the declared size would exceed the budget', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     run(budget, makeReq({ 'content-length': '800' }));
 
     const rejected = makeReq({ 'content-length': '300' });
@@ -132,21 +140,21 @@ describe('createInflightBodyBudget middleware', () => {
   });
 
   it('sends the configured Retry-After value', () => {
-    const budget = createInflightBodyBudget(100, { retryAfterSeconds: 5 });
+    const budget = createInflightBodyBudget(100, { retryAfterSeconds: 5, perClientShare: 1 });
     run(budget, makeReq({ 'content-length': '100' }));
     const { headers } = run(budget, makeReq({ 'content-length': '1' }));
     expect(headers['retry-after']).toBe('5');
   });
 
   it('admits a zero-length body even when the budget is fully used', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     run(budget, makeReq({ 'content-length': '1000' }));
     const { next } = run(budget, makeReq({ 'content-length': '0' }));
     expect(next).toHaveBeenCalledTimes(1);
   });
 
   it('releases the reservation exactly once on normal completion', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const req = makeReq({ 'content-length': '400' });
     const { res } = run(budget, req);
 
@@ -159,7 +167,7 @@ describe('createInflightBodyBudget middleware', () => {
   });
 
   it('releases exactly once on a client abort (request close before the response)', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const req = makeReq({ 'content-length': '400' });
     const { res } = run(budget, req);
 
@@ -172,7 +180,7 @@ describe('createInflightBodyBudget middleware', () => {
   });
 
   it('releases on stream errors (request or response side)', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const reqA = makeReq({ 'content-length': '400' });
     run(budget, reqA);
     reqA.emit('error', new Error('boom'));
@@ -185,7 +193,7 @@ describe('createInflightBodyBudget middleware', () => {
   });
 
   it('takes only an opening placeholder for chunk-encoded bodies and releases it on completion', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const req = makeReq({ 'transfer-encoding': 'chunked' });
     const { res, next } = run(budget, req);
 
@@ -204,7 +212,7 @@ describe('createInflightBodyBudget middleware', () => {
   it('does not price a small chunked body at a whole per-request slot', () => {
     // Regression: reserving budget/4 up front turned the byte budget into a concurrency limit of 4
     // for chunked senders — four 6-byte uploads refused every further body-carrying request.
-    const budget = createInflightBodyBudget(64 * 1024 * 1024);
+    const budget = createInflightBodyBudget(64 * 1024 * 1024, { perClientShare: 1 });
     for (let i = 0; i < 8; i++) {
       const { next } = run(budget, makeReq({ 'transfer-encoding': 'chunked' }));
       expect(next).toHaveBeenCalledTimes(1);
@@ -213,7 +221,7 @@ describe('createInflightBodyBudget middleware', () => {
   });
 
   it('still refuses an un-declared body once the aggregate is exhausted', () => {
-    const budget = createInflightBodyBudget(2 * 1024 * 1024);
+    const budget = createInflightBodyBudget(2 * 1024 * 1024, { perClientShare: 1 });
     for (let i = 0; i < 2; i++) {
       expect(run(budget, makeReq({ 'transfer-encoding': 'chunked' })).next).toHaveBeenCalledTimes(1);
     }
@@ -223,7 +231,7 @@ describe('createInflightBodyBudget middleware', () => {
   });
 
   it('reserves nothing for requests with neither Content-Length nor Transfer-Encoding', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     run(budget, makeReq({ 'content-length': '1000' }));
     // No body expected (health checks, GETs): admitted even with the budget fully reserved.
     const req = makeReq();
@@ -234,7 +242,7 @@ describe('createInflightBodyBudget middleware', () => {
   });
 
   it('drops the socket instead of writing a 503 when the response is already flushing', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     run(budget, makeReq({ 'content-length': '800' }));
 
     const req = makeReq({ 'content-length': '300' });
@@ -250,7 +258,7 @@ describe('createInflightBodyBudget middleware', () => {
   });
 
   it('reuses freed budget for the next request (no leak across a full lifecycle)', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     for (let i = 0; i < 5; i++) {
       const req = makeReq({ 'content-length': '900' });
       const { res, next } = run(budget, req);
@@ -268,7 +276,7 @@ describe('stall reaper', () => {
   const destroyMock = (req: Request): jest.Mock => (req as unknown as { destroy: jest.Mock }).destroy;
 
   it('reaps a stalled declared-length connection and releases its reservation', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const req = makeReq({ 'content-length': '400' });
     run(budget, req);
     expect(budget.currentBytes()).toBe(400);
@@ -285,7 +293,7 @@ describe('stall reaper', () => {
   });
 
   it('reaps a stalled chunk-encoded connection the same way', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const req = makeReq({ 'transfer-encoding': 'chunked' });
     run(budget, req);
     expect(budget.currentBytes()).toBe(1000);
@@ -296,7 +304,7 @@ describe('stall reaper', () => {
   });
 
   it('does not reap a connection that keeps making progress, however slow', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const req = makeReq({ 'content-length': '400' });
     run(budget, req);
     const socket = (req as unknown as { socket: { bytesRead: number } }).socket;
@@ -311,7 +319,7 @@ describe('stall reaper', () => {
   });
 
   it('stops reaping once the declared body has fully arrived', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const req = makeReq({ 'content-length': '400' });
     const { res } = run(budget, req);
     (req as unknown as { socket: { bytesRead: number } }).socket.bytesRead = 400;
@@ -325,7 +333,7 @@ describe('stall reaper', () => {
   });
 
   it('stops reaping once the downstream consumer finished reading (end)', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const req = makeReq({ 'transfer-encoding': 'chunked' });
     const { res } = run(budget, req);
 
@@ -339,7 +347,7 @@ describe('stall reaper', () => {
   });
 
   it('reconciles a chunked reservation with the bytes that actually arrive', () => {
-    const budget = createInflightBodyBudget(64 * 1024 * 1024);
+    const budget = createInflightBodyBudget(64 * 1024 * 1024, { perClientShare: 1 });
     const req = makeReq({ 'transfer-encoding': 'chunked' });
     run(budget, req);
     expect(budget.currentBytes()).toBe(1024 * 1024); // opening placeholder
@@ -351,7 +359,7 @@ describe('stall reaper', () => {
   });
 
   it('aborts an un-declared body that streams past the aggregate budget', () => {
-    const budget = createInflightBodyBudget(2 * 1024 * 1024);
+    const budget = createInflightBodyBudget(2 * 1024 * 1024, { perClientShare: 1 });
     const req = makeReq({ 'transfer-encoding': 'chunked' });
     run(budget, req);
 
@@ -361,11 +369,94 @@ describe('stall reaper', () => {
     expect(budget.currentBytes()).toBe(0);
   });
 
+  // The per-client share: the DoS bound is per ATTACKER, not per deployment. The spec doubles
+  // share one remoteAddress, so every request here comes from the same client.
+  describe('per-client share of the budget', () => {
+    const runFrom = (budget: InflightBodyBudget, ip: string, headers: Record<string, string>) => {
+      const req = makeReq(headers);
+      (req as unknown as { socket: { bytesRead: number; remoteAddress: string } }).socket = {
+        bytesRead: 0,
+        remoteAddress: ip,
+      };
+      return run(budget, req);
+    };
+
+    it('refuses a SECOND client request once that client holds its share, while a different client is still admitted', () => {
+      const budget = createInflightBodyBudget(1000); // default share 0.5 -> cap 500
+      const { next: firstOk } = runFrom(budget, '198.51.100.1', { 'content-length': '400' });
+      expect(firstOk).toHaveBeenCalledTimes(1);
+
+      // Same client, over its 500-byte share now.
+      const { next: refused, state } = runFrom(budget, '198.51.100.1', { 'content-length': '200' });
+      expect(refused).not.toHaveBeenCalled();
+      expect(state.code).toBe(503);
+
+      // A different client sails through - the whole aggregate is still theirs to use.
+      const { next: other } = runFrom(budget, '198.51.100.2', { 'content-length': '400' });
+      expect(other).toHaveBeenCalledTimes(1);
+    });
+
+    it('releases the client ledger exactly once: a finished body frees the share', () => {
+      const budget = createInflightBodyBudget(1000);
+      const { res } = runFrom(budget, '198.51.100.1', { 'content-length': '400' });
+      res.emit('finish');
+      const { next } = runFrom(budget, '198.51.100.1', { 'content-length': '400' });
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(budget.clientBytes(makeReq() as never)).toBe(0);
+    });
+
+    it('X-Forwarded-For is IGNORED without trusted proxies (share keys on the socket address)', () => {
+      const budget = createInflightBodyBudget(1000);
+      const reqA = makeReq({ 'content-length': '400', 'x-forwarded-for': '192.0.2.1' });
+      const a = run(budget, reqA);
+      const reqB = makeReq({ 'content-length': '400', 'x-forwarded-for': '192.0.2.2' });
+      const b = run(budget, reqB);
+      // Both share one socket address -> one share -> the second is over the cap.
+      expect(a.next).toHaveBeenCalledTimes(1);
+      expect(b.next).not.toHaveBeenCalled();
+    });
+
+    it('X-Forwarded-For keys the share when the proxy is trusted', () => {
+      const budget = createInflightBodyBudget(1000, { trustedProxies: ['127.0.0.1'] });
+      const base = { 'x-forwarded-for': '', 'content-length': '400' };
+      const reqA = makeReq({ ...base, 'x-forwarded-for': '192.0.2.1' });
+      (reqA as unknown as { socket: { bytesRead: number; remoteAddress: string } }).socket = {
+        bytesRead: 0,
+        remoteAddress: '127.0.0.1',
+      };
+      const reqB = makeReq({ ...base, 'x-forwarded-for': '192.0.2.2' });
+      (reqB as unknown as { socket: { bytesRead: number; remoteAddress: string } }).socket = {
+        bytesRead: 0,
+        remoteAddress: '127.0.0.1',
+      };
+      expect(run(budget, reqA).next).toHaveBeenCalledTimes(1);
+      expect(run(budget, reqB).next).toHaveBeenCalledTimes(1);
+    });
+
+    it('perClientShare: 1 restores single-client use of the whole budget', () => {
+      const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
+      expect(runFrom(budget, '198.51.100.1', { 'content-length': '600' }).next).toHaveBeenCalledTimes(1);
+      expect(runFrom(budget, '198.51.100.1', { 'content-length': '400' }).next).toHaveBeenCalledTimes(1);
+    });
+
+    it('aborts a chunked body that crosses its client share mid-stream', () => {
+      const budget = createInflightBodyBudget(10 * 1024 * 1024); // cap 5 MiB
+      const req = makeReq({ 'transfer-encoding': 'chunked' });
+      run(budget, req);
+
+      (req as unknown as { socket: { bytesRead: number } }).socket.bytesRead = 6 * 1024 * 1024;
+      jest.advanceTimersByTime(5_000);
+      expect(destroyMock(req)).toHaveBeenCalledTimes(1);
+      expect(budget.currentBytes()).toBe(0);
+      expect(budget.clientBytes(req as never)).toBe(0);
+    });
+  });
+
   it('does not reap a fully-received request whose body no parser consumed', () => {
     // The body can arrive in the same segment as the headers, so socket.bytesRead never moves again
     // and 'end' never fires when no parser reads the stream. Killing that request at the stall
     // timeout would drop a healthy connection mid-handler.
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const req = makeReq({ 'content-length': '400' });
     const { res } = run(budget, req);
     (req as unknown as { complete: boolean }).complete = true;
@@ -379,7 +470,7 @@ describe('stall reaper', () => {
   });
 
   it('never arms the reaper for requests without a body', () => {
-    const budget = createInflightBodyBudget(1000);
+    const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const getReq = makeReq();
     const emptyReq = makeReq({ 'content-length': '0' });
     run(budget, getReq);
@@ -388,5 +479,200 @@ describe('stall reaper', () => {
     jest.advanceTimersByTime(120_000);
     expect(destroyMock(getReq)).not.toHaveBeenCalled();
     expect(destroyMock(emptyReq)).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Compressed bodies, exercised over a REAL server with a RAW http client. The doubles above hand the
+ * middleware a header bag and never move a byte, so they cannot show what a compressed body costs
+ * once the parser inflates it. A raw client (rather than an assertion library) is deliberate: the
+ * exact bytes on the wire are the subject here, and a serializer that helpfully re-encodes a Buffer
+ * would test itself instead of the middleware.
+ */
+describe('compressed request bodies', () => {
+  const BUDGET = 64 * 1024;
+  /** Compresses ~1000:1, so its declared length is a small fraction of what inflating it costs. */
+  const INFLATED_PAYLOAD = Buffer.from(JSON.stringify({ data: 'a'.repeat(2 * MB) }));
+
+  let server: Server | undefined;
+  let budget: InflightBodyBudget;
+  let port = 0;
+
+  const listen = async (): Promise<void> => {
+    budget = createInflightBodyBudget(BUDGET);
+    const app = express();
+    app.use(budget.middleware);
+    app.use(json({ limit: '25mb' }));
+    app.post('/echo', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    server = createServer(app);
+    await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', resolve));
+    port = (server.address() as AddressInfo).port;
+  };
+
+  interface Reply {
+    status: number;
+    body: string;
+  }
+
+  /**
+   * Resolves on the response even when the server drops the socket mid-upload — which is exactly
+   * what a refusal does here (it answers, sets Connection: close and never reads the body), so a
+   * client that treated the reset as fatal could not observe the status it is meant to assert.
+   */
+  const send = (headers: Record<string, string>, body: Buffer): Promise<Reply> =>
+    new Promise((resolve, reject) => {
+      let reply: Reply | undefined;
+      const req = httpRequest({ host: '127.0.0.1', port, path: '/echo', method: 'POST', headers }, res => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          reply = { status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString() };
+          resolve(reply);
+        });
+      });
+      req.on('error', (error: NodeJS.ErrnoException) => {
+        if (reply) return;
+        // A refusal answers and drops the socket without reading the body, so the reset can beat
+        // the parsed response. Settle with a sentinel rather than swallowing it: a bare timeout
+        // would report as "test timed out" instead of "expected 415, got a connection reset".
+        if (error.code === 'ECONNRESET' || error.code === 'EPIPE') {
+          resolve({ status: 0, body: '' });
+          return;
+        }
+        reject(error);
+      });
+      req.end(body);
+    });
+
+  beforeEach(() => jest.useRealTimers());
+  afterEach(async () => {
+    if (server) await new Promise<void>(resolve => server!.close(() => resolve()));
+    server = undefined;
+  });
+
+  it('refuses a gzip-encoded body with 415 instead of admitting it on its compressed length', async () => {
+    await listen();
+    const gzipped = gzipSync(INFLATED_PAYLOAD);
+    // The premise: compressed, this body is small enough to sail through admission control.
+    expect(gzipped.length).toBeLessThan(BUDGET);
+    expect(INFLATED_PAYLOAD.length).toBeGreaterThan(BUDGET);
+
+    const reply = await send(
+      {
+        'Content-Type': 'application/json',
+        'Content-Encoding': 'gzip',
+        'Content-Length': String(gzipped.length),
+      },
+      gzipped,
+    );
+
+    expect(reply.status).toBe(415);
+    expect(JSON.parse(reply.body)).toEqual({
+      statusCode: 415,
+      message: 'Compressed request bodies are not supported',
+      error: 'Unsupported Media Type',
+    });
+    expect(budget.currentBytes()).toBe(0);
+  });
+
+  it('refuses an oversized UNCOMPRESSED body through the budget, not the encoding guard', async () => {
+    await listen();
+    const plain = Buffer.alloc(BUDGET + 1, 0x20);
+
+    const reply = await send({ 'Content-Type': 'application/json', 'Content-Length': String(plain.length) }, plain);
+
+    expect(reply.status).toBe(503);
+  });
+
+  it('refuses a compressed body whose Content-Length is zero', async () => {
+    await listen();
+
+    // `reserved` is 0 here, so a gate keyed on the reservation would wave this through to the
+    // parser and the client would get body-parser's HTML error instead of the documented shape.
+    const reply = await send(
+      { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', 'Content-Length': '0' },
+      Buffer.alloc(0),
+    );
+
+    expect(reply.status).toBe(415);
+    expect((JSON.parse(reply.body) as { error?: string }).error).toBe('Unsupported Media Type');
+  });
+
+  it('refuses a compressed body whose Content-Length is not a safe integer', async () => {
+    await listen();
+    const gzipped = gzipSync(INFLATED_PAYLOAD);
+
+    // parseDeclaredLength refuses to reserve for this, but type-is `hasBody` still hands it to the
+    // parser — the one shape that escaped both the reservation AND admission control.
+    const reply = await send(
+      {
+        'Content-Type': 'application/json',
+        'Content-Encoding': 'gzip',
+        'Content-Length': String(Number.MAX_SAFE_INTEGER + 2),
+      },
+      gzipped,
+    );
+
+    expect(reply.status).toBe(415);
+    expect((JSON.parse(reply.body) as { error?: string }).error).toBe('Unsupported Media Type');
+  });
+
+  it('refuses an encoding LIST, matching what the parser would do with it', async () => {
+    await listen();
+    const plain = Buffer.from(JSON.stringify({ data: 'small' }));
+
+    // "identity, identity" transforms nothing, but body-parser compares the whole header against
+    // 'identity' and refuses it — so the middleware refuses it too and both layers answer the same
+    // documented shape instead of disagreeing about who rejects it.
+    const reply = await send(
+      {
+        'Content-Type': 'application/json',
+        'Content-Encoding': 'identity, identity',
+        'Content-Length': String(plain.length),
+      },
+      plain,
+    );
+
+    expect(reply.status).toBe(415);
+    expect((JSON.parse(reply.body) as { error?: string }).error).toBe('Unsupported Media Type');
+  });
+
+  it('admits an ordinary body declaring Content-Encoding: identity', async () => {
+    await listen();
+    const plain = Buffer.from(JSON.stringify({ data: 'small' }));
+
+    const reply = await send(
+      {
+        'Content-Type': 'application/json',
+        'Content-Encoding': 'identity',
+        'Content-Length': String(plain.length),
+      },
+      plain,
+    );
+
+    expect(reply.status).toBe(200);
+  });
+});
+
+/**
+ * The `inflate: false` backstop is unreachable while the guard above stands, so no behavioural test
+ * can lock it — yet it is the only thing standing if the guard is ever bypassed. Assert it in the
+ * source instead, the way load-env.spec.ts locks main.ts's import order.
+ */
+describe('body-parser inflate backstop', () => {
+  const read = (relative: string): string => readFileSync(resolve(__dirname, relative), 'utf8');
+
+  it('disables inflate on both global parsers', () => {
+    // The parsers live in configure-app.ts, which is where the production stack is assembled; they
+    // sat inline in main.ts until that stack was extracted so the e2e lane could run it too.
+    const source = read('../configure-app.ts');
+
+    expect(source.match(/^\s+inflate: false,$/gm)).toHaveLength(2);
+  });
+
+  it('mirrors the global cap and disabled inflate on the MCP route-level fallback parser', () => {
+    expect(read('../modules/mcp/mcp.server.ts')).toContain('express.json({ limit: bodyLimit, inflate: false })');
   });
 });

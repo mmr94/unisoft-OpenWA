@@ -69,6 +69,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -e '.[dev]'
+      # Before pytest: this package ships py.typed, so its annotations are a published contract,
+      # and pytest cannot see a mistake in them — TypedDict keys are not enforced at runtime, so a
+      # request type missing a field passes every test here while a typed caller is told the field
+      # does not exist.
+      - run: mypy
       - run: pytest
 
   php:
@@ -97,7 +102,7 @@ jobs:
         working-directory: sdk/java
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: '17'

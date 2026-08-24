@@ -48,6 +48,24 @@ describe('validateIngressManifest', () => {
     expect(() => validateIngressManifest(m as never)).toThrow(/webhook:ingress/);
   });
 
+  it('the ingress refusal names the array and the manifest file to fix', () => {
+    // Load-time twin of the capability denial: an author who sees only "is missing the
+    // 'webhook:ingress' permission" is told the fault, not where to declare it.
+    const m = baseManifest();
+    m.permissions = ['conversation:send'];
+    const error = (() => {
+      try {
+        validateIngressManifest(m as never);
+        return null;
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+    expect(error?.message).toContain('webhook:ingress');
+    expect(error?.message).toContain('permissions');
+    expect(error?.message).toContain('manifest.json');
+  });
+
   it('rejects toleranceSec <= 0 (replay guard would be a no-op)', () => {
     const m = baseManifest();
     m.ingress[0].signature.toleranceSec = 0;

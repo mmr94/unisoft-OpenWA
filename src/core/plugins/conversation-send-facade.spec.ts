@@ -60,6 +60,63 @@ describe('conversation.send facade', () => {
     expect(res).toEqual({ id: 'm1' });
   });
 
+  it.each([true, false])('forwards an explicit linkPreview: %s to the text send', async choice => {
+    const sendText = jest.fn().mockResolvedValue({ id: 'm1' });
+    const facade = buildConversationSendFacade({
+      manifest: manifest(['conversation:send']) as never,
+      assertPermission: () => undefined,
+      assertSessionActive: jest.fn(),
+      resolveChatId: () => Promise.resolve('chat@c.us'),
+      runGuarded: (_events: string[], run: () => Promise<unknown>) => run(),
+      sendText,
+      reply: jest.fn(),
+    } as never);
+    await facade.send({
+      type: 'text',
+      text: 'see https://example.com',
+      sessionId: 's',
+      chatId: 'chat@c.us',
+      linkPreview: choice,
+    });
+    expect(sendText).toHaveBeenCalledWith('s', {
+      chatId: 'chat@c.us',
+      text: 'see https://example.com',
+      linkPreview: choice,
+    });
+  });
+
+  it('ignores linkPreview on a media envelope rather than rejecting the send', async () => {
+    // The engine media path takes no preview option, but a caption carrying a URL is ordinary — refusing
+    // the send over a hint the engine simply cannot act on would cost the message for nothing.
+    const sendMedia = jest.fn().mockResolvedValue({ id: 'm2' });
+    const sendText = jest.fn();
+    const facade = buildConversationSendFacade({
+      manifest: manifest(['conversation:send']) as never,
+      assertPermission: () => undefined,
+      assertSessionActive: jest.fn(),
+      resolveChatId: () => Promise.resolve('chat@c.us'),
+      runGuarded: (_events: string[], run: () => Promise<unknown>) => run(),
+      sendText,
+      reply: jest.fn(),
+      sendMedia,
+    } as never);
+    await facade.send({
+      type: 'image',
+      mediaUrl: 'https://cdn.example.com/x.jpg',
+      text: 'see https://example.com',
+      sessionId: 's',
+      chatId: 'chat@c.us',
+      linkPreview: true,
+    });
+    expect(sendMedia).toHaveBeenCalledWith('s', {
+      chatId: 'chat@c.us',
+      url: 'https://cdn.example.com/x.jpg',
+      type: 'image',
+      caption: 'see https://example.com',
+    });
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
   it('routes a media envelope to sendMedia with the caption from text, not sendText', async () => {
     const sendMedia = jest.fn().mockResolvedValue({ id: 'm2' });
     const sendText = jest.fn();

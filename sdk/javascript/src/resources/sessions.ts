@@ -12,16 +12,46 @@ import type {
   PairingCodeResponse,
   QrCodeResponse,
   RequestPairingCodeRequest,
+  SessionConfig,
   SessionResponse,
+  UpdateSessionConfigRequest,
   SessionStatsOverview,
+  SetOwnPresenceRequest,
+  SuccessResult,
 } from '../types.js';
+
+/** Pagination for {@link SessionsResource.list}. The server applies its own default when omitted. */
+export interface ListSessionsQuery {
+  limit?: number;
+  offset?: number;
+}
 
 export class SessionsResource {
   constructor(private readonly client: OpenWAClient) {}
 
   /** List all sessions (scoped to the API key's `allowedSessions`). */
-  list(): Promise<SessionResponse[]> {
-    return this.client.request<SessionResponse[]>({ method: 'GET', path: '/api/sessions' });
+  list(query?: ListSessionsQuery): Promise<SessionResponse[]> {
+    return this.client.request<SessionResponse[]>({ method: 'GET', path: '/api/sessions', query });
+  }
+
+  /** Read a session's effective configuration. */
+  getConfig(id: string): Promise<SessionConfig> {
+    return this.client.request<SessionConfig>({
+      method: 'GET',
+      path: `/api/sessions/${encodeSegment(id)}/config`,
+    });
+  }
+
+  /**
+   * Update a running session's configuration. Takes effect without re-linking the account — all three
+   * fields were fixed at creation before this route existed.
+   */
+  updateConfig(id: string, body: UpdateSessionConfigRequest): Promise<SessionConfig> {
+    return this.client.request<SessionConfig>({
+      method: 'PATCH',
+      path: `/api/sessions/${encodeSegment(id)}/config`,
+      body,
+    });
   }
 
   /** Get a single session by id. */
@@ -44,15 +74,29 @@ export class SessionsResource {
     return this.client.request<SessionResponse>({ method: 'POST', path: `/api/sessions/${encodeSegment(id)}/start` });
   }
 
-  /** Stop a session and disconnect gracefully. */
+  /**
+   * Stop a session and disconnect gracefully. Rejects with HTTP `502` and
+   * `code: 'SESSION_STOP_INCOMPLETE'` when the session was stopped locally but the engine
+   * teardown did not complete (the graceful disconnect and the force-destroy escalation both
+   * failed, so the engine process may still be running); the status is settled to
+   * `disconnected` and no success audit is written. Retry the stop; restart the node to reap
+   * a leaked process.
+   */
   stop(id: string): Promise<SessionResponse> {
     return this.client.request<SessionResponse>({ method: 'POST', path: `/api/sessions/${encodeSegment(id)}/stop` });
   }
 
   /**
-   * Unlink this device from the WhatsApp account, then stop the session. Unlike `stop` and
-   * `delete`, this removes the device from the account holder's Linked Devices list, so a later
-   * `start` requires a fresh QR scan or pairing code. Requires a running session.
+   * Attempt an engine-native unlink of this device, then stop the session. A `200` means the
+   * unlink operation AND the required local credential cleanup completed — it is not an
+   * independent observation that the handset UI no longer shows the linked device. Because a
+   * completed unlink wipes the stored credentials, a later `start` requires a fresh QR scan or
+   * pairing code. Requires a running session. Rejects with HTTP `502` and
+   * `code: 'SESSION_LOGOUT_INCOMPLETE'` when the session was stopped locally but the logout
+   * operation did not complete (no send, no acknowledgement, timeout/transport error, or local
+   * cleanup failure); `phone` is cleared and no success audit is written. Start the session again
+   * and retry the logout; do not assume the retry reconnects automatically or lands in a
+   * guaranteed QR state.
    */
   logout(id: string): Promise<SessionResponse> {
     return this.client.request<SessionResponse>({ method: 'POST', path: `/api/sessions/${encodeSegment(id)}/logout` });
@@ -60,7 +104,21 @@ export class SessionsResource {
 
   /** Force-kill a stuck session (SIGKILL + teardown). */
   forceKill(id: string): Promise<SessionResponse> {
-    return this.client.request<SessionResponse>({ method: 'POST', path: `/api/sessions/${encodeSegment(id)}/force-kill` });
+    return this.client.request<SessionResponse>({
+      method: 'POST',
+      path: `/api/sessions/${encodeSegment(id)}/force-kill`,
+    });
+  }
+
+  /**
+   * Resume a session hibernated after inactivity (Unisoft fork). Reloads the engine from the
+   * credentials already on disk, so no QR scan is involved. Returns as soon as the engine is
+   * launching (`status: 'initializing'`) — poll `retrieve` or watch the `session.status` event
+   * until it reports `ready`. Idempotent, and unnecessary before a send: sending to a hibernated
+   * session wakes it on its own.
+   */
+  wake(id: string): Promise<SessionResponse> {
+    return this.client.request<SessionResponse>({ method: 'POST', path: `/api/sessions/${encodeSegment(id)}/wake` });
   }
 
   /** Get the current QR code for authentication (live from the engine, not the DB). */
@@ -82,6 +140,21 @@ export class SessionsResource {
     return this.client.request<SessionStatsOverview>({
       method: 'GET',
       path: '/api/sessions/stats/overview',
+    });
+  }
+
+  /**
+   * Set the account's own global presence — appear online, or offline.
+   *
+   * `available: false` hands notifications back to the phone: a linked device that stays online
+   * suppresses the phone's own alerts. This is the ACCOUNT's presence, not a chat's — see
+   * {@link ChatsResource.sendState} for per-chat typing/recording.
+   */
+  setOnlinePresence(sessionId: string, body: SetOwnPresenceRequest): Promise<SuccessResult> {
+    return this.client.request<SuccessResult>({
+      method: 'PUT',
+      path: `/api/sessions/${encodeSegment(sessionId)}/presence`,
+      body,
     });
   }
 }

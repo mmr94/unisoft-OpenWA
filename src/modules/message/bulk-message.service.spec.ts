@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { PayloadTooLargeException } from '@nestjs/common';
+import { HttpException, PayloadTooLargeException } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { In, Not } from 'typeorm';
 import {
@@ -11,8 +11,11 @@ import {
 import { MessageBatch, BatchStatus, BatchMessageStatus, BatchMessageResult } from './entities/message-batch.entity';
 import { MessageStatus } from './entities/message.entity';
 import { SendBulkMessageDto } from './dto/bulk-message.dto';
-import { SessionService } from '../session/session.service';
+import { EngineRegistry } from '../../engine/engine-registry.service';
+import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
 import { MessageService } from './message.service';
+import { SendPacingService, SEND_PACING_LIMITED } from './send-pacing.service';
+import { SessionOwnershipService } from '../session/session-ownership.service';
 import { HookManager } from '../../core/hooks';
 import { SsrfBlockedError } from '../../common/security/ssrf-guard';
 
@@ -67,8 +70,18 @@ describe('BulkMessageService.onApplicationBootstrap', () => {
       providers: [
         BulkMessageService,
         { provide: getRepositoryToken(MessageBatch, 'data'), useValue: repo },
-        { provide: SessionService, useValue: { getEngine: jest.fn() } },
+        EngineRegistry,
         { provide: MessageService, useValue: { saveOutgoingMessage: jest.fn() } },
+        {
+          // Pacing is off by default; its own spec covers the governor. Here it must simply not
+          // refuse, so the bulk assertions exercise the paths they were written for.
+          provide: SendPacingService,
+          useValue: {
+            assertSendAllowed: jest.fn().mockResolvedValue(undefined),
+            recordSendFailure: jest.fn(),
+            recordSendSuccess: jest.fn(),
+          },
+        },
         {
           provide: HookManager,
           useValue: {
@@ -98,6 +111,103 @@ describe('BulkMessageService.onApplicationBootstrap', () => {
     await service.onApplicationBootstrap();
     expect(repo.save).not.toHaveBeenCalled();
   });
+
+  /**
+   * The takeover path's reconcile: adopting a session from a lapsed node must fail THAT session's
+   * stuck batches (same no-auto-resume policy as boot — the dead node's already-sent messages are
+   * unknowable), scoped strictly to the one session, with inline media payloads stripped.
+   */
+  it('reapProcessingBatches fails only the given session’s PROCESSING batches and strips payloads', async () => {
+    const mine = {
+      id: 'b1',
+      sessionId: 'sess-a',
+      status: BatchStatus.PROCESSING,
+      messages: [{ content: { image: { base64: 'x'.repeat(64) } } }],
+    } as unknown as MessageBatch;
+    repo.find.mockResolvedValue([mine]);
+
+    const reaped = await service.reapProcessingBatches('sess-a', 'session adopted from a lapsed node');
+
+    expect(repo.find).toHaveBeenCalledWith({ where: { status: BatchStatus.PROCESSING, sessionId: 'sess-a' } });
+    expect(reaped).toBe(1);
+    expect(mine.status).toBe(BatchStatus.FAILED);
+    expect(repo.save).toHaveBeenCalledWith(mine);
+    expect(JSON.stringify(mine.messages)).not.toContain('x'.repeat(64));
+  });
+
+  /**
+   * A batch is only ever driven by the process holding its session's engine, so on a second replica
+   * "PROCESSING" does not mean "abandoned". Reaping a peer's batch tells the caller their send
+   * failed while the messages continue going out — a wrong answer about work that is still running.
+   */
+  describe('with another node in play', () => {
+    /** Rebuild the service with an ownership service that owns only `ownedSessionIds`. */
+    const withOwnership = async (ownedSessionIds: string[]): Promise<BulkMessageService> => {
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          BulkMessageService,
+          { provide: getRepositoryToken(MessageBatch, 'data'), useValue: repo },
+          EngineRegistry,
+          { provide: MessageService, useValue: { saveOutgoingMessage: jest.fn() } },
+          {
+            provide: SendPacingService,
+            useValue: {
+              assertSendAllowed: jest.fn().mockResolvedValue(undefined),
+              recordSendFailure: jest.fn(),
+              recordSendSuccess: jest.fn(),
+            },
+          },
+          {
+            provide: HookManager,
+            useValue: {
+              execute: jest
+                .fn()
+                .mockImplementation((_e: string, d: unknown) => Promise.resolve({ continue: true, data: d })),
+            },
+          },
+          {
+            provide: SessionOwnershipService,
+            useValue: {
+              claimable: jest.fn((ids: string[]) => Promise.resolve(ids.filter(id => ownedSessionIds.includes(id)))),
+            },
+          },
+        ],
+      }).compile();
+      return module.get<BulkMessageService>(BulkMessageService);
+    };
+
+    it('leaves a batch alone when its session belongs to another node', async () => {
+      const peers = { id: 'b1', sessionId: 'peer-session', status: BatchStatus.PROCESSING } as MessageBatch;
+      repo.find.mockResolvedValue([peers]);
+
+      await (await withOwnership([])).onApplicationBootstrap();
+
+      expect(peers.status).toBe(BatchStatus.PROCESSING);
+      expect(repo.save).not.toHaveBeenCalled();
+    });
+
+    it('still reaps a batch whose session this node may claim', async () => {
+      const mine = { id: 'b2', sessionId: 'my-session', status: BatchStatus.PROCESSING } as MessageBatch;
+      repo.find.mockResolvedValue([mine]);
+
+      await (await withOwnership(['my-session'])).onApplicationBootstrap();
+
+      expect(mine.status).toBe(BatchStatus.FAILED);
+      expect(repo.save).toHaveBeenCalledWith(mine);
+    });
+
+    it('reaps only its own when both are present', async () => {
+      const mine = { id: 'b2', sessionId: 'my-session', status: BatchStatus.PROCESSING } as MessageBatch;
+      const peers = { id: 'b1', sessionId: 'peer-session', status: BatchStatus.PROCESSING } as MessageBatch;
+      repo.find.mockResolvedValue([mine, peers]);
+
+      await (await withOwnership(['my-session'])).onApplicationBootstrap();
+
+      expect(mine.status).toBe(BatchStatus.FAILED);
+      expect(peers.status).toBe(BatchStatus.PROCESSING);
+      expect(repo.save).toHaveBeenCalledTimes(1);
+    });
+  });
 });
 
 /** Regression lock: an SSRF block (which names the internal host/IP) must not be stored verbatim. */
@@ -114,6 +224,15 @@ describe('sanitizeBatchError', () => {
     const result = sanitizeBatchError(new Error('Session is not active'));
     expect(result).toEqual({ code: 'SEND_FAILED', message: 'Session is not active' });
   });
+
+  it('keeps the pacing code, so a policy 429 is distinguishable from an engine refusal', () => {
+    const refusal = new HttpException(
+      { statusCode: 429, message: 'Daily send allowance of 20 reached', code: 'SEND_PACING_LIMITED' },
+      429,
+    );
+    const result = sanitizeBatchError(refusal);
+    expect(result).toEqual({ code: 'SEND_PACING_LIMITED', message: 'Daily send allowance of 20 reached' });
+  });
 });
 
 describe('BulkMessageService.processBatch', () => {
@@ -126,13 +245,9 @@ describe('BulkMessageService.processBatch', () => {
     sendVideoMessage?: jest.Mock;
     sendAudioMessage?: jest.Mock;
   };
-  let sessionService: {
-    getEngine: jest.Mock;
-    ensureEngineReady: jest.Mock;
-    markActivity: jest.Mock;
-    findOne: jest.Mock;
-  };
+  let engines: EngineRegistry;
   let hookManager: { execute: jest.Mock };
+  let pacing: { assertSendAllowed: jest.Mock; recordSendFailure: jest.Mock; recordSendSuccess: jest.Mock };
 
   const makeBatch = (messageCount: number): MessageBatch =>
     ({
@@ -152,16 +267,21 @@ describe('BulkMessageService.processBatch', () => {
     }) as unknown as MessageBatch;
 
   beforeEach(async () => {
-    engine = { sendTextMessage: jest.fn().mockResolvedValue({ id: 'wa1', timestamp: 111 }) };
-    sessionService = {
-      getEngine: jest.fn().mockReturnValue(engine),
-      ensureEngineReady: jest.fn().mockResolvedValue(engine),
-      markActivity: jest.fn().mockResolvedValue(undefined),
-      findOne: jest.fn().mockResolvedValue({ phone: '628' }),
+    engine = {
+      sendTextMessage: jest.fn().mockResolvedValue({ id: 'wa1', timestamp: 111 }),
+      sendImageMessage: jest.fn().mockResolvedValue({ id: 'wa1', timestamp: 111 }),
+      sendAudioMessage: jest.fn().mockResolvedValue({ id: 'wa1', timestamp: 111 }),
     };
+    engines = new EngineRegistry();
+    engines.set('s1', engine as unknown as IWhatsAppEngine);
     messageService = { saveOutgoingMessage: jest.fn().mockResolvedValue(undefined) };
     hookManager = {
       execute: jest.fn().mockImplementation((_e: string, data: unknown) => Promise.resolve({ continue: true, data })),
+    };
+    pacing = {
+      assertSendAllowed: jest.fn().mockResolvedValue(undefined),
+      recordSendFailure: jest.fn(),
+      recordSendSuccess: jest.fn(),
     };
     repo = {
       findOne: jest.fn(),
@@ -173,8 +293,12 @@ describe('BulkMessageService.processBatch', () => {
       providers: [
         BulkMessageService,
         { provide: getRepositoryToken(MessageBatch, 'data'), useValue: repo },
-        { provide: SessionService, useValue: sessionService },
+        { provide: EngineRegistry, useValue: engines },
         { provide: MessageService, useValue: messageService },
+        {
+          provide: SendPacingService,
+          useValue: pacing,
+        },
         { provide: HookManager, useValue: hookManager },
       ],
     }).compile();
@@ -202,9 +326,136 @@ describe('BulkMessageService.processBatch', () => {
     }
   });
 
+  // `content.text` is @MaxLength(4096)-validated BEFORE substitution, and the single-send template
+  // path caps its FINAL render at template.renderMaxChars — the bulk path capped neither, so
+  // caller-supplied variables inflated each item without bound.
+  const batchWithVariables = (text: string, variables: Record<string, string>): MessageBatch => ({
+    ...makeBatch(1),
+    messages: [{ chatId: 'c0@c.us', type: 'text', content: { text }, variables }],
+  });
+
+  // The cap must bound the MESSAGE, not the payload. `variables` is a sibling of the media fields on
+  // the same DTO, so personalised media is a supported bulk request — and a 100 KB image is ~137,000
+  // base64 characters, twice the 64 KiB text cap. Capping every string in the content tree failed
+  // exactly the requests this endpoint exists for.
+  // The gate has TWO copies (see applySendingGate's doc); the envelope check landed on one of them.
+  // A handler returning a truthy object without `input` fed `undefined` into every send below.
+  it('fails an item when a message:sending handler returns a payload with no usable input', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(1));
+    hookManager.execute.mockResolvedValue({ continue: true, data: { notInput: 1 } });
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).not.toHaveBeenCalled();
+    const finalPartial = (repo.update.mock.calls as Array<[unknown, { results: BatchMessageResult[] }]>).at(-1)![1];
+    expect(finalPartial.results[0].status).toBe(BatchMessageStatus.FAILED);
+    expect(finalPartial.results[0].error?.message).toMatch(/message:sending/);
+  });
+
+  /**
+   * The ONLY reason this second copy of the gate exists is that it must flag a plugin refusal apart
+   * from a delivery failure, so the per-item `message:failed` hook is skipped. Nothing bound that:
+   * deleting the flag on the envelope-refusal branch left the whole suite green, which means the
+   * refusal would have been reported to every plugin as a failed delivery with no test noticing.
+   */
+  it('does not report an unusable envelope to plugins as a delivery failure', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(1));
+    hookManager.execute.mockResolvedValue({ continue: true, data: { notInput: 1 } });
+
+    await runProcessBatch();
+
+    expect(hookManager.execute).not.toHaveBeenCalledWith('message:failed', expect.anything(), expect.anything());
+  });
+
+  // Negative twin: a chain that returns nothing is the ordinary no-plugin path.
+  it('keeps the original content when the hook chain returns no data', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(1));
+    hookManager.execute.mockResolvedValue({ continue: true });
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends a media item with variables even when its base64 exceeds the text cap', async () => {
+    const bigBase64 = 'A'.repeat(137_000);
+    repo.findOne.mockResolvedValue({
+      ...makeBatch(1),
+      messages: [
+        {
+          chatId: 'c0@c.us',
+          type: 'image',
+          content: { image: { base64: bigBase64, mimetype: 'image/jpeg' }, caption: 'Hi {{name}}' },
+          variables: { name: 'Alice' },
+        },
+      ],
+    });
+    engine.sendImageMessage = jest.fn().mockResolvedValue({ id: 'wa1', timestamp: 1 });
+
+    await runProcessBatch();
+
+    expect(engine.sendImageMessage).toHaveBeenCalledTimes(1);
+    const finalPartial = (repo.update.mock.calls as Array<[unknown, { results: BatchMessageResult[] }]>).at(-1)![1];
+    expect(finalPartial.results[0].status).not.toBe(BatchMessageStatus.FAILED);
+  });
+
+  it('fails an item whose rendered text exceeds the cap instead of sending it', async () => {
+    // Comfortably over the 64 KiB default the un-configured service falls back to.
+    const huge = 'x'.repeat(70 * 1024);
+    repo.findOne.mockResolvedValue(batchWithVariables('{{v}}', { v: huge }));
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).not.toHaveBeenCalled();
+    const finalPartial = (
+      repo.update.mock.calls as Array<[unknown, { status: BatchStatus; results: BatchMessageResult[] }]>
+    ).at(-1)![1];
+    expect(finalPartial.results[0].status).toBe(BatchMessageStatus.FAILED);
+    expect(finalPartial.results[0].error?.message).toMatch(/character limit/i);
+  });
+
+  /**
+   * The cap covers text AND caption — a caption is the other caller-supplied string a template can
+   * inflate without bound, and it lands in the same `messages.body` column. Only the text half was
+   * bound: narrowing the loop to `['text']` left the suite green, so the caption half was a claim
+   * with nothing behind it.
+   */
+  it('fails an item whose rendered CAPTION exceeds the cap', async () => {
+    const huge = 'x'.repeat(70 * 1024);
+    repo.findOne.mockResolvedValue({
+      ...makeBatch(1),
+      messages: [
+        {
+          chatId: 'c0@c.us',
+          type: 'image',
+          content: { image: { base64: 'AAAA', mimetype: 'image/jpeg' }, caption: '{{v}}' },
+          variables: { v: huge },
+        },
+      ],
+    });
+
+    await runProcessBatch();
+
+    const finalPartial = (
+      repo.update.mock.calls as Array<[unknown, { status: BatchStatus; results: BatchMessageResult[] }]>
+    ).at(-1)![1];
+    expect(finalPartial.results[0].status).toBe(BatchMessageStatus.FAILED);
+    expect(finalPartial.results[0].error?.message).toMatch(/caption/i);
+  });
+
+  it('still sends an item whose render stays under the cap', async () => {
+    repo.findOne.mockResolvedValue(batchWithVariables('hello {{v}}', { v: 'world' }));
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).toHaveBeenCalledTimes(1);
+    const sendArgs = engine.sendTextMessage.mock.calls[0] as [string, string];
+    expect(sendArgs[1]).toBe('hello world');
+  });
+
   it('releases the in-flight marker when the engine is missing (no processingBatches leak)', async () => {
     repo.findOne.mockResolvedValue(makeBatch(1));
-    sessionService.getEngine.mockReturnValue(undefined); // engine-not-found → early-return path
+    engines.delete('s1'); // engine-not-found → early-return path
 
     await runProcessBatch();
 
@@ -281,6 +532,42 @@ describe('BulkMessageService.processBatch', () => {
     // A moderation block must not be reported as a delivery failure — matches single send, where a
     // block is a 400 with no message:failed.
     expect(hookManager.execute).not.toHaveBeenCalledWith('message:failed', expect.anything(), expect.anything());
+  });
+
+  it('feeds the pacing breaker: a successful bulk send records success, so bulk can reset a streak', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(1));
+
+    await runProcessBatch();
+
+    expect(pacing.recordSendSuccess).toHaveBeenCalledWith('s1');
+    expect(pacing.recordSendFailure).not.toHaveBeenCalled();
+  });
+
+  it('feeds the pacing breaker: an engine refusal records a failure, so bulk can trip the streak', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(1));
+    engine.sendTextMessage.mockRejectedValueOnce(new Error('boom'));
+
+    await runProcessBatch();
+
+    // The engine was asked and refused — exactly what the breaker's streak counts, just like the
+    // single-send path (message.service failSend). A success never happened, so no reset.
+    expect(pacing.recordSendFailure).toHaveBeenCalledWith('s1');
+    expect(pacing.recordSendSuccess).not.toHaveBeenCalled();
+  });
+
+  it('a pacing 429 fails the item WITHOUT a message:failed hook or a breaker increment (policy, not delivery)', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(1));
+    pacing.assertSendAllowed.mockRejectedValueOnce(
+      new HttpException({ statusCode: 429, code: SEND_PACING_LIMITED }, 429),
+    );
+
+    await runProcessBatch();
+
+    // Thrown before the engine was asked: not a delivery failure (no message:failed), and it must
+    // not feed the breaker — matching single send, where a pacing refusal is a bare 429.
+    expect(engine.sendTextMessage).not.toHaveBeenCalled();
+    expect(hookManager.execute).not.toHaveBeenCalledWith('message:failed', expect.anything(), expect.anything());
+    expect(pacing.recordSendFailure).not.toHaveBeenCalled();
   });
 
   it('sends a bulk audio item with ptt as a voice note and persists type "voice"', async () => {
@@ -489,6 +776,76 @@ describe('BulkMessageService.processBatch', () => {
     expect(engine.sendTextMessage).toHaveBeenCalledWith('c0@c.us', 'Hi Sam');
   });
 
+  it('tags participants per item, on the text body and on a media caption alike', async () => {
+    // Each item names its own list: a batch fans out to many chats, and a WID is only taggable in a
+    // chat the participant is actually in.
+    const batch = makeBatch(1);
+    batch.messages[0].content = { text: 'Hi @62811', mentions: ['62811@c.us'] };
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).toHaveBeenCalledWith('c0@c.us', 'Hi @62811', ['62811@c.us']);
+
+    const media = makeBatch(1);
+    media.messages[0].type = 'image';
+    media.messages[0].content = {
+      image: { base64: 'AAAA', mimetype: 'image/jpeg' },
+      caption: 'look @62811',
+      mentions: ['62811@c.us'],
+    };
+    repo.findOne.mockResolvedValue(media);
+
+    await runProcessBatch();
+
+    expect(engine.sendImageMessage).toHaveBeenCalledWith(
+      'c0@c.us',
+      expect.objectContaining({ caption: 'look @62811', mentions: ['62811@c.us'] }),
+    );
+  });
+
+  it('substitutes variables inside mentions, so a campaign can tag a different participant per item', async () => {
+    // applyVariables walks the whole content tree, so a placeholder in a WID is rendered like one in
+    // the body. That is load-bearing for a personalised batch, and nothing else pins it: a future
+    // rewrite of applyVariables that rebuilt the object field by field would drop mentions silently.
+    const batch = makeBatch(1);
+    batch.messages[0].content = { text: 'Hi @{{num}}', mentions: ['{{num}}@c.us'] };
+    batch.messages[0].variables = { num: '62811' };
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).toHaveBeenCalledWith('c0@c.us', 'Hi @62811', ['62811@c.us']);
+  });
+
+  it('tags an audio item too, which has no caption to anchor a visible @token', async () => {
+    // Audio carries no caption, but a mention still tags through contextInfo, which is why the
+    // single-send audio route accepts the field. Skipping it here would accept the list and deliver
+    // an untagged voice note, turning a clear 400 into a silent no-op for one bulk type only.
+    const batch = makeBatch(1);
+    batch.messages[0].type = 'audio';
+    batch.messages[0].content = { audio: { base64: 'AAAA', mimetype: 'audio/mpeg' }, mentions: ['62811@c.us'] };
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    expect(engine.sendAudioMessage).toHaveBeenCalledWith(
+      'c0@c.us',
+      expect.objectContaining({ mentions: ['62811@c.us'] }),
+    );
+  });
+
+  it('leaves an untagged batch item on its two-argument send', async () => {
+    // Control: without a list the call shape every existing batch makes is untouched.
+    const batch = makeBatch(1);
+    batch.messages[0].content = { text: 'Hi there', mentions: [] };
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).toHaveBeenCalledWith('c0@c.us', 'Hi there');
+  });
+
   it('fails an item whose rendered variables grow its base64 media past the cap (no send, explicit failure)', async () => {
     process.env.MEDIA_DOWNLOAD_MAX_BYTES = '16';
     try {
@@ -585,15 +942,16 @@ describe('BulkMessageService.cancelBatch', () => {
       providers: [
         BulkMessageService,
         { provide: getRepositoryToken(MessageBatch, 'data'), useValue: repo },
+        EngineRegistry,
+        { provide: MessageService, useValue: {} },
         {
-          provide: SessionService,
+          provide: SendPacingService,
           useValue: {
-            getEngine: jest.fn().mockReturnValue({}),
-            ensureEngineReady: jest.fn().mockResolvedValue({}),
-            markActivity: jest.fn().mockResolvedValue(undefined),
+            assertSendAllowed: jest.fn().mockResolvedValue(undefined),
+            recordSendFailure: jest.fn(),
+            recordSendSuccess: jest.fn(),
           },
         },
-        { provide: MessageService, useValue: { saveOutgoingMessage: jest.fn() } },
         { provide: HookManager, useValue: { execute: jest.fn() } },
       ],
     }).compile();
@@ -648,7 +1006,7 @@ describe('BulkMessageService.cancelBatch', () => {
 describe('BulkMessageService.createBatch base64 media cap', () => {
   let service: BulkMessageService;
   let repo: { findOne: jest.Mock; save: jest.Mock; create: jest.Mock; update: jest.Mock };
-  let sessionService: { getEngine: jest.Mock; ensureEngineReady: jest.Mock; markActivity: jest.Mock };
+  let engines: EngineRegistry;
   let messageService: { saveOutgoingMessage: jest.Mock };
 
   beforeEach(async () => {
@@ -658,18 +1016,25 @@ describe('BulkMessageService.createBatch base64 media cap', () => {
       create: jest.fn().mockImplementation((b: MessageBatch) => Object.assign({ id: 'b1' }, b)),
       update: jest.fn().mockResolvedValue({ affected: 1 }),
     };
-    sessionService = {
-      getEngine: jest.fn().mockReturnValue({}),
-      ensureEngineReady: jest.fn().mockResolvedValue({}),
-      markActivity: jest.fn().mockResolvedValue(undefined),
-    };
+    engines = new EngineRegistry();
+    // These suites exercise batch bookkeeping across several session ids, so every session is
+    // "started" here; the engine itself is never called.
+    for (const id of ['s1', 's2']) engines.set(id, {} as IWhatsAppEngine);
     messageService = { saveOutgoingMessage: jest.fn().mockResolvedValue(undefined) };
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         BulkMessageService,
         { provide: getRepositoryToken(MessageBatch, 'data'), useValue: repo },
-        { provide: SessionService, useValue: sessionService },
+        { provide: EngineRegistry, useValue: engines },
         { provide: MessageService, useValue: messageService },
+        {
+          provide: SendPacingService,
+          useValue: {
+            assertSendAllowed: jest.fn().mockResolvedValue(undefined),
+            recordSendFailure: jest.fn(),
+            recordSendSuccess: jest.fn(),
+          },
+        },
         {
           provide: HookManager,
           useValue: {
@@ -805,9 +1170,7 @@ describe('BulkMessageService.createBatch base64 media cap', () => {
 
   it('runs the engine once per exact duplicate entry across the full create→process path', async () => {
     const engine = { sendTextMessage: jest.fn().mockResolvedValue({ id: 'wa', timestamp: 1 }) };
-    sessionService.getEngine.mockReturnValue(engine);
-    // Fork-specific: the send path resolves its engine through ensureEngineReady (hibernation wake).
-    sessionService.ensureEngineReady.mockResolvedValue(engine);
+    engines.set('s1', engine as unknown as IWhatsAppEngine);
     const dto = {
       messages: [
         { chatId: 'a@c.us', type: 'text' as const, content: { text: 'first' } },
@@ -833,9 +1196,7 @@ describe('BulkMessageService.createBatch base64 media cap', () => {
       sendTextMessage: jest.fn().mockResolvedValue({ id: 'wa-t', timestamp: 1 }),
       sendImageMessage: jest.fn().mockResolvedValue({ id: 'wa-i', timestamp: 2 }),
     };
-    sessionService.getEngine.mockReturnValue(engine);
-    // Fork-specific: the send path resolves its engine through ensureEngineReady (hibernation wake).
-    sessionService.ensureEngineReady.mockResolvedValue(engine);
+    engines.set('s1', engine as unknown as IWhatsAppEngine);
     const dto = {
       messages: [
         { chatId: 'a@c.us', type: 'text' as const, content: { text: 'part 1' } },

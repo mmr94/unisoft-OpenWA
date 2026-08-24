@@ -1,5 +1,6 @@
 import { BaileysSessionStore } from './baileys-session-store';
 import type { LidMappingStore } from '../identity/lid-mapping-store.service';
+import { userPart } from '../identity/wa-id';
 
 describe('BaileysSessionStore', () => {
   let store: BaileysSessionStore;
@@ -23,6 +24,22 @@ describe('BaileysSessionStore', () => {
     });
     expect(store.findContact('nope@s.whatsapp.net')).toBeNull();
     expect(store.listContacts()).toHaveLength(1);
+  });
+
+  /**
+   * Baileys documents `name` as the one YOU saved and `notify` as the pushname the contact set
+   * themselves, so a contact carrying only `notify` is not in the addressbook. Reporting true for
+   * everyone told an automation that every chat partner was a saved contact.
+   */
+  it('reports isMyContact from the saved name, not for every contact seen', () => {
+    store.upsertContacts([
+      { id: '628111@s.whatsapp.net', name: 'Alice', notify: 'Al' },
+      { id: '628222@s.whatsapp.net', notify: 'Bob' },
+    ]);
+    expect(store.findContact('628111@s.whatsapp.net')?.isMyContact).toBe(true);
+    expect(store.findContact('628222@s.whatsapp.net')?.isMyContact).toBe(false);
+    // The pushname still surfaces either way; it is the addressbook claim that changed.
+    expect(store.findContact('628222@s.whatsapp.net')?.pushName).toBe('Bob');
   });
 
   it('records the newest message per chat and surfaces it in getChats', () => {
@@ -317,9 +334,12 @@ describe('BaileysSessionStore', () => {
   describe('persistent lid->phone table', () => {
     const makeFakeLidStore = () => {
       const map = new Map<string, string | null>();
+      const getCached = jest.fn((lid: string) => map.get(lid));
       return {
         map,
-        getCached: jest.fn((lid: string) => map.get(lid)),
+        getCached,
+        // Mirrors the real implementation: userPart of the JID through getCached, null on a miss.
+        resolveLid: jest.fn((jid: string) => getCached(userPart(jid)) ?? null),
         lidsForPhone: jest.fn(() => [] as string[]),
         remember: jest.fn((lid: string, phone: string | null) => {
           map.set(lid, phone);
@@ -426,8 +446,10 @@ describe('BaileysSessionStore', () => {
 
     it('bounds lidToPn: an evicted mapping still resolves via the write-through persistent table', () => {
       const map = new Map<string, string | null>();
+      const getCached = jest.fn((lid: string) => map.get(lid));
       const lidStore = {
-        getCached: jest.fn((lid: string) => map.get(lid)),
+        getCached,
+        resolveLid: jest.fn((jid: string) => getCached(userPart(jid)) ?? null),
         lidsForPhone: jest.fn(() => [] as string[]),
         remember: jest.fn((lid: string, phone: string | null) => {
           map.set(lid, phone);

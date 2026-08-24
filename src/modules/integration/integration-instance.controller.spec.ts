@@ -5,7 +5,13 @@ import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { AuditService } from '../audit/audit.service';
 import { ScopeBindingService } from './scope-binding.service';
+import { Repository } from 'typeorm';
+import { Session } from '../session/entities/session.entity';
 import { ApiKey } from '../auth/entities/api-key.entity';
+
+// ScopeBindingService reads session rows only for its boot-time "this scope matches no session"
+// warning; provisioning never reaches it, so these tests hand it a resolving stub.
+const sessions = { findOne: jest.fn().mockResolvedValue({ id: 'sess-1' }) } as unknown as Repository<Session>;
 
 // The provisioning bridge is what makes a minted instance's config reach the ingress worker: on
 // create/patch it mirrors the instance config into the plugin's per-session config and activates the
@@ -50,7 +56,7 @@ describe('IntegrationInstanceController provisioning bridge', () => {
       instances,
       loader,
       audit,
-      new ScopeBindingService(instances, loader, audit),
+      new ScopeBindingService(instances, loader, audit, sessions),
     );
 
     await controller.create('chatwoot-adapter', {
@@ -86,7 +92,7 @@ describe('IntegrationInstanceController provisioning bridge', () => {
       instances,
       loader,
       audit,
-      new ScopeBindingService(instances, loader, audit),
+      new ScopeBindingService(instances, loader, audit, sessions),
     );
 
     await controller.patch('chatwoot-adapter', 'acct1', { enabled: false });
@@ -114,7 +120,7 @@ describe('IntegrationInstanceController provisioning bridge', () => {
       instances,
       loader,
       audit,
-      new ScopeBindingService(instances, loader, audit),
+      new ScopeBindingService(instances, loader, audit, sessions),
     );
 
     await controller.patch('chatwoot-adapter', 'acct1', { enabled: false });
@@ -144,7 +150,7 @@ describe('IntegrationInstanceController provisioning bridge', () => {
       instances,
       loader,
       audit,
-      new ScopeBindingService(instances, loader, audit),
+      new ScopeBindingService(instances, loader, audit, sessions),
     );
 
     await controller.patch('chatwoot-adapter', 'acct1', { enabled: false });
@@ -182,7 +188,7 @@ describe('IntegrationInstanceController provisioning bridge', () => {
       instances,
       loader,
       audit,
-      new ScopeBindingService(instances, loader, audit),
+      new ScopeBindingService(instances, loader, audit, sessions),
     );
 
     await controller.patch('chatwoot-adapter', 'acct1', { sessionScope: 'sess-2' });
@@ -191,7 +197,7 @@ describe('IntegrationInstanceController provisioning bridge', () => {
     expect(setPluginSessionConfig).toHaveBeenCalledWith('chatwoot-adapter', 'sess-2', { baseUrl: 'https://y' }); // new bound
   });
 
-  it('keeps the session + its config when a disabled instance shares its scope with an ENABLED sibling', async () => {
+  it('keeps the session but CLEARS its config when a disabled instance shares its scope with a sibling', async () => {
     const { loader, audit, setPluginSessionConfig, setPluginSessions } = build();
     (loader.getPlugin as jest.Mock).mockReturnValue({
       manifest: { id: 'chatwoot-adapter', ingress: [{ route: 'chatwoot' }], permissions: ['webhook:ingress'] },
@@ -213,17 +219,19 @@ describe('IntegrationInstanceController provisioning bridge', () => {
       instances,
       loader,
       audit,
-      new ScopeBindingService(instances, loader, audit),
+      new ScopeBindingService(instances, loader, audit, sessions),
     );
 
     await controller.patch('chatwoot-adapter', 'acct1', { enabled: false });
 
-    // The sibling still fires on sess-1: neither the session nor its sessionConfig may be torn down.
-    expect(setPluginSessionConfig).not.toHaveBeenCalledWith('chatwoot-adapter', 'sess-1', {});
+    // The sibling still fires on sess-1, so the SESSION stays bound. Its config slice does not: it is
+    // keyed by scope and holds the retiring instance's projection, which dispatch would hand to the
+    // survivor as soon as this leaves one enabled instance on the scope.
+    expect(setPluginSessionConfig).toHaveBeenCalledWith('chatwoot-adapter', 'sess-1', {});
     expect(setPluginSessions).not.toHaveBeenCalled();
   });
 
-  it('keeps the session + its config when a deleted instance shares its scope with an ENABLED sibling', async () => {
+  it('keeps the session but CLEARS its config when a deleted instance shares its scope with a sibling', async () => {
     const { loader, audit, setPluginSessionConfig, setPluginSessions } = build();
     (loader.getPlugin as jest.Mock).mockReturnValue({
       manifest: { id: 'chatwoot-adapter', ingress: [{ route: 'chatwoot' }], permissions: ['webhook:ingress'] },
@@ -250,12 +258,14 @@ describe('IntegrationInstanceController provisioning bridge', () => {
       instances,
       loader,
       audit,
-      new ScopeBindingService(instances, loader, audit),
+      new ScopeBindingService(instances, loader, audit, sessions),
     );
 
     await controller.remove('chatwoot-adapter', 'acct1');
 
-    expect(setPluginSessionConfig).not.toHaveBeenCalledWith('chatwoot-adapter', 'sess-1', {});
+    // Same rule as the disable path — and the delete case is the sharper one: the row is gone, so the
+    // slice is the deleted tenant's only remaining trace and the survivor would inherit it.
+    expect(setPluginSessionConfig).toHaveBeenCalledWith('chatwoot-adapter', 'sess-1', {});
     expect(setPluginSessions).not.toHaveBeenCalled();
   });
 
@@ -281,7 +291,7 @@ describe('IntegrationInstanceController provisioning bridge', () => {
       instances,
       loader,
       audit,
-      new ScopeBindingService(instances, loader, audit),
+      new ScopeBindingService(instances, loader, audit, sessions),
     );
 
     await controller.remove('chatwoot-adapter', 'acct1');
@@ -290,7 +300,7 @@ describe('IntegrationInstanceController provisioning bridge', () => {
     expect(setPluginSessions).toHaveBeenCalledWith('chatwoot-adapter', []);
   });
 
-  it('keeps the OLD scope bound by an ENABLED sibling on a scope move (PATCH sessionScope) and binds the new one', async () => {
+  it('keeps the OLD scope ACTIVE for an ENABLED sibling on a scope move, and binds the new one', async () => {
     const { loader, audit, setPluginSessionConfig, setPluginSessions } = build();
     (loader.getPlugin as jest.Mock).mockReturnValue({
       manifest: { id: 'chatwoot-adapter', ingress: [{ route: 'chatwoot' }], permissions: ['webhook:ingress'] },
@@ -323,12 +333,14 @@ describe('IntegrationInstanceController provisioning bridge', () => {
       instances,
       loader,
       audit,
-      new ScopeBindingService(instances, loader, audit),
+      new ScopeBindingService(instances, loader, audit, sessions),
     );
 
     await controller.patch('chatwoot-adapter', 'acct1', { sessionScope: 'sess-2' });
 
-    expect(setPluginSessionConfig).not.toHaveBeenCalledWith('chatwoot-adapter', 'sess-1', {}); // old scope kept for the sibling
+    // Moving off sess-1 leaves the sibling alone on it, so the slice this instance projected there
+    // must go with it — otherwise the sibling inherits the config of a tenant that has moved away.
+    expect(setPluginSessionConfig).toHaveBeenCalledWith('chatwoot-adapter', 'sess-1', {});
     expect(setPluginSessionConfig).toHaveBeenCalledWith('chatwoot-adapter', 'sess-2', { baseUrl: 'https://y' }); // new scope bound
     expect(setPluginSessions).toHaveBeenCalledWith('chatwoot-adapter', ['sess-1', 'sess-2']); // sess-1 never stripped
   });
@@ -354,7 +366,7 @@ describe('IntegrationInstanceController provisioning bridge', () => {
       instances,
       loader,
       audit,
-      new ScopeBindingService(instances, loader, audit),
+      new ScopeBindingService(instances, loader, audit, sessions),
     );
 
     await controller.patch('chatwoot-adapter', 'acct1', { enabled: false });
@@ -393,7 +405,7 @@ describe('IntegrationInstanceController provisioning bridge', () => {
       instances,
       loader,
       audit,
-      new ScopeBindingService(instances, loader, audit),
+      new ScopeBindingService(instances, loader, audit, sessions),
     );
 
     await controller.create('chatwoot-adapter', {
@@ -410,7 +422,8 @@ describe('IntegrationInstanceController provisioning bridge', () => {
 
 // sessionScope travels in the request body, which the ApiKeyGuard's route-param fence never sees —
 // so the controller itself confines a session-scoped key to instances bound inside its
-// allowedSessions (the same pattern plugins.controller uses for updateSessions).
+// allowedSessions (the body-scoping pattern; the plugin updateSessions route is NOT scoped this way
+// — it is a full active-set replacement and is fenced with @RequireUnscopedKey).
 describe('IntegrationInstanceController session-scope fence', () => {
   const scopedKey = { allowedSessions: ['sess-1'] } as ApiKey;
   const unrestrictedKey = { allowedSessions: null } as unknown as ApiKey;
@@ -431,7 +444,7 @@ describe('IntegrationInstanceController session-scope fence', () => {
       svc,
       loader,
       audit,
-      new ScopeBindingService(svc, loader, audit),
+      new ScopeBindingService(svc, loader, audit, sessions),
     );
     return { controller, svc };
   }
@@ -621,7 +634,7 @@ describe('IntegrationInstanceController reveal masking', () => {
       instances,
       loader,
       audit,
-      new ScopeBindingService(instances, loader, audit),
+      new ScopeBindingService(instances, loader, audit, sessions),
     );
     return { controller };
   }
@@ -711,7 +724,7 @@ describe('IntegrationInstanceController update audit', () => {
       instances,
       loader,
       audit as unknown as AuditService,
-      new ScopeBindingService(instances, loader, audit as unknown as AuditService),
+      new ScopeBindingService(instances, loader, audit as unknown as AuditService, sessions),
     );
     return { controller, audit, instances };
   }

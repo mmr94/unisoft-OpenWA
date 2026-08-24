@@ -26,8 +26,8 @@ Search is backed by an open `SearchProvider` contract, not a hardcoded query pat
 
 ```ts
 interface SearchProvider {
-  readonly id: string;      // e.g. 'builtin-fts'
-  readonly label: string;   // human label for dashboard/config
+  readonly id: string; // e.g. 'builtin-fts'
+  readonly label: string; // human label for dashboard/config
   search(query: SearchQuery): Promise<SearchResults>;
   health(): Promise<SearchHealth>; // provider liveness; not yet surfaced on any route
 }
@@ -91,11 +91,11 @@ it into Postgres). Concretely:
 
 All search configuration lives in the environment (`.env` / Compose / dashboard Infrastructure form):
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `SEARCH_ENABLED` | `true` (unset) | Set to `false` to remove the `/search` route and the entire search module — zero footprint, no DI wiring. The migration still runs (so the index is ready if you re-enable). |
-| `SEARCH_PROVIDER` | `auto` | `auto` selects the built-in provider at runtime and lets an enabled plugin provider supersede it; `builtin-fts` pins the built-in explicitly; `none` leaves the registry empty — the module and the route stay mounted, but with no active provider `/api/search` answers `501`. Those three are the only accepted values — anything else (including a plugin id) fails boot. |
-| `SEARCH_LIMIT_MAX` | `100` | Hard cap applied to the `limit` query parameter, so a caller cannot request an unbounded result set. |
+| Variable           | Default        | Meaning                                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------ | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SEARCH_ENABLED`   | `true` (unset) | Set to `false` to remove the `/search` route and the entire search module — zero footprint, no DI wiring. The migration still runs (so the index is ready if you re-enable).                                                                                                                                                                                                  |
+| `SEARCH_PROVIDER`  | `auto`         | `auto` selects the built-in provider at runtime and lets an enabled plugin provider supersede it; `builtin-fts` pins the built-in explicitly; `none` leaves the registry empty — the module and the route stay mounted, but with no active provider `/api/search` answers `501`. Those three are the only accepted values — anything else (including a plugin id) fails boot. |
+| `SEARCH_LIMIT_MAX` | `100`          | Hard cap applied to the `limit` query parameter, so a caller cannot request an unbounded result set.                                                                                                                                                                                                                                                                          |
 
 ### The opt-out footprint note
 

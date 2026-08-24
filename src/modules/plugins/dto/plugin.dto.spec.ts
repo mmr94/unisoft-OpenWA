@@ -3,10 +3,10 @@ import { validate } from 'class-validator';
 import { InstallFromUrlDto } from './plugin.dto';
 
 /**
- * The install/update-from-URL boundary: plugin packages are executable code, so the download must
- * be integrity-protected in transit. Plain http:// is rejected with a clear message; https:// —
- * including an optional `#sha256=` integrity fragment — passes DTO validation (private-network
- * targets remain subject to the SSRF guard downstream).
+ * The install/update-from-URL boundary: the DTO checks only the coarse shape — an absolute http(s)
+ * URL. The transport policy itself (plain http is accepted only when the URL carries a `#sha256=`
+ * content pin, verified against the download) is enforced once, at the download funnel every install
+ * path shares — see plugin-download.spec.ts and plugins.service.spec.ts.
  */
 describe('InstallFromUrlDto', () => {
   const dtoWith = (url: string): InstallFromUrlDto => {
@@ -15,21 +15,6 @@ describe('InstallFromUrlDto', () => {
     return dto;
   };
 
-  it('rejects a plain http:// URL with a clear message', async () => {
-    const errors = await validate(dtoWith('http://plugins.example/pkg.zip'));
-
-    expect(errors).toHaveLength(1);
-    expect(errors[0].property).toBe('url');
-    expect(JSON.stringify(errors[0].constraints)).toMatch(/https:\/\/ URL.*plain http is not accepted/i);
-  });
-
-  it('rejects http:// even for a localhost/private host (no scheme carve-out)', async () => {
-    const errors = await validate(dtoWith('http://localhost:3000/pkg.zip'));
-
-    expect(errors).toHaveLength(1);
-    expect(errors[0].property).toBe('url');
-  });
-
   it('accepts an https:// URL', async () => {
     await expect(validate(dtoWith('https://plugins.example/pkg.zip'))).resolves.toHaveLength(0);
   });
@@ -37,6 +22,19 @@ describe('InstallFromUrlDto', () => {
   it('accepts an https:// URL carrying a #sha256 integrity fragment', async () => {
     const digest = 'a'.repeat(64);
     await expect(validate(dtoWith(`https://plugins.example/pkg.zip#sha256=${digest}`))).resolves.toHaveLength(0);
+  });
+
+  it('accepts a plain http:// URL at the DTO — the pin requirement is enforced at the download funnel', async () => {
+    await expect(validate(dtoWith('http://plugins.example/pkg.zip'))).resolves.toHaveLength(0);
+    const digest = 'a'.repeat(64);
+    await expect(validate(dtoWith(`http://plugins.example/pkg.zip#sha256=${digest}`))).resolves.toHaveLength(0);
+  });
+
+  it('rejects a non-http(s) scheme', async () => {
+    const errors = await validate(dtoWith('ftp://plugins.example/pkg.zip'));
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0].property).toBe('url');
   });
 
   it('rejects a non-URL value', async () => {

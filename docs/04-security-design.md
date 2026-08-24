@@ -74,19 +74,19 @@ fixed `dev-admin-key`; with neither set, the seed key is generated in the format
 API keys carry **no permission strings**. Authorization is a role hierarchy on the key itself, plus
 two scoping dimensions enforced by `ApiKeyGuard`.
 
-| Role | Rank | Meaning |
-|------|------|---------|
-| `admin` | 3 | Satisfies every `@RequireRole` level, including API-key management |
-| `operator` | 2 | Satisfies `operator` and `viewer` routes — the default for a new key |
-| `viewer` | 1 | Satisfies `viewer` routes only |
+| Role       | Rank | Meaning                                                              |
+| ---------- | ---- | -------------------------------------------------------------------- |
+| `admin`    | 3    | Satisfies every `@RequireRole` level, including API-key management   |
+| `operator` | 2    | Satisfies `operator` and `viewer` routes — the default for a new key |
+| `viewer`   | 1    | Satisfies `viewer` routes only                                       |
 
 A route declares its minimum level with `@RequireRole(...)`; a key passes when its role ranks at or
 above that level (`AuthService.hasPermission`). A key below it is rejected with `403 Forbidden`.
 
-| Scope | Field | Effect |
-|-------|-------|--------|
-| Source IP | `allowedIps` | Empty/absent = unrestricted; non-empty = fail-closed IP whitelist (see §4.3) |
-| Sessions | `allowedSessions` | Empty/absent = every session; non-empty = a request carrying any other session id is rejected with `401` |
+| Scope     | Field             | Effect                                                                                                   |
+| --------- | ----------------- | -------------------------------------------------------------------------------------------------------- |
+| Source IP | `allowedIps`      | Empty/absent = unrestricted; non-empty = fail-closed IP whitelist (see §4.3)                             |
+| Sessions  | `allowedSessions` | Empty/absent = every session; non-empty = a request carrying any other session id is rejected with `401` |
 
 The key-lifecycle routes (`/api/auth/api-keys`) are additionally fenced with `@RequireUnscopedKey()`:
 a session-scoped key is refused there whatever its role, so it cannot mint or widen credentials
@@ -171,14 +171,14 @@ OpenWA serves plain HTTP on its port; terminate **TLS at your reverse proxy / lo
 
 > **There is currently no application-level encryption at rest.** API keys are stored **hashed** (one-way), but other sensitive values are stored as plaintext in the database / on disk and are protected by filesystem and database permissions, not by encryption. Encryption at rest for these fields is a roadmap item, not a shipped feature — do not assume it.
 
-| Data                                      | At rest                                                                       | How it is protected                                                                                              |
-| ----------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| API keys                                  | **Hashed** — SHA-256 with an optional `API_KEY_PEPPER` HMAC; never reversible | A database leak alone cannot recover the keys; with a pepper set, hashes can't be precomputed offline. See §4.2. |
-| Session auth state (WhatsApp credentials) | Plaintext on disk (the engine's auth store under the data volume)             | Filesystem permissions on the data volume — keep it private.                                                     |
-| Webhook secrets                           | Plaintext — `webhooks.secret` (`varchar`)                                     | Database access control; never returned by any API response (write-only response DTO).                           |
-| Proxy credentials                         | Plaintext — `sessions.proxyUrl` may embed `user:pass`                         | Database access control; never returned by the session read DTOs.                                                |
-| Generated config (`data/.env.generated`)  | Plaintext file, written `0600`                                                | Owner-only file permissions.                                                                                     |
-| Message content                           | Plaintext in the `messages` table                                             | Database access control.                                                                                         |
+| Data                                      | At rest                                                                       | How it is protected                                                                                                                       |
+| ----------------------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| API keys                                  | **Hashed** — SHA-256 with an optional `API_KEY_PEPPER` HMAC; never reversible | A database leak alone cannot recover the keys; with a pepper set, hashes can't be precomputed offline. See §4.2.                          |
+| Session auth state (WhatsApp credentials) | Plaintext on disk (the engine's auth store under the data volume)             | Filesystem permissions on the data volume — keep it private.                                                                              |
+| Webhook secrets                           | Plaintext — `webhooks.secret` (`varchar`)                                     | Database access control; never returned by the webhook read DTOs (write-only) and omitted from `GET /api/infra/export-data` webhook rows. |
+| Proxy credentials                         | Plaintext — `sessions.proxyUrl` may embed `user:pass`                         | Database access control; never returned by the session read DTOs.                                                                         |
+| Generated config (`data/.env.generated`)  | Plaintext file, written `0600`                                                | Owner-only file permissions.                                                                                                              |
+| Message content                           | Plaintext in the `messages` table                                             | Database access control.                                                                                                                  |
 
 **Hardening you can apply today:** set `API_KEY_PEPPER`; restrict the data volume and database to the app's user; and encrypt at the infrastructure layer (LUKS / cloud-provider encrypted volumes / an encrypted managed Postgres) rather than relying on application-level field encryption, which is not implemented.
 
@@ -200,13 +200,13 @@ flowchart TB
 
 ### Validation Examples
 
-| Field | Rules |
-|-------|-------|
-| `chatId` | Non-empty string — **no format pattern**; the engine resolves the id, so `@c.us`, `@g.us`, `@lid`, `@newsletter` and `status@broadcast` all pass |
-| `phoneNumber` (pairing code) | Pattern: `^[0-9]{6,15}$` — digits only, international format |
-| `url` | Valid URL (`require_tld: false`, so single-label hosts like `http://localhost:3000` pass); HTTPS is a recommendation, not enforced |
-| `text` | Max 4096 chars (`send-text`) |
-| `sessionName` | Alphanumeric + hyphen, 3-50 chars |
+| Field                        | Rules                                                                                                                                            |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `chatId`                     | Non-empty string — **no format pattern**; the engine resolves the id, so `@c.us`, `@g.us`, `@lid`, `@newsletter` and `status@broadcast` all pass |
+| `phoneNumber` (pairing code) | Pattern: `^[0-9]{6,15}$` — digits only, international format                                                                                     |
+| `url`                        | Valid URL (`require_tld: false`, so single-label hosts like `http://localhost:3000` pass); HTTPS is a recommendation, not enforced               |
+| `text`                       | Max 4096 chars (`send-text`)                                                                                                                     |
+| `sessionName`                | Alphanumeric + hyphen, 3-50 chars                                                                                                                |
 
 ### DTO Validation
 
@@ -276,7 +276,12 @@ Exceeding a window returns `429 Too Many Requests`. Because the windows are **na
 - On success, each response carries one header triple per window: `X-RateLimit-Limit-short` / `-Remaining-short` / `-Reset-short`, plus the `-medium` and `-long` equivalents.
 - On `429`, the exceeded window sets `Retry-After-short`, `Retry-After-medium`, or `Retry-After-long` (seconds until the block expires) — read whichever is present rather than a plain `Retry-After`.
 
-The ingress route (`ALL /api/ingress/:pluginId/:instanceId/*path`) additionally evaluates a per-instance window named `instance` (env: `INGRESS_INSTANCE_LIMIT`, default 120, per `INGRESS_INSTANCE_TTL`, default 60000 ms), so its responses carry `X-RateLimit-*-instance` and, on saturation, `Retry-After-instance`.
+The ingress route (`ALL /api/ingress/:pluginId/:instanceId/*path`) is exempt from the global per-IP tiers (their 100/min medium window sits below the per-instance limit, so a provider fanning every tenant's webhooks through one egress IP was shed before the per-instance bound could fire). It carries its own two windows instead, both on `INGRESS_INSTANCE_TTL` (default 60000 ms):
+
+- `instance`, keyed on `(pluginId, instanceId)`, env `INGRESS_INSTANCE_LIMIT`, default 120. Sheds one noisy tenant without touching its neighbours.
+- `ingress-ip`, keyed on the client (proxy-aware, see `TRUSTED_PROXIES`), env `INGRESS_IP_LIMIT`, default 1200. The `instance` key is built from path segments the caller supplies, so varying them mints a fresh bucket; this window is the bound an unauthenticated caller cannot walk around. It is sized 10x the per-instance default so it never binds first for legitimate traffic.
+
+Responses therefore carry `X-RateLimit-*-instance` and `X-RateLimit-*-ingress-ip`, and on saturation the `Retry-After-*` of whichever window shed the request.
 
 The API exposes the rate-limit headers via CORS (`exposedHeaders`) so browser clients can read them. The simplest backpressure signal remains the `429` status itself, with the suffixed `Retry-After-*` as the retry delay.
 
@@ -370,7 +375,8 @@ from unauthenticated WhatsApp senders — so the copy amplification is bounded a
 | Bound                         | Knob                                      | Default                            | Behavior                                                                                                                                                                             |
 | ----------------------------- | ----------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Webhooks per session          | `WEBHOOK_MAX_PER_SESSION`                 | 16 (`0` = unlimited)               | Creating a NEW webhook at/over the cap is rejected with `400`; existing webhooks are grandfathered                                                                                   |
-| Inline media in payloads      | `WEBHOOK_MEDIA_INLINE_MAX_BYTES`          | 1 MiB (`0` = never inline)         | Larger media is replaced once, before per-webhook cloning, with `media: { mimetype, filename?, omitted: true, sizeBytes }`                                                           |
+| Autoreply rules per session   | `AUTOMATION_MAX_PER_SESSION`              | 32 (`0` = unlimited)               | Creating a NEW rule at/over the cap is rejected with `400`; existing rules are grandfathered. Every inbound message is evaluated against every rule of its session                   |
+| Inline media in payloads      | `WEBHOOK_MEDIA_INLINE_MAX_BYTES`          | 1 MiB (`0` = never inline)         | Larger media is replaced once, before per-webhook cloning and WebSocket broadcast, with `media: { mimetype, filename?, omitted: true, sizeBytes }`                                   |
 | Serialized body size          | `WEBHOOK_MAX_PAYLOAD_BYTES`               | 1 MiB                              | Over-budget bodies shed any remaining inline media (marker form) and are re-checked; still over budget → recorded as undelivered, never sent/queued                                  |
 | Failed-job retention in Redis | queue `removeOnComplete` / `removeOnFail` | 1h/1000 completed, 24h/5000 failed | Finished jobs auto-evict; payloads were already media-shed before enqueue, so retained jobs stay small. The durable record of a lost delivery is the `webhook_delivery_failures` row |
 
@@ -382,7 +388,7 @@ media shedding, so it is small. The HMAC signature is computed over the exact sh
 
 ### Helmet Configuration
 
-The shipped configuration lives in `src/main.ts` — that file is the source of truth:
+The shipped configuration lives in `src/configure-app.ts` (the HTTP stack `main.ts` and the e2e suites both install), and that file is the source of truth:
 
 ```typescript
 app.use(helmet({
@@ -413,13 +419,13 @@ app.use(helmet({
 
 ### Security Headers Checklist
 
-| Header | Value | Purpose |
-|--------|-------|---------|
-| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains; preload` | Force HTTPS |
-| `X-Content-Type-Options` | `nosniff` | Prevent MIME sniffing |
-| `X-Frame-Options` | `SAMEORIGIN` | Prevent clickjacking (helmet's default; not overridden) |
-| `X-XSS-Protection` | `0` | Helmet 8 deliberately disables the legacy auditor — the CSP is the protection |
-| `Referrer-Policy` | `strict-origin-when-cross-origin` | Control referrer |
+| Header                      | Value                                          | Purpose                                                                       |
+| --------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------- |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains; preload` | Force HTTPS                                                                   |
+| `X-Content-Type-Options`    | `nosniff`                                      | Prevent MIME sniffing                                                         |
+| `X-Frame-Options`           | `SAMEORIGIN`                                   | Prevent clickjacking (helmet's default; not overridden)                       |
+| `X-XSS-Protection`          | `0`                                            | Helmet 8 deliberately disables the legacy auditor — the CSP is the protection |
+| `Referrer-Policy`           | `strict-origin-when-cross-origin`              | Control referrer                                                              |
 
 ## 4.10 Audit Logging
 
@@ -515,14 +521,14 @@ flowchart TB
 
 ### Secrets Inventory
 
-| Secret                            | Storage                                             | Rotation guidance                               |
-| --------------------------------- | --------------------------------------------------- | ----------------------------------------------- |
-| Database credentials              | Environment variable                                | 90 days                                         |
-| Redis password                    | Environment variable                                | 90 days                                         |
-| API master key (`API_MASTER_KEY`) | Environment variable                                | 180 days                                        |
-| API key pepper (`API_KEY_PEPPER`) | Environment variable                                | Rotating it invalidates all existing key hashes |
-| Webhook secrets                   | Database — **plaintext**; never returned by the API | Per webhook                                     |
-| Session auth state                | File system (data volume) — **not encrypted**       | Never (tied to the WA session)                  |
+| Secret                            | Storage                                                                                                            | Rotation guidance                               |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------- |
+| Database credentials              | Environment variable                                                                                               | 90 days                                         |
+| Redis password                    | Environment variable                                                                                               | 90 days                                         |
+| API master key (`API_MASTER_KEY`) | Environment variable                                                                                               | 180 days                                        |
+| API key pepper (`API_KEY_PEPPER`) | Environment variable                                                                                               | Rotating it invalidates all existing key hashes |
+| Webhook secrets                   | Database — **plaintext**; not in the webhook read DTOs, and omitted from `GET /api/infra/export-data` webhook rows | Per webhook                                     |
+| Session auth state                | File system (data volume) — **not encrypted**                                                                      | Never (tied to the WA session)                  |
 
 > There is no application `ENCRYPTION_KEY` — OpenWA does not encrypt data at rest (see §4.4). The rotation cadences above are operational recommendations, not enforced by the app.
 
@@ -663,12 +669,12 @@ updates:
       - dependencies
     ignore:
       # TypeScript 7 is the native port: typescript-eslint and ts-jest cannot load it (#727/#729).
-      - dependency-name: "typescript"
-        versions: [">=7.0.0"]
+      - dependency-name: 'typescript'
+        versions: ['>=7.0.0']
       # better-sqlite3 v13: every released TypeORM caps its peer at ^12, and the linux-arm64
       # prebuild needs glibc 2.38 (the node:22-slim base has 2.36).
-      - dependency-name: "better-sqlite3"
-        versions: [">=13.0.0"]
+      - dependency-name: 'better-sqlite3'
+        versions: ['>=13.0.0']
 ```
 
 Majors are **not** ignored — they arrive as their own grouped PR, separate from the minor/patch
@@ -677,7 +683,7 @@ documented inline.
 
 ### Security Scanning in CI
 
-> **Aspirational template — not in the repo.** There is no `security.yml`, no Snyk, and no CodeQL workflow today. The actual dependency check is a dedicated `audit` job ("Security audit") in `ci.yml`, running `npm audit --audit-level=high` on push/PR — not on a schedule. It is deliberately its own job rather than a step inside Lint: an advisory published against an unrelated dependency would otherwise abort the job before ESLint, the type-check and the drift gates ever ran. The threshold is `high` rather than `critical` because the `overrides` in `package.json` clear the root tree's existing HIGH advisories, so it now fences regressions. The workflow below is a recommended setup to add if you want scheduled scanning and SAST.
+> **Aspirational template — not in the repo.** There is no `security.yml`, no Snyk, and no CodeQL workflow today. The actual dependency check is a dedicated `audit` job ("Security audit") in `ci.yml`, on push/PR — not on a schedule. It is deliberately its own job rather than a step inside Lint: an advisory published against an unrelated dependency would otherwise abort the job before ESLint, the type-check and the drift gates ever ran. It runs `npm run check:audit` over the root tree and `npm audit --audit-level=high` over `dashboard/`. Both fence `high` rather than `critical`, because the `overrides` in `package.json` clear the root tree's existing HIGH advisories, so the threshold fences regressions. `check:audit` applies that threshold per advisory instead of all-or-nothing: an advisory with no patched version can be excused by id in `scripts/check-audit.mjs`, with its reason and its removal condition recorded beside it, rather than dropping the whole job to `critical` — and an allowlist entry whose advisory has since gone fails the job too, so an exception cannot outlive its cause. The dashboard keeps the plain form: it has nothing to excuse and stays the stricter of the two. The workflow below is a recommended setup to add if you want scheduled scanning and SAST.
 
 ```yaml
 # .github/workflows/security.yml

@@ -47,6 +47,7 @@ export class IntegrationInstanceController {
       'Instance created. The plaintext ingress secret and verifyToken are revealed once in this response — store them immediately (both masked on every later read).',
     type: InstanceView,
   })
+  @ApiResponse({ status: 409, description: 'An instance with that id already exists for the plugin' })
   async create(
     @Param('pluginId') pluginId: string,
     @Body() dto: CreateInstanceDto,

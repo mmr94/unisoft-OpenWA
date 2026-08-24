@@ -8,6 +8,8 @@ process.env.BASE_URL = 'https://api.example.com';
 
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import { getRepositoryToken } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from '../src/app.module';
@@ -15,6 +17,7 @@ import { applyGlobalValidation } from '../src/config/app-validation';
 import { PluginLoaderService } from '../src/core/plugins/plugin-loader.service';
 import { AuthService } from '../src/modules/auth/auth.service';
 import { ApiKeyRole } from '../src/modules/auth/entities/api-key.entity';
+import { IntegrationDeliveryFailure } from '../src/modules/integration/entities/integration-delivery-failure.entity';
 
 // A stub ingress-capable plugin so the capability check passes without a real plugin on disk. The
 // configSchema carries a NESTED secret field so the masking tests can prove a `secret:true` config
@@ -54,6 +57,10 @@ describe('IntegrationInstanceController (e2e)', () => {
   let app: INestApplication<App>;
   const key = 'dev-admin-key';
   const base = '/api/integration/plugins';
+  // Hoisted so the redrive-provenance test can clear it before the POST and assert exactly which
+  // delivery was dispatched inline (the e2e runs with QUEUE_ENABLED unset, so redrive dispatches
+  // inline through this mock rather than enqueuing to BullMQ).
+  const dispatchWebhookForInstance = jest.fn();
 
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
@@ -61,7 +68,7 @@ describe('IntegrationInstanceController (e2e)', () => {
       .useValue({
         getPlugin: (id: string) =>
           id === 'chatwoot' ? INGRESS_PLUGIN : id === 'plain' ? NON_INGRESS_PLUGIN : undefined,
-        dispatchWebhookForInstance: jest.fn(),
+        dispatchWebhookForInstance,
         // EngineFactory.onModuleInit registers the built-in whatsapp-web.js/baileys engine plugins
         // and auto-enables the configured one through these at boot; no-ops keep app boot working
         // without a real plugin registry (enablePlugin failing is caught+logged, not fatal, but a
@@ -338,6 +345,115 @@ describe('IntegrationInstanceController (e2e)', () => {
         .post('/api/integration/instances/chatwoot/own1/redrive')
         .set('X-API-Key', scopedKey)
         .expect(201);
+    });
+  });
+
+  /**
+   * redrive session-provenance regression: the controller authorizes a scoped key against the
+   * instance's CURRENT sessionScope, but the DLQ also retains rows written under PRIOR bindings.
+   * After a rebind sess-old -> sess-current, a key scoped to sess-current would otherwise replay
+   * the historical sess-old row. The redrive must filter the DLQ by the authorized current binding
+   * (provenance), not just by {pluginId, instanceId}.
+   */
+  describe('redrive session provenance (rebind replay fence)', () => {
+    let scopedCurrentKey: string; // ADMIN, allowedSessions: ['sess-current']
+    let failures: Repository<IntegrationDeliveryFailure>;
+    let oldRowId: string;
+    let currentRowId: string;
+
+    beforeAll(async () => {
+      const authService = app.get(AuthService);
+      scopedCurrentKey = (
+        await authService.createApiKey({
+          name: 'e2e-redrive-sess-current',
+          role: ApiKeyRole.ADMIN,
+          allowedSessions: ['sess-current'],
+        })
+      ).rawKey;
+      failures = app.get(getRepositoryToken(IntegrationDeliveryFailure, 'data'));
+
+      // 1. Create the instance bound to sess-old with the unrestricted key.
+      await request(app.getHttpServer())
+        .post(`${base}/chatwoot/instances`)
+        .set('X-API-Key', key)
+        .send({ instanceId: 'rebound-redrive', sessionScope: 'sess-old' })
+        .expect(201);
+
+      // 2. Seed a non-redriven inbound DLQ row carrying the OLD binding's sessionId (the historical
+      //    payload that must NOT be replayable by a sess-current key after the rebind).
+      const oldRow = await failures.save(
+        failures.create({
+          direction: 'inbound',
+          pluginId: 'chatwoot',
+          instanceId: 'rebound-redrive',
+          sessionId: 'sess-old',
+          deliveryId: 'dlv-old',
+          attempts: 1,
+          lastError: 'inline dispatch failed',
+          payload: {
+            route: 'chatwoot',
+            method: 'POST',
+            ingress: { headers: {}, query: {}, body: '{}', rawBody: '{}' },
+          },
+          redriven: false,
+        }),
+      );
+      oldRowId = oldRow.id;
+
+      // 3. Rebind the instance to sess-current (the new authorized binding).
+      await request(app.getHttpServer())
+        .patch(`${base}/chatwoot/instances/rebound-redrive`)
+        .set('X-API-Key', key)
+        .send({ sessionScope: 'sess-current' })
+        .expect(200);
+
+      // 4. Seed a second non-redriven inbound DLQ row carrying the CURRENT binding's sessionId —
+      //    this is the only row a sess-current key should be able to replay.
+      const currentRow = await failures.save(
+        failures.create({
+          direction: 'inbound',
+          pluginId: 'chatwoot',
+          instanceId: 'rebound-redrive',
+          sessionId: 'sess-current',
+          deliveryId: 'dlv-current',
+          attempts: 0,
+          lastError: 'inline dispatch failed',
+          payload: {
+            route: 'chatwoot',
+            method: 'POST',
+            ingress: { headers: {}, query: {}, body: '{}', rawBody: '{}' },
+          },
+          redriven: false,
+        }),
+      );
+      currentRowId = currentRow.id;
+    });
+
+    it('redrives only the current-binding DLQ row, never the historical sess-old one', async () => {
+      // 5. POST redrive as a key scoped to sess-current (the instance's current binding).
+      dispatchWebhookForInstance.mockClear();
+      const res = await request(app.getHttpServer())
+        .post('/api/integration/instances/chatwoot/rebound-redrive/redrive')
+        .set('X-API-Key', scopedCurrentKey)
+        // 6. Exactly one row (the sess-current one) is redriven; the sess-old row neither consumes
+        //    the batch nor leaks through `remaining`.
+        .expect(201)
+        .then(r => r.body as { redriven: number; remaining: number; batchSize: number });
+
+      expect(res).toEqual({ redriven: 1, remaining: 0, batchSize: 100 });
+
+      // 7. Only the current delivery was dispatched inline; the historical sess-old row was not.
+      expect(dispatchWebhookForInstance).toHaveBeenCalledTimes(1);
+      expect(dispatchWebhookForInstance).toHaveBeenCalledWith(expect.objectContaining({ deliveryId: 'dlv-current' }));
+      expect(dispatchWebhookForInstance).not.toHaveBeenCalledWith(expect.objectContaining({ deliveryId: 'dlv-old' }));
+
+      // Re-read both rows: the current one is retired, the sess-old one stays redrivable (unchanged).
+      const [currentAfter, oldAfter] = await Promise.all([
+        failures.findOneByOrFail({ id: currentRowId }),
+        failures.findOneByOrFail({ id: oldRowId }),
+      ]);
+      expect(currentAfter.redriven).toBe(true);
+      expect(oldAfter.redriven).toBe(false);
     });
   });
 });

@@ -28,7 +28,8 @@ export function resolveSessionScope(
  * sees every scope; a scoped key only sees resources bound to one of its own sessions, so a null
  * scope (and the '*' wildcard) is never inside its fence. Use this on surfaces whose session
  * binding travels in the request body or in persisted rows, which the ApiKeyGuard's route-param
- * fence cannot reach (mirrors how plugins.controller threads allowedSessions into its service).
+ * fence cannot reach (the same body/persisted-scope pattern the integration-instance controller
+ * uses to confine a scoped key to instances bound inside its allowedSessions).
  */
 export function sessionScopeVisible(
   allowedSessions: string[] | null | undefined,

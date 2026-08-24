@@ -23,7 +23,7 @@ jest.mock('undici', () => {
 describe('WebhookProcessor', () => {
   let processor: WebhookProcessor;
   let repo: { update: jest.Mock };
-  let failureRepo: { insert: jest.Mock };
+  let failureRepo: { insert: jest.Mock; count: jest.Mock };
   let hookManager: { execute: jest.Mock };
   let configService: { get: jest.Mock };
   let mockFetch: jest.Mock;
@@ -54,7 +54,24 @@ describe('WebhookProcessor', () => {
 
   beforeEach(() => {
     repo = { update: jest.fn().mockResolvedValue({ affected: 1 }) };
-    failureRepo = { insert: jest.fn().mockResolvedValue({}) };
+    // Stateful like the real table: the recorder counts existing rows for the delivery before it
+    // inserts, so a constant would leave that guard unexercised here and let a duplicated row pass.
+    const insertedFailures: Array<{ webhookId?: string; idempotencyKey?: string | null }> = [];
+    failureRepo = {
+      insert: jest.fn().mockImplementation((rowToInsert: { webhookId?: string; idempotencyKey?: string | null }) => {
+        insertedFailures.push(rowToInsert);
+        return Promise.resolve({});
+      }),
+      count: jest
+        .fn()
+        .mockImplementation((opts: { where: { webhookId?: string; idempotencyKey?: string } }) =>
+          Promise.resolve(
+            insertedFailures.filter(
+              r => r.webhookId === opts.where.webhookId && r.idempotencyKey === opts.where.idempotencyKey,
+            ).length,
+          ),
+        ),
+    };
     hookManager = { execute: jest.fn().mockResolvedValue({ continue: true, data: {} }) };
     configService = { get: jest.fn((key: string, def?: unknown) => (key === 'webhook.timeout' ? 25000 : def)) };
     processor = new WebhookProcessor(

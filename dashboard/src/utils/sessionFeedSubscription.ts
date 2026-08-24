@@ -6,7 +6,7 @@
 // one subscription per visible session. The sessions list endpoint is already scope-filtered
 // server-side, so every listed session is joinable.
 
-export const SESSION_FEED_EVENTS = ['session.status', 'session.qr'] as const;
+export const SESSION_FEED_EVENTS = ['session.status', 'session.qr', 'session.restriction'] as const;
 
 export interface SessionFeedSink {
   subscribe(sessionId: string, events: string[]): void;

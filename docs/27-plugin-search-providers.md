@@ -21,6 +21,26 @@ user-facing feature and the built-in DB-FTS default.
 
 ## 27.2 The contract
 
+### Declare the permission
+
+The manifest must declare `search:provide`:
+
+```json
+{
+  "id": "meili",
+  "name": "Meilisearch",
+  "version": "1.0.0",
+  "type": "extension",
+  "main": "index.cjs",
+  "permissions": ["search:provide"]
+}
+```
+
+Without it the host ignores the registration and logs one warning
+(`sandbox_search_provider_denied`); the plugin keeps running and the active provider is unchanged.
+The permission is required because under the default `SEARCH_PROVIDER=auto` a registered provider is
+also made **active**, so it sees every query `GET /api/search` serves.
+
 ### Register the handler
 
 In `onEnable`, call `ctx.registerSearchProvider(handler)` with a function that takes a `SearchQuery` and
@@ -72,10 +92,10 @@ The core fires `message:persisted` for every live message (outbound on send, inb
 for history backfill. Register a handler to keep your index in sync:
 
 ```ts
-ctx.registerHook('message:persisted', async (hookCtx) => {
+ctx.registerHook('message:persisted', async hookCtx => {
   const { sessionId, message } = hookCtx.data;
   // message carries: id, waMessageId, sessionId, chatId, body, from, to, type, direction, timestamp, …
-  await myBackend.index(message);   // fire-and-forget is fine; an error here doesn't break the send/receive
+  await myBackend.index(message); // fire-and-forget is fine; an error here doesn't break the send/receive
 });
 ```
 
@@ -89,7 +109,7 @@ merged into the echo's row and then dropped. The core emits `message:persisted` 
 (upsert it) followed by `message:deleted` for the dropped one — delete that document by its `id`:
 
 ```ts
-ctx.registerHook('message:deleted', async (hookCtx) => {
+ctx.registerHook('message:deleted', async hookCtx => {
   const { message } = hookCtx.data;
   await myBackend.delete(message.id);
 });
@@ -126,6 +146,7 @@ plugins/my-search/
 ```
 
 **manifest.json:**
+
 ```json
 {
   "id": "my-search",
@@ -137,21 +158,22 @@ plugins/my-search/
 ```
 
 **index.js:**
+
 ```js
 module.exports = class MySearchPlugin {
   async onEnable(ctx) {
     // 1. Index every persisted message (live traffic only — backfill separately at onEnable).
-    ctx.registerHook('message:persisted', async (hookCtx) => {
+    ctx.registerHook('message:persisted', async hookCtx => {
       const { message } = hookCtx.data;
       await this._index(ctx, message);
     });
 
     // 2. Answer search queries.
-    ctx.registerSearchProvider(async (query) => {
+    ctx.registerSearchProvider(async query => {
       const start = Date.now();
       const results = await this._search(ctx, query); // your backend's query
       return {
-        hits: results.rows.map((r) => ({
+        hits: results.rows.map(r => ({
           messageId: String(r.id),
           waMessageId: r.waMessageId ?? '',
           sessionId: r.sessionId,
@@ -172,9 +194,15 @@ module.exports = class MySearchPlugin {
   }
 
   // Your backend-specific methods:
-  async _index(ctx, message) { /* upsert into your index */ }
-  async _search(ctx, query) { /* run your backend's query, honoring query.q + filters + limit/offset */ return { rows: [], total: 0 }; }
-  _highlight(body, term) { return body.replace(new RegExp(term, 'gi'), '<mark>$&</mark>'); }
+  async _index(ctx, message) {
+    /* upsert into your index */
+  }
+  async _search(ctx, query) {
+    /* run your backend's query, honoring query.q + filters + limit/offset */ return { rows: [], total: 0 };
+  }
+  _highlight(body, term) {
+    return body.replace(new RegExp(term, 'gi'), '<mark>$&</mark>');
+  }
 
   // Optional: report backend health to the /search health check.
   async healthCheck() {

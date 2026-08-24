@@ -52,6 +52,11 @@ func (s *StatusService) SendVideo(ctx context.Context, sessionID string, body Se
 	return s.send(ctx, sessionID, "/send-video", body)
 }
 
+// SendVoice posts an audio status as a voice note. Requires an OPERATOR-level key.
+func (s *StatusService) SendVoice(ctx context.Context, sessionID string, body SendVoiceStatusRequest) (*StatusResult, error) {
+	return s.send(ctx, sessionID, "/send-voice", body)
+}
+
 func (s *StatusService) send(ctx context.Context, sessionID, suffix string, body any) (*StatusResult, error) {
 	var out StatusResult
 	err := s.client.do(ctx, "POST", s.base(sessionID)+suffix, nil, body, &out)

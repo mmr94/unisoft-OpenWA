@@ -11,7 +11,19 @@
  * This middleware closes the gap. It tracks the aggregate body bytes currently in flight across
  * ALL connections — the declared Content-Length where present, one budget slot otherwise — and
  * refuses NEW requests with 503 + Retry-After once the budget is exhausted, without reading a
- * single byte of the rejected body. A stalled sender (headers, then silence) holds its
+ * single byte of the rejected body.
+ *
+ * The bound is on WIRE bytes, and it holds as heap only while a body is stored as it arrives.
+ * A compressed body would break that — admitted at its compressed length, then inflated by the
+ * parser into memory nothing accounted for — so a non-identity Content-Encoding is refused with
+ * 415 outright rather than priced. The remaining looseness in the wire-byte ACCOUNTING is
+ * deliberate and bounded: a chunked identity body reserves a placeholder and is reconciled against
+ * socket.bytesRead on the poll interval, so it can briefly under-report by the bytes that arrive
+ * within one interval. Separately, and by design, an admitted identity body still costs a constant
+ * multiple of its wire size once parsed (the raw Buffer pinned on rawBody, plus the decoded string
+ * and the parsed object) — the budget bounds the input, not the parse.
+ *
+ * A stalled sender (headers, then silence) holds its
  * reservation only until the stall reaper drops the socket after STALL_TIMEOUT_MS without any
  * new body bytes, so a handful of silent connections cannot pin the whole budget. The request
  * stream itself is never tapped — no 'data' listener — so downstream consumers (the body
@@ -22,6 +34,7 @@
  */
 import { Request, Response, NextFunction } from 'express';
 import { resolveBodyLimit } from './bootstrap-security';
+import { resolveClientIp } from '../common/utils/ip';
 
 /**
  * Default budget = 4 × the per-request body cap: a handful of concurrent full-size media uploads
@@ -91,17 +104,43 @@ export function resolveInflightBodyBudgetBytes(budgetEnv?: string, bodyLimitEnv?
 export interface InflightBodyBudgetOptions {
   /** Retry-After value (seconds) sent with the 503. Default 1 — budget frees as bodies finish. */
   retryAfterSeconds?: number;
+  /**
+   * Trusted proxies for client-IP resolution (TRUSTED_PROXIES). Untrusted by default: with no
+   * proxy named, the X-Forwarded-For header is ignored and every connection keys on its socket
+   * address - which behind an unconfigured reverse proxy is ONE address, i.e. one shared share.
+   * That is the same trade the API-key allowlists and the throttler make; the boot-time proxy
+   * warning covers the operator half.
+   */
+  trustedProxies?: string[];
+  /**
+   * Per-client share of the aggregate budget as a fraction in (0, 1]. Default 0.5: no single
+   * client can pin more than half the budget, so two independent heavy uploaders still coexist;
+   * a legitimate bulk uploader above the share gets 503 + Retry-After, not a hang.
+   */
+  perClientShare?: number;
 }
 
 export interface InflightBodyBudget {
   middleware: (req: Request, res: Response, next: NextFunction) => void;
   /** Aggregate bytes currently attributed to in-flight request bodies (observability/tests). */
   currentBytes: () => number;
+  /** Bytes currently attributed to one client's in-flight bodies (observability/tests). */
+  clientBytes: (req: Request) => number;
 }
 
 export function createInflightBodyBudget(budgetBytes: number, options?: InflightBodyBudgetOptions): InflightBodyBudget {
   let inFlightBytes = 0;
   const retryAfter = String(options?.retryAfterSeconds ?? 1);
+  const trustedProxies = options?.trustedProxies ?? [];
+  const share = Math.min(1, Math.max(Number.EPSILON, options?.perClientShare ?? 0.5));
+  const perClientCap = Math.max(1, Math.floor(budgetBytes * share));
+  // Per-client in-flight bytes. The key is the resolved client IP; entries are created lazily and
+  // deleted by the same exactly-once release that decrements the aggregate, so the map cannot
+  // leak a client that finished. A cap on the MAP itself guards the pathological many-spoofed-IPs
+  // case: past it, a NEW client key is treated as busiest (refused) rather than evicting a live
+  // one - refusing beats corrupting another client's accounting.
+  const clientInFlight = new Map<string, number>();
+  const MAX_TRACKED_CLIENTS = 10_000;
   // Opening reservation for a body with no declared length (chunked). It is only a placeholder:
   // the poller below reconciles it against the bytes that actually arrive, so a small chunked
   // request ends up costing what it really weighs. Reserving a whole per-request cap up front
@@ -127,6 +166,19 @@ export function createInflightBodyBudget(budgetBytes: number, options?: Inflight
       .json({ statusCode: 503, message: 'Too much request body data in flight; retry later' });
   };
 
+  /** Same never-read-the-body disposal as rejectBusy; only the reason and status differ. */
+  const rejectCompressed = (req: Request, res: Response): void => {
+    if (res.headersSent || res.writableEnded) {
+      req.destroy();
+      return;
+    }
+    res.status(415).set('Connection', 'close').json({
+      statusCode: 415,
+      message: 'Compressed request bodies are not supported',
+      error: 'Unsupported Media Type',
+    });
+  };
+
   const middleware = (req: Request, res: Response, next: NextFunction): void => {
     const declared = parseDeclaredLength(req.headers['content-length']);
     // A body with no declared length is expected only when the request is chunk-encoded (Node
@@ -134,14 +186,46 @@ export function createInflightBodyBudget(budgetBytes: number, options?: Inflight
     // health checks, Content-Length: 0 — reserves nothing and is never reaped.
     let reserved = declared ?? (req.headers['transfer-encoding'] !== undefined ? undeclaredReservation : 0);
 
-    // Admission control on the RESERVED size: a request that would push the aggregate past the
-    // budget is refused before a single byte of its body is buffered.
-    if (inFlightBytes + reserved > budgetBytes) {
+    // Every quantity this budget works with — the declared length, and socket.bytesRead in the
+    // reconciler below — is a WIRE measurement, while what the budget exists to bound is HEAP. The
+    // two are the same size only while the body is stored as it arrives. A compressed body breaks
+    // that: it is admitted on its compressed length and then inflated by the parser, so a payload
+    // orders of magnitude larger than the whole budget can be buffered without the accounting ever
+    // seeing it. Refusing here — before admission, before a byte is read — keeps the invariant
+    // true rather than trying to price an expansion that is not knowable in advance.
+    //
+    // The predicate is body-parser's, NOT `reserved > 0`. They disagree on exactly the cases that
+    // matter: `parseDeclaredLength` rejects a Content-Length that is not a safe integer (reserving
+    // nothing), while type-is `hasBody` accepts anything non-NaN — so `Content-Length: 2**53 + 1`
+    // with a gzip body reserves 0 here yet is still handed to the parser. Mirroring hasBody keeps
+    // the two layers from disagreeing about whether a body exists.
+    const bodyIndicated =
+      req.headers['transfer-encoding'] !== undefined || !Number.isNaN(Number(req.headers['content-length']));
+    // The accepted set is body-parser's, deliberately: it compares the WHOLE header against
+    // 'identity', so even a technically-uncompressed list ("identity, identity") is refused there.
+    // Accepting more here would only move the refusal to the parser, which answers a different
+    // shape — the two layers agreeing matters more than honouring an encoding list nobody sends.
+    const encoding = (req.headers['content-encoding'] ?? '').trim().toLowerCase();
+    if (bodyIndicated && encoding !== '' && encoding !== 'identity') {
+      rejectCompressed(req, res);
+      return;
+    }
+
+    // Admission control on the RESERVED size: a request that would push the aggregate OR ITS
+    // CLIENT'S SHARE past the budget is refused before a single byte of its body is buffered.
+    // The per-client check is what makes the DoS bounded per attacker rather than per deployment:
+    // four trickle connections from one source exhaust only that source's share, and every other
+    // client's uploads still land.
+    const clientKey = resolveClientIp(req, trustedProxies);
+    const clientBusy = clientInFlight.get(clientKey) ?? 0;
+    const mapAtCapacity = clientInFlight.size >= MAX_TRACKED_CLIENTS && !clientInFlight.has(clientKey);
+    if (inFlightBytes + reserved > budgetBytes || clientBusy + reserved > perClientCap || mapAtCapacity) {
       rejectBusy(req, res);
       return;
     }
 
     inFlightBytes += reserved;
+    if (!mapAtCapacity) clientInFlight.set(clientKey, clientBusy + reserved);
 
     let released = false;
     let stallTimer: ReturnType<typeof setInterval> | undefined;
@@ -159,6 +243,11 @@ export function createInflightBodyBudget(budgetBytes: number, options?: Inflight
       released = true;
       disarmStallReaper();
       inFlightBytes -= reserved;
+      if (!mapAtCapacity) {
+        const busy = (clientInFlight.get(clientKey) ?? reserved) - reserved;
+        if (busy > 0) clientInFlight.set(clientKey, busy);
+        else clientInFlight.delete(clientKey);
+      }
     };
     res.on('finish', release);
     res.on('close', release);
@@ -184,8 +273,21 @@ export function createInflightBodyBudget(budgetBytes: number, options?: Inflight
       const reconcileUndeclared = (readNow: number): void => {
         const actual = Math.max(undeclaredReservation, readNow - startBytes);
         if (actual === reserved) return;
-        inFlightBytes += actual - reserved;
+        const delta = actual - reserved;
+        inFlightBytes += delta;
         reserved = actual;
+        if (!mapAtCapacity) {
+          // Crossing the per-client cap mid-stream aborts too: the share bound applies to what is
+          // actually arriving, not only to what was declared. reserved is updated BEFORE release()
+          // so the exactly-once decrement subtracts the reconciled size, not the placeholder.
+          const busy = (clientInFlight.get(clientKey) ?? 0) + delta;
+          clientInFlight.set(clientKey, busy);
+          if (busy > perClientCap) {
+            release();
+            req.destroy();
+            return;
+          }
+        }
         if (inFlightBytes > budgetBytes) {
           release();
           req.destroy();
@@ -222,7 +324,11 @@ export function createInflightBodyBudget(budgetBytes: number, options?: Inflight
     next();
   };
 
-  return { middleware, currentBytes: () => inFlightBytes };
+  return {
+    middleware,
+    currentBytes: () => inFlightBytes,
+    clientBytes: req => clientInFlight.get(resolveClientIp(req, trustedProxies)) ?? 0,
+  };
 }
 
 /** A well-formed Content-Length, or undefined when absent/unusable (then reserve one slot if chunk-encoded). */

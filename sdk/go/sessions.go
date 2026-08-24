@@ -13,6 +13,27 @@ func (s *SessionsService) List(ctx context.Context, query *ListSessionsQuery) ([
 	return out, err
 }
 
+// GetConfig reads a session's effective configuration.
+func (s *SessionsService) GetConfig(ctx context.Context, sessionID string) (*SessionConfig, error) {
+	var out SessionConfig
+	err := s.client.do(ctx, "GET", "/api/sessions/"+pathEscape(sessionID)+"/config", nil, nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// UpdateConfig changes a RUNNING session's configuration. It takes effect without re-linking the
+// account — all three fields were fixed at creation before this route existed.
+func (s *SessionsService) UpdateConfig(ctx context.Context, sessionID string, body UpdateSessionConfigRequest) (*SessionConfig, error) {
+	var out SessionConfig
+	err := s.client.do(ctx, "PATCH", "/api/sessions/"+pathEscape(sessionID)+"/config", nil, body, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Get returns a single session.
 func (s *SessionsService) Get(ctx context.Context, sessionID string) (*SessionResponse, error) {
 	var out SessionResponse
@@ -48,7 +69,12 @@ func (s *SessionsService) Start(ctx context.Context, sessionID string) (*Session
 	return &out, nil
 }
 
-// Stop disconnects a session gracefully.
+// Stop disconnects a session gracefully. Returns an HTTP 502 error with
+// code 'SESSION_STOP_INCOMPLETE' when the session was stopped locally but the engine
+// teardown did not complete (the graceful disconnect and the force-destroy escalation
+// both failed, so the engine process may still be running); the status is settled to
+// disconnected and no success audit is written. Retry the stop; restart the node to
+// reap a leaked process.
 func (s *SessionsService) Stop(ctx context.Context, sessionID string) (*SessionResponse, error) {
 	var out SessionResponse
 	err := s.client.do(ctx, "POST", "/api/sessions/"+pathEscape(sessionID)+"/stop", nil, nil, &out)
@@ -58,9 +84,15 @@ func (s *SessionsService) Stop(ctx context.Context, sessionID string) (*SessionR
 	return &out, nil
 }
 
-// Logout unlinks this device from the WhatsApp account, then tears the session down. Unlike Stop
-// and Delete, it removes the device from the account holder's Linked Devices list, so a later
-// Start requires a fresh QR scan or pairing code. Requires a running session.
+// Logout attempts an engine-native unlink of this device, then tears the session down. A 200
+// means the unlink operation AND the required local credential cleanup completed — it is not an
+// independent observation that the handset UI no longer shows the linked device. Because a
+// completed unlink wipes the stored credentials, a later Start requires a fresh QR scan or
+// pairing code. Requires a running session. Returns an HTTP 502 error with
+// code 'SESSION_LOGOUT_INCOMPLETE' when the session was stopped locally but the logout operation
+// did not complete (no send, no acknowledgement, timeout/transport error, or local cleanup
+// failure); phone is cleared and no success audit is written. Start the session again and retry
+// the logout; do not assume the retry reconnects automatically or lands in a guaranteed QR state.
 func (s *SessionsService) Logout(ctx context.Context, sessionID string) (*SessionResponse, error) {
 	var out SessionResponse
 	err := s.client.do(ctx, "POST", "/api/sessions/"+pathEscape(sessionID)+"/logout", nil, nil, &out)
@@ -74,6 +106,18 @@ func (s *SessionsService) Logout(ctx context.Context, sessionID string) (*Sessio
 func (s *SessionsService) ForceKill(ctx context.Context, sessionID string) (*SessionResponse, error) {
 	var out SessionResponse
 	err := s.client.do(ctx, "POST", "/api/sessions/"+pathEscape(sessionID)+"/force-kill", nil, nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Wake resumes a session hibernated after inactivity (Unisoft fork). The engine is reloaded from
+// the credentials already on disk, so no QR scan is involved; the call returns as soon as the
+// engine is launching, so poll Get or watch session.status until it reports ready.
+func (s *SessionsService) Wake(ctx context.Context, sessionID string) (*SessionResponse, error) {
+	var out SessionResponse
+	err := s.client.do(ctx, "POST", "/api/sessions/"+pathEscape(sessionID)+"/wake", nil, nil, &out)
 	if err != nil {
 		return nil, err
 	}
@@ -104,6 +148,22 @@ func (s *SessionsService) RequestPairingCode(ctx context.Context, sessionID stri
 func (s *SessionsService) Stats(ctx context.Context) (*SessionStatsOverview, error) {
 	var out SessionStatsOverview
 	err := s.client.do(ctx, "GET", "/api/sessions/stats/overview", nil, nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SetOnlinePresence sets the account's own global presence — appear online, or offline.
+//
+// Available=false hands notifications back to the phone: a linked device that stays online
+// suppresses the phone's own alerts. This is the ACCOUNT's presence, not a chat's — see
+// ChatsService.SendState for per-chat typing/recording states.
+func (s *SessionsService) SetOnlinePresence(
+	ctx context.Context, sessionID string, body SetOwnPresenceRequest,
+) (*SuccessResult, error) {
+	var out SuccessResult
+	err := s.client.do(ctx, "PUT", "/api/sessions/"+pathEscape(sessionID)+"/presence", nil, body, &out)
 	if err != nil {
 		return nil, err
 	}

@@ -142,7 +142,8 @@
       "orLabel": "o",
       "post": "Pubblica",
       "posted": "Stato pubblicato",
-      "postFailed": "Impossibile pubblicare lo stato"
+      "postFailed": "Impossibile pubblicare lo stato",
+      "imageFile": "Immagine di stato"
     },
     "channels": {
       "notSupported": "I canali non sono supportati sul motore Baileys.",
@@ -157,9 +158,17 @@
       "markRead": "Impossibile contrassegnare la chat come letta",
       "send": "Impossibile inviare il messaggio",
       "react": "Impossibile reagire al messaggio",
-      "delete": "Impossibile eliminare il messaggio"
+      "delete": "Impossibile eliminare il messaggio",
+      "fileTooLarge": "Il file è troppo grande (max 18 MB)"
     },
-    "loadMessagesError": "Impossibile caricare i messaggi. Controlla i log del server."
+    "loadMessagesError": "Impossibile caricare i messaggi. Controlla i log del server.",
+    "messageStatus": {
+      "pending": "In attesa",
+      "sent": "Inviato",
+      "delivered": "Consegnato",
+      "read": "Letto",
+      "failed": "Fallito"
+    }
   },
   "errorBoundary": {
     "title": "Qualcosa è andato storto",
@@ -290,7 +299,9 @@
       "phone": "Numero di Telefono",
       "phoneNone": "Non connesso",
       "created": "Creata",
-      "lastActive": "Ultima Attività"
+      "lastActive": "Ultima Attività",
+      "autoRejectCalls": "Rifiuta automaticamente le chiamate",
+      "autoRejectCallsHint": "Le chiamate in arrivo vengono rifiutate appena squillano. Il webhook call.received viene comunque inviato prima. Si applica alla prossima chiamata — nessun riavvio necessario."
     },
     "actions": {
       "view": "Visualizza",
@@ -315,7 +326,8 @@
       "phone": "Telefono",
       "sessionId": "ID Sessione",
       "lastActive": "Ultima Attività",
-      "error": "Errore"
+      "error": "Errore",
+      "restriction": "Limitazione"
     },
     "forceKill": {
       "title": "Termina sessione bloccata",
@@ -333,11 +345,11 @@
       "warning": "WhatsApp rimuove questo dispositivo dai Dispositivi collegati dell'account e la sessione si interrompe. Per riconnettersi è necessaria una nuova scansione del QR o un codice di abbinamento. Per cancellare anche tutti i dati locali, elimina la sessione in seguito.",
       "confirm": "Scollega",
       "successTitle": "Dispositivo scollegato",
-      "success": "WhatsApp ha rimosso il dispositivo dai Dispositivi collegati dell'account. Per riconnettersi è necessaria una nuova scansione del QR o un codice di abbinamento.",
-      "unconfirmedTitle": "Scollegamento non confermato",
-      "unconfirmed": "La sessione si è interrotta localmente, ma WhatsApp non ha confermato lo scollegamento — il dispositivo potrebbe essere ancora elencato tra i Dispositivi collegati. Avvia la sessione e riprova.",
+      "success": "Scollegamento completato: il dispositivo è stato disconnesso e le credenziali di sessione locali sono state cancellate. La riconnessione richiede una nuova scansione QR o un codice di abbinamento.",
       "failedTitle": "Scollegamento non riuscito",
-      "failed": "Impossibile scollegare la sessione."
+      "failed": "Impossibile scollegare la sessione.",
+      "incompleteTitle": "Scollegamento incompleto",
+      "incomplete": "La sessione si è interrotta localmente, ma l'operazione di disconnessione è incompleta — il dispositivo potrebbe essere ancora collegato. Avvia la sessione e riprova lo scollegamento."
     },
     "pairing": {
       "tabQr": "Codice QR",
@@ -356,6 +368,16 @@
       "step3": "<strong>3.</strong> Tocca <strong>Collega un dispositivo</strong>, poi tocca <strong>Collega con numero di telefono</strong>",
       "step4": "<strong>4.</strong> Inserisci sul tuo telefono il codice di 8 caratteri mostrato sopra",
       "waitingConnection": "In attesa del collegamento del tuo telefono…"
+    },
+    "start": {
+      "teardownPendingTitle": "Avvio sessione",
+      "teardownPending": "Uno smontaggio delle credenziali per questa sessione è ancora in corso. Attendi un momento e riprova."
+    },
+    "restriction": {
+      "reachout_timelock": "Nuove chat bloccate",
+      "tos_block": "Bloccato da WhatsApp",
+      "proxy_block": "Connessione bloccata",
+      "until": "fino al {{date}}"
     }
   },
   "webhooks": {
@@ -399,7 +421,10 @@
         "isNot": "non è",
         "contains": "contiene",
         "equals": "è uguale a"
-      }
+      },
+      "fieldLabel": "Campo filtro",
+      "operatorLabel": "Operatore filtro",
+      "valueLabel": "Valore filtro"
     },
     "columns": {
       "url": "URL",
@@ -480,7 +505,8 @@
       "deleted": "Modello eliminato con successo",
       "deleteFailed": "Impossibile eliminare il modello: {{message}}",
       "copied": "Nome del modello copiato"
-    }
+    },
+    "sessionSelect": "Sessione"
   },
   "apiKeys": {
     "title": "Chiavi API",
@@ -552,7 +578,10 @@
     },
     "empty": {
       "title": "Nessun log trovato",
-      "description": "I log di audit appariranno qui man mano che verranno eseguite le azioni"
+      "description": "I log di audit appariranno qui man mano che verranno eseguite le azioni",
+      "filteredTitle": "Nessuna corrispondenza in questa pagina",
+      "filteredDescription": "La ricerca filtra solo la pagina corrente. Cancellala, sfoglia le pagine o usa il filtro severità lato server.",
+      "filteredServerDescription": "Nessun log corrisponde a questi filtri. Modifica il filtro severità per ampliare la ricerca."
     }
   },
   "messageTester": {
@@ -756,7 +785,8 @@
     "toasts": {
       "saveFailed": "Salvataggio Fallito"
     },
-    "envPinNote": "Fissato da una variabile d'ambiente: questo è il valore in esecuzione; le modifiche dalla dashboard non avranno effetto finché la variabile non viene rimossa.",
+    "envPinNote": "Fissato dalla variabile d'ambiente {{name}}: questo è il valore in esecuzione; le modifiche dalla dashboard non verranno applicate finché quella variabile non viene rimossa.",
+    "pendingRestartNote": "Salvato, ma non ancora applicato: riavvia il server perché questa modifica abbia effetto.",
     "migration": {
       "title": "Attenzione: questa operazione cambia il backend dei dati",
       "dbWarning": "Il nuovo database parte vuoto. Scarica ora un backup dei tuoi dati attuali (mentre sei ancora sul vecchio database), poi ripristinalo dopo il riavvio.",
@@ -767,6 +797,8 @@
       "export": "Esporta dati",
       "import": "Importa dati",
       "exportFailed": "Impossibile esportare i dati",
+      "exportPartialTitle": "Backup is missing some media",
+      "exportPartial": "{{count}} attachment payload(s) exceeded the export media budget and were saved as placeholders. The messages restore; their media does not.",
       "importFailed": "Impossibile importare i dati",
       "importOk": "Dati importati",
       "importConfirm": "L'importazione SOSTITUIRÀ tutti i dati attuali con il backup ({{rows}} righe). Questa operazione non può essere annullata. Continuare?",
@@ -810,6 +842,7 @@
     "installModal": {
       "title": "Installa un plugin",
       "hint": "Carica un plugin pacchettizzato come file .zip (con un manifest.json). Viene eseguito in sandbox una volta abilitato.",
+      "trustWarning": "I plugin vengono eseguiti con i pieni privilegi del processo del gateway — la sandbox contiene gli arresti anomali, non il codice dannoso. Installa solo plugin di cui ti fidi.",
       "choose": "Scegli un file .zip…",
       "tooLarge": "Il file supera il limite di 5 MB.",
       "catalogHint": "Installa direttamente dal catalogo dei plugin di OpenWA. Lo .zip viene recuperato lato server tramite la protezione SSRF, quindi validato ed eseguito in sandbox.",

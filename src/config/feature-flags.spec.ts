@@ -82,4 +82,31 @@ describe('feature-flags', () => {
       expect(compose).toMatch(/^\s*- AUTO_START_SESSIONS=\$\{AUTO_START_SESSIONS:-\}$/m);
     });
   });
+
+  // PLUGIN_DOWNLOAD_ALLOW_INSECURE_REDIRECTS gates a security-sensitive hop in ssrf-guard (off unless
+  // the exact string 'true'). Both bundled manifests must forward it with a secure default so an
+  // operator's .env takes effect; whole-file contains() is not enough — the line must land on the API
+  // service, never on a datastore/proxy service.
+  describe('bundled compose forwards the plugin redirect policy', () => {
+    // Extract the body of one top-level service block. Compose indents a service's keys two spaces
+    // under the `name:` key, so the block runs from `  serviceName:` to the next top-level key.
+    function extractTopLevelService(compose: string, serviceName: string): string {
+      const start = compose.indexOf(`\n  ${serviceName}:\n`);
+      if (start === -1) throw new Error(`service ${serviceName} not found`);
+      const rest = compose.slice(start + 1);
+      const next = rest.search(/\n[a-z]/);
+      return next === -1 ? rest : rest.slice(0, next);
+    }
+
+    it.each([
+      ['docker-compose.yml', 'openwa-api'],
+      ['docker-compose.dev.yml', 'openwa'],
+    ])('%s forwards the redirect flag on service %s', (file, serviceName) => {
+      const compose = fs.readFileSync(path.join(__dirname, '../../', file), 'utf8');
+      const service = extractTopLevelService(compose, serviceName);
+      expect(service).toContain(
+        'PLUGIN_DOWNLOAD_ALLOW_INSECURE_REDIRECTS=${PLUGIN_DOWNLOAD_ALLOW_INSECURE_REDIRECTS:-false}',
+      );
+    });
+  });
 });

@@ -2,6 +2,7 @@ package com.rmyndharis.openwa.resources;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -13,6 +14,7 @@ import com.rmyndharis.openwa.http.HttpMethod;
 import com.rmyndharis.openwa.model.SendImageStatusRequest;
 import com.rmyndharis.openwa.model.SendTextStatusRequest;
 import com.rmyndharis.openwa.model.SendVideoStatusRequest;
+import com.rmyndharis.openwa.model.SendVoiceStatusRequest;
 import com.rmyndharis.openwa.model.StatusMediaInput;
 import com.rmyndharis.openwa.model.StatusRecord;
 import com.rmyndharis.openwa.support.MockTransport;
@@ -115,6 +117,22 @@ class StatusResourceTest {
         assertEquals(HttpMethod.POST, tx.lastRequest().method());
         assertTrue(tx.lastRequest().body().contains("\"video\""));
         assertTrue(tx.lastRequest().body().contains("AAAA"));
+    }
+
+    /** A voice status wraps its media under `audio` and carries no caption. */
+    @Test
+    void sendVoicePostsAudioWrapperWithoutCaption() {
+        tx.respond(200, "{\"statusId\":\"st4\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"expiresAt\":\"2026-01-02T00:00:00Z\"}");
+        status.sendVoice(
+            "s",
+            SendVoiceStatusRequest.builder()
+                .audio(StatusMediaInput.builder().base64("T2dnUw==").build())
+                .recipients(List.of("628@c.us"))
+                .build());
+        assertEquals("http://h/api/sessions/s/status/send-voice", tx.lastRequest().url());
+        assertEquals(HttpMethod.POST, tx.lastRequest().method());
+        assertTrue(tx.lastRequest().body().contains("\"audio\""));
+        assertFalse(tx.lastRequest().body().contains("caption"));
     }
 
     @Test

@@ -80,9 +80,9 @@ export class ShutdownService {
   /**
    * Bounded, configurable grace (SHUTDOWN_DELAY_MS), capped at 30s. An explicit value always wins.
    * When unset, the default is the full 3s drain window (so a load balancer observes the 503 before
-   * teardown) for EVERY real deployment — including a bare `docker run` or a Kubernetes pod that never
-   * sets NODE_ENV. Only an explicit `development`/`test` skips the window (delay 0), so a
-   * `nest start --watch` hot reload or a dev Ctrl+C is not slowed by a grace it does not need.
+   * teardown) for EVERY real deployment — even an ad-hoc run that never sets NODE_ENV. Only an
+   * explicit `development`/`test` skips the window (delay 0), so a `nest start --watch` hot reload
+   * or a dev Ctrl+C is not slowed by a grace it does not need.
    */
   private resolveDelay(): number {
     const parsed = Number.parseInt(process.env.SHUTDOWN_DELAY_MS ?? '', 10);

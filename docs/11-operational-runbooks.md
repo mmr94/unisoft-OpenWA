@@ -27,6 +27,7 @@ Each runbook follows this format:
 **Impact:** All sessions affected, messages not processing
 
 **Prerequisites:**
+
 - SSH access to server
 - Docker CLI access
 - Database access
@@ -108,6 +109,7 @@ curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
 **Impact:** Single session affected
 
 **Prerequisites:**
+
 - API Key
 - Physical access to phone (if QR needed)
 
@@ -172,6 +174,7 @@ curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
 **Impact:** Performance degradation, potential OOM
 
 **Prerequisites:**
+
 - SSH access
 - Docker CLI
 
@@ -237,6 +240,7 @@ as a delivery failure rather than retaining payloads without limit.
 **Impact:** External systems not receiving events
 
 **Prerequisites:**
+
 - API Key
 - Access to webhook endpoint
 
@@ -330,6 +334,7 @@ curl -H "X-API-Key: $API_KEY" \
 **Impact:** Service downtime during maintenance
 
 **Prerequisites:**
+
 - Scheduled maintenance window
 - Backup verified
 - User notification sent
@@ -405,6 +410,7 @@ curl -H "X-API-Key: $API_KEY" \
 **Impact:** Brief downtime during upgrade
 
 **Prerequisites:**
+
 - Backup completed
 - Release notes reviewed
 - Breaking changes identified
@@ -424,6 +430,10 @@ export BACKUP_DIR="/backups/openwa"
 # 3. Export the Data DB as JSON alongside the archive (admin key)
 curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/infra/export-data > "$BACKUP_DIR/export-data.json"
+
+# Started with docker-compose.dev.yml (the README Quick Start)? Add `-f docker-compose.dev.yml`
+# to every docker compose command in this runbook, the Rollback block included, and write `openwa`
+# wherever a command names the `openwa-api` service (steps 6 and 7, rollback step 2).
 
 # 4. Stop services
 docker compose down
@@ -449,8 +459,8 @@ docker compose up -d
 sleep 30
 curl http://localhost:2785/api/health
 
-# 10. Verify version
-curl http://localhost:2785/api/health | jq '.version'
+# 10. Verify version (`version` is only included for an authenticated request)
+curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health | jq '.version'
 
 # 11. Verify all sessions
 curl -H "X-API-Key: $API_KEY" \
@@ -470,8 +480,8 @@ curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
 **Verification:**
 
 ```bash
-# Correct version
-curl http://localhost:2785/api/health | jq '.version'
+# Correct version (`version` is only included for an authenticated request)
+curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health | jq '.version'
 # Expected: "<new-version>"
 
 # All sessions reconnected
@@ -490,8 +500,9 @@ git checkout v<old-version>
 docker compose build openwa-api
 
 # 3. Restore from the pre-upgrade backup (both DBs + sessions) — the archive step 2 produced is
-#    "$BACKUP_DIR/openwa-backup-<timestamp>.tar.gz"
-./scripts/restore.sh "$BACKUP_DIR/openwa-backup-<timestamp>.tar.gz"
+#    "$BACKUP_DIR/openwa-backup-<timestamp>.tar.gz". The databases in place still hold the failed
+#    upgrade's data, so the restore refuses to touch them without --force
+./scripts/restore.sh "$BACKUP_DIR/openwa-backup-<timestamp>.tar.gz" --force
 
 # 4. Start with old version
 docker compose up -d
@@ -509,6 +520,7 @@ curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health
 **Impact:** None (online backup)
 
 **Prerequisites:**
+
 - Sufficient disk space
 - Backup storage accessible
 
@@ -549,10 +561,14 @@ OPENWA_DATA_DIR=/srv/openwa/data \
 
 > The data directory is a Docker **named volume** (`openwa-data`) in the production
 > compose. Run the script where that volume is mounted — e.g. point `OPENWA_DATA_DIR`
-> at the volume's mountpoint, or run it inside a container with `/app/data` mounted. When operating
-> directly on the host mount, also set any path that does not use its default below `OPENWA_DATA_DIR`
-> (notably compose's colocated `PLUGINS_DIR`, and `MAIN_DATABASE_NAME` / `DATABASE_NAME` when the app
-> overrides them) to the corresponding host-visible path.
+> at the volume's mountpoint, or run it inside a container with `/app/data` mounted.
+>
+> The scripts resolve every other path the way the application does: an explicit environment value
+> first, then `./.env`, then `<data dir>/.env.generated`. Settings made through Dashboard >
+> Infrastructure therefore apply without being restated on the command line. Two caveats when
+> operating directly on the host mount: a path recorded inside the container (`/app/data/...`) is not
+> host-visible, so override it in the environment; and a value written with quotes or a trailing `#`
+> comment is reported and skipped rather than guessed at, so pass those explicitly too.
 
 **Verification:**
 
@@ -574,6 +590,7 @@ tar -tzf ./backups/openwa-backup-*.tar.gz
 **Impact:** Service downtime during restore
 
 **Prerequisites:**
+
 - Valid backup file
 - Sufficient disk space
 - SSH access
@@ -592,7 +609,9 @@ docker compose down
 # 2. Restore from an archive produced by scripts/backup.sh
 #    (databases land on MAIN_DATABASE_NAME / DATABASE_NAME, default ./data/... — the same paths
 #    the app reads; non-DB state follows OPENWA_DATA_DIR. Pass --strict to refuse an archive
-#    whose CONSISTENCY-WARNING marker reports plain-copied, possibly-torn database snapshots)
+#    whose CONSISTENCY-WARNING marker reports plain-copied, possibly-torn database snapshots.
+#    Restoring over an existing install's live databases requires --force; without it the script
+#    refuses to overwrite them)
 ./scripts/restore.sh ./backups/openwa-backup-<timestamp>.tar.gz
 
 # 3. (Postgres only) the archive contains database.sql — import it manually:
@@ -631,14 +650,14 @@ curl -H "X-API-Key: $API_KEY" \
 
 ### Alert Response Matrix
 
-| Alert | Severity | Response Time | Runbook |
-|-------|----------|---------------|---------|
-| Service Down | Critical | 5 min | Service Down |
-| High Memory | Warning | 30 min | High Memory Usage |
-| Session Disconnected | Warning | 15 min | Session Disconnected |
-| Webhook Failures > 5% | Warning | 30 min | Webhook Delivery Failure |
-| Disk Space < 10% | Critical | 15 min | Disk Space Low |
-| Certificate Expiry < 7 days | Warning | 24 hours | Certificate Renewal |
+| Alert                       | Severity | Response Time | Runbook                  |
+| --------------------------- | -------- | ------------- | ------------------------ |
+| Service Down                | Critical | 5 min         | Service Down             |
+| High Memory                 | Warning  | 30 min        | High Memory Usage        |
+| Session Disconnected        | Warning  | 15 min        | Session Disconnected     |
+| Webhook Failures > 5%       | Warning  | 30 min        | Webhook Delivery Failure |
+| Disk Space < 10%            | Critical | 15 min        | Disk Space Low           |
+| Certificate Expiry < 7 days | Warning  | 24 hours      | Certificate Renewal      |
 
 ### Runbook: Certificate Renewal
 
@@ -768,6 +787,7 @@ External Contacts:
 - Domain registrar: [support email]
 - SSL provider: [support portal]
 ```
+
 ---
 
 <div align="center">

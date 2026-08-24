@@ -52,6 +52,29 @@ describe('App smoke (e2e)', () => {
       });
   });
 
+  it('GET /api/health withholds the version without credentials, discloses it to a valid key', async () => {
+    const authService = app.get(AuthService);
+    const { rawKey } = await authService.createApiKey({ name: 'e2e-health', role: ApiKeyRole.VIEWER });
+
+    await request(app.getHttpServer())
+      .get('/api/health')
+      .expect(200)
+      .expect(res => {
+        if ('version' in (res.body as object)) throw new Error('version disclosed without credentials');
+      });
+
+    await request(app.getHttpServer())
+      .get('/api/health')
+      .set('X-API-Key', rawKey)
+      .expect(200)
+      .expect(res => {
+        const body = res.body as { version?: string };
+        if (typeof body.version !== 'string' || !body.version) {
+          throw new Error('version missing for an authenticated caller');
+        }
+      });
+  });
+
   it('GET /api/sessions without an API key is rejected (401)', () => {
     return request(app.getHttpServer()).get('/api/sessions').expect(401);
   });

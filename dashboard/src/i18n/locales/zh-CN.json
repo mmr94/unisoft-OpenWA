@@ -142,7 +142,8 @@
       "orLabel": "或",
       "post": "发布",
       "posted": "状态已发布",
-      "postFailed": "无法发布状态"
+      "postFailed": "无法发布状态",
+      "imageFile": "状态图片"
     },
     "channels": {
       "notSupported": "Baileys 引擎不支持频道。",
@@ -157,9 +158,17 @@
       "markRead": "将聊天标记为已读失败",
       "send": "发送消息失败",
       "react": "回应消息失败",
-      "delete": "删除消息失败"
+      "delete": "删除消息失败",
+      "fileTooLarge": "文件过大（最大 18 MB）"
     },
-    "loadMessagesError": "无法加载消息。请检查服务器日志。"
+    "loadMessagesError": "无法加载消息。请检查服务器日志。",
+    "messageStatus": {
+      "pending": "待发送",
+      "sent": "已发送",
+      "delivered": "已送达",
+      "read": "已读",
+      "failed": "发送失败"
+    }
   },
   "errorBoundary": {
     "title": "出了点问题",
@@ -290,7 +299,9 @@
       "phone": "电话号码",
       "phoneNone": "未连接",
       "created": "创建时间",
-      "lastActive": "上次活跃"
+      "lastActive": "上次活跃",
+      "autoRejectCalls": "自动拒接来电",
+      "autoRejectCallsHint": "来电响铃后立即拒接。call.received webhook 仍会先行触发。下一通来电起生效，无需重启。"
     },
     "actions": {
       "view": "查看",
@@ -315,7 +326,8 @@
       "phone": "电话",
       "sessionId": "会话 ID",
       "lastActive": "上次活跃",
-      "error": "错误"
+      "error": "错误",
+      "restriction": "限制"
     },
     "forceKill": {
       "title": "终止卡死的会话",
@@ -333,11 +345,11 @@
       "warning": "WhatsApp 会将此设备从账号的已关联设备列表中移除，会话将停止。重新连接需要重新扫描二维码或使用配对码。如需同时清除所有本地数据，请随后删除该会话。",
       "confirm": "取消关联",
       "successTitle": "设备已取消关联",
-      "success": "WhatsApp 已将设备从账号的已关联设备列表中移除。重新连接需要重新扫描二维码或使用配对码。",
-      "unconfirmedTitle": "取消关联未确认",
-      "unconfirmed": "会话已在本地停止，但 WhatsApp 未确认取消关联——设备可能仍列在已关联设备中。请启动会话后重试。",
+      "success": "取消关联已完成：设备已登出，本地会话凭据已清除。重新连接需要新的二维码扫描或配对码。",
       "failedTitle": "取消关联失败",
-      "failed": "无法取消关联该会话。"
+      "failed": "无法取消关联该会话。",
+      "incompleteTitle": "取消关联未完成",
+      "incomplete": "会话已在本地停止，但登出操作未完成——设备可能仍处于关联状态。请启动会话后重新尝试取消关联。"
     },
     "pairing": {
       "tabQr": "QR 码",
@@ -356,6 +368,16 @@
       "step3": "<strong>3.</strong> 点击<strong>关联设备</strong>，然后点击<strong>改用电话号码关联</strong>",
       "step4": "<strong>4.</strong> 在手机上输入上方显示的 8 位字符配对码",
       "waitingConnection": "正在等待您的手机完成关联…"
+    },
+    "start": {
+      "teardownPendingTitle": "会话启动中",
+      "teardownPending": "此会话的凭据拆除仍在处理中。请稍候再试。"
+    },
+    "restriction": {
+      "reachout_timelock": "新会话被阻止",
+      "tos_block": "被 WhatsApp 封禁",
+      "proxy_block": "连接被阻止",
+      "until": "至 {{date}}"
     }
   },
   "webhooks": {
@@ -399,7 +421,10 @@
         "isNot": "不是",
         "contains": "包含",
         "equals": "等于"
-      }
+      },
+      "fieldLabel": "筛选字段",
+      "operatorLabel": "筛选运算符",
+      "valueLabel": "筛选值"
     },
     "columns": {
       "url": "URL",
@@ -480,7 +505,8 @@
       "deleted": "模板删除成功",
       "deleteFailed": "删除模板失败：{{message}}",
       "copied": "已复制模板名称"
-    }
+    },
+    "sessionSelect": "会话"
   },
   "apiKeys": {
     "title": "API 密钥",
@@ -552,7 +578,10 @@
     },
     "empty": {
       "title": "未找到日志",
-      "description": "执行操作后，审计日志将显示在这里"
+      "description": "执行操作后，审计日志将显示在这里",
+      "filteredTitle": "本页无匹配项",
+      "filteredDescription": "搜索仅过滤当前页。请清除搜索、翻页，或使用严重级别筛选在服务端收窄。",
+      "filteredServerDescription": "没有符合这些筛选条件的日志。请调整严重级别筛选以扩大搜索范围。"
     }
   },
   "messageTester": {
@@ -756,7 +785,8 @@
     "toasts": {
       "saveFailed": "保存失败"
     },
-    "envPinNote": "已由环境变量锁定 —— 此为当前运行值；在取消该变量之前，仪表盘的更改不会生效。",
+    "envPinNote": "已由环境变量 {{name}} 锁定 —— 此为当前运行值；在取消该变量之前，仪表盘的更改不会生效。",
+    "pendingRestartNote": "已保存，但尚未生效 —— 请重启服务器以应用此更改。",
     "migration": {
       "title": "请注意 —— 此操作将更改数据后端",
       "dbWarning": "新数据库将从空白状态开始。请立即（在仍使用旧数据库时）下载当前数据的备份，然后在重启后恢复。",
@@ -767,6 +797,8 @@
       "export": "导出数据",
       "import": "导入数据",
       "exportFailed": "无法导出数据",
+      "exportPartialTitle": "Backup is missing some media",
+      "exportPartial": "{{count}} attachment payload(s) exceeded the export media budget and were saved as placeholders. The messages restore; their media does not.",
       "importFailed": "无法导入数据",
       "importOk": "数据已导入",
       "importConfirm": "导入操作将用备份数据替换（REPLACE）当前所有数据（{{rows}} 行）。此操作无法撤销。是否继续？",
@@ -810,6 +842,7 @@
     "installModal": {
       "title": "安装插件",
       "hint": "上传打包为 .zip 的插件（包含 manifest.json）。启用后将在沙箱中运行。",
+      "trustWarning": "插件以网关进程的完整权限运行——沙箱只能隔离崩溃，无法防御恶意代码。请只安装你信任的插件。",
       "choose": "选择 .zip 文件…",
       "tooLarge": "文件超过 5 MB 限制。",
       "catalogHint": "直接从 OpenWA 插件目录安装。.zip 文件由服务器通过 SSRF 防护获取，然后经过验证并在沙箱中运行。",

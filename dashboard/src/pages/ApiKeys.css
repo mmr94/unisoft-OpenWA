@@ -114,7 +114,7 @@
 
 .api-keys-page .permission-badge:first-child:last-child {
   background: rgba(37, 211, 102, 0.1);
-  color: var(--primary);
+  color: var(--primary-text);
 }
 
 .api-keys-page .actions-cell {
@@ -142,7 +142,7 @@
 .api-keys-page .icon-btn.danger:hover {
   background: rgba(239, 68, 68, 0.12);
   border-color: rgba(239, 68, 68, 0.3);
-  color: var(--error);
+  color: var(--error-text);
 }
 
 .api-keys-page .permissions-reference {
@@ -175,7 +175,7 @@
 
 .api-keys-page .perm-item code {
   font-size: 0.8125rem;
-  color: var(--primary);
+  color: var(--primary-text);
   background: rgba(37, 211, 102, 0.1);
   padding: 0.25rem 0.5rem;
   border-radius: 4px;
@@ -229,7 +229,7 @@
 }
 
 .api-keys-page .confirm-warning-icon {
-  color: var(--warning);
+  color: var(--warning-text);
 }
 
 .api-keys-page .confirm-message {
@@ -256,12 +256,12 @@
 
 .api-keys-page .status-badge.active {
   background: rgba(37, 211, 102, 0.1);
-  color: var(--primary);
+  color: var(--primary-text);
 }
 
 .api-keys-page .status-badge.inactive {
   background: rgba(239, 68, 68, 0.12);
-  color: var(--error);
+  color: var(--error-text);
 }
 
 @media (max-width: 768px) {

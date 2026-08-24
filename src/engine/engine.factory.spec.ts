@@ -127,6 +127,55 @@ describe('EngineFactory', () => {
     expect(() => factory.create({ sessionId: 'sess-b', dbSessionId: 'db-b' })).toThrow(/baileys/i);
   });
 
+  describe('create() makes the session credential directories owner-only', () => {
+    let tmpRoot: string;
+
+    beforeEach(() => {
+      tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'engine-create-'));
+    });
+    afterEach(() => {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    });
+
+    const buildTmpFactory = (preLoosen?: boolean) => {
+      const sessionDataPath = path.join(tmpRoot, 'sessions');
+      const authDir = path.join(tmpRoot, 'baileys');
+      // An upgrade reuses the dirs a previous install left world-readable (default umask); fresh
+      // installs have no dirs at all. Both must end at 0o700 after create().
+      if (preLoosen) {
+        fs.mkdirSync(path.join(sessionDataPath, 'session-alice'), { recursive: true, mode: 0o755 });
+        fs.mkdirSync(path.join(authDir, 'alice'), { recursive: true, mode: 0o755 });
+      }
+      const createEngine = jest.fn().mockReturnValue({});
+      const pluginLoader = {
+        getPlugin: jest.fn().mockReturnValue({ instance: { type: PluginType.ENGINE, createEngine } }),
+      } as unknown as PluginLoaderService;
+      const factory = new EngineFactory(
+        buildConfigService({
+          'engine.sessionDataPath': sessionDataPath,
+          'engine.baileys.authDir': authDir,
+        }),
+        pluginLoader,
+        buildMessageStore(),
+        buildLidStore(),
+      );
+      return {
+        factory,
+        wwjsDir: path.join(sessionDataPath, 'session-alice'),
+        baileysDir: path.join(authDir, 'alice'),
+      };
+    };
+
+    it.each([false, true])('hardens both engine shapes on a %s install', preLoosen => {
+      const { factory, wwjsDir, baileysDir } = buildTmpFactory(preLoosen);
+
+      factory.create({ sessionId: 'alice', dbSessionId: 'db-1' });
+
+      expect(fs.statSync(wwjsDir).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(baileysDir).mode & 0o777).toBe(0o700);
+    });
+  });
+
   describe('purgeSessionData (delete fully removes on-disk auth, keyed by session name)', () => {
     const noPluginLoader = () => ({ getPlugin: jest.fn() }) as unknown as PluginLoaderService;
     let tmpRoot: string;

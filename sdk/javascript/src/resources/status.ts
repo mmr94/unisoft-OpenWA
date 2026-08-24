@@ -13,6 +13,7 @@ import type {
   SendImageStatusRequest,
   SendTextStatusRequest,
   SendVideoStatusRequest,
+  SendVoiceStatusRequest,
   StatusRecord,
   StatusResult,
 } from '../types.js';
@@ -67,6 +68,20 @@ export class StatusResource {
     return this.client.request<StatusResult>({
       method: 'POST',
       path: `/api/sessions/${encodeSegment(sessionId)}/status/send-video`,
+      body,
+    });
+  }
+
+  /**
+   * Post an audio status as a voice note. No caption: WhatsApp has nowhere to render one.
+   *
+   * WhatsApp plays a status voice note only as Ogg/Opus and neither engine transcodes, so convert
+   * first with `media.convertVoice` and post the base64 it returns. Requires an OPERATOR key.
+   */
+  sendVoice(sessionId: string, body: SendVoiceStatusRequest): Promise<StatusResult> {
+    return this.client.request<StatusResult>({
+      method: 'POST',
+      path: `/api/sessions/${encodeSegment(sessionId)}/status/send-voice`,
       body,
     });
   }

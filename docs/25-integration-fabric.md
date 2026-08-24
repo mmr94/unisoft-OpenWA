@@ -2,7 +2,7 @@
 
 > **Status:** Shipped. The core substrate, operator provisioning (an ADMIN instance API and a dashboard
 > **Instances** tab), and the official ingress adapters are all in place; the public SDK reference is
-> still to come (P4). This document describes the architecture and the design rationale — *why* it is
+> still to come (P4). This document describes the architecture and the design rationale — _why_ it is
 > built this way — not a how-to or an API reference (see
 > [15 - Project Roadmap](./15-project-roadmap.md) for the phase table).
 
@@ -27,7 +27,7 @@ public contract — Integration SDK v1** — because the contract, not any singl
 
 ## 25.2 Design principle: one new primitive, everything else a clone
 
-The overriding goal is to preserve the untrusted-worker safety invariants *by construction*. OpenWA
+The overriding goal is to preserve the untrusted-worker safety invariants _by construction_. OpenWA
 plugins run in a capability-gated worker thread with no ambient host access (see
 [30 - Plugin Sandboxing](./30-plugin-sandboxing.md)). Every host↔worker message is a serializable POJO
 across a `structuredClone` boundary; host-initiated calls fail open on a timeout and drain on a worker
@@ -37,15 +37,15 @@ host-side.
 Rather than invent new machinery that would have to re-earn those properties, the Integration Fabric is
 **~90% a faithful clone of seams OpenWA already ships**:
 
-| Concern | Cloned from |
-| ------- | ----------- |
-| Host→worker dispatch with fail-open timeout + crash-drain | the existing hook bridge |
-| Worker→host capability calls | the existing capability router |
-| Durable delivery with retry + dead-letter | the outbound webhook queue and DLQ |
-| Identity mapping table (no foreign key, last-write-wins) | the LID↔phone mapping table |
-| Inbound deduplication (insert-or-skip on a unique key) | the inbound-message dedup oracle |
-| SSRF-guarded egress | `ctx.net.fetch` (reused verbatim) |
-| Secret masking on read | the plugin config redaction utility |
+| Concern                                                   | Cloned from                         |
+| --------------------------------------------------------- | ----------------------------------- |
+| Host→worker dispatch with fail-open timeout + crash-drain | the existing hook bridge            |
+| Worker→host capability calls                              | the existing capability router      |
+| Durable delivery with retry + dead-letter                 | the outbound webhook queue and DLQ  |
+| Identity mapping table (no foreign key, last-write-wins)  | the LID↔phone mapping table         |
+| Inbound deduplication (insert-or-skip on a unique key)    | the inbound-message dedup oracle    |
+| SSRF-guarded egress                                       | `ctx.net.fetch` (reused verbatim)   |
+| Secret masking on read                                    | the plugin config redaction utility |
 
 Exactly **one** genuinely new primitive exists: a host→worker RPC that returns an **HTTP status + body**
 from a sandboxed worker — inbound webhook ingress. It is modelled line-for-line on the hook bridge so its
@@ -111,11 +111,17 @@ Alongside this async pipeline, a route may additionally declare a `response` con
   many instances (for example, one external account per WhatsApp number). Each instance owns a host-minted
   ingress secret, a resolved session scope, and a config slice. It is a serializable field threaded
   through payloads and rows — **not** a separate worker; there is still one worker per plugin.
+  _Known residue:_ per-instance isolation covers the **ingress dispatch** path (concrete-scoped
+  instances resolve their own config slice). A `wildcard`/`null`-scoped sibling is still projected
+  into the plugin's **base** config with last-write-wins merging, so a sparse wildcard instance
+  inherits keys a sibling projected, and hook dispatch resolves config without per-instance
+  scoping. Run one enabled wildcard instance per plugin, or scope instances concretely, until the
+  projection is re-keyed per instance.
 - **`conversation.send` capability** — a normalized outbound send authored by the plugin and translated
   host-side to the message service, so persistence and the message hook chain are preserved. It is gated
   by a `conversation:send` permission and the instance's session scope.
 - **Identity, dedup, and DLQ tables** — see §25.5.
-- **Ingress queue** — a durable BullMQ queue that is a *sibling* of the outbound webhook queue (its own
+- **Ingress queue** — a durable BullMQ queue that is a _sibling_ of the outbound webhook queue (its own
   worker, not the reordering webhook worker), with exponential-backoff retries and a dead-letter row on
   the final attempt.
 
@@ -185,7 +191,7 @@ Four tables live on the data connection, each created by a hand-authored dual-di
   supported ingress body formats and fail verification/content handling rather than being re-serialized.
 - **Egress.** The only outbound path remains the existing SSRF-guarded `ctx.net.fetch`, scoped to the
   manifest's allowed hosts.
-- **Re-entrancy.** A reply issued *inside* an ingress handler seeds the in-flight hook set, so an adapter's
+- **Re-entrancy.** A reply issued _inside_ an ingress handler seeds the in-flight hook set, so an adapter's
   own outbound message hook cannot echo-loop the reply back out to the external system.
 
 ## 25.7 Scale and durability
@@ -245,7 +251,7 @@ signed over `${id}.${timestamp}.${rawBody}`), so only `toleranceSec` (falling ba
 `encoding`, `prefix`, and `timestampHeader` are ignored, and the
 operator pastes the provider's Svix secret (`v1,whsec_<base64>`) as the instance secret. It is the
 recommended scheme for Standard-Webhooks providers: because the `session-alive` preflight (§25.4) runs
-*after* signature verification, an unauthenticated caller can no longer use that preflight as a liveness
+_after_ signature verification, an unauthenticated caller can no longer use that preflight as a liveness
 oracle on a route that previously declared `scheme: "none"`. The existing `hmac-sha256`/`shared-secret`/
 `none` behavior is unchanged. For `hmac-sha256`, declaring `timestampHeader` always activates the replay
 window (§25.6) — declare it together with a `contentTemplate` that includes `{timestamp}` so the checked

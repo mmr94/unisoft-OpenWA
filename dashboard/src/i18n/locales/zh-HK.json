@@ -142,7 +142,8 @@
       "orLabel": "或",
       "post": "發佈",
       "posted": "狀態已發佈",
-      "postFailed": "無法發佈狀態"
+      "postFailed": "無法發佈狀態",
+      "imageFile": "狀態圖片"
     },
     "channels": {
       "notSupported": "Baileys 引擎不支援頻道。",
@@ -157,9 +158,17 @@
       "markRead": "將聊天標記為已讀失敗",
       "send": "傳送訊息失敗",
       "react": "回應訊息失敗",
-      "delete": "刪除訊息失敗"
+      "delete": "刪除訊息失敗",
+      "fileTooLarge": "檔案過大（最大 18 MB）"
     },
-    "loadMessagesError": "無法載入訊息。請檢查伺服器日誌。"
+    "loadMessagesError": "無法載入訊息。請檢查伺服器日誌。",
+    "messageStatus": {
+      "pending": "待傳送",
+      "sent": "已傳送",
+      "delivered": "已送達",
+      "read": "已讀",
+      "failed": "傳送失敗"
+    }
   },
   "errorBoundary": {
     "title": "發生問題",
@@ -290,7 +299,9 @@
       "phone": "電話號碼",
       "phoneNone": "未連線",
       "created": "建立時間",
-      "lastActive": "上次活躍"
+      "lastActive": "上次活躍",
+      "autoRejectCalls": "自動拒接來電",
+      "autoRejectCallsHint": "來電響鈴後即時拒接。call.received webhook 仍會先行觸發。下一通來電起生效，無需重新啟動。"
     },
     "actions": {
       "view": "查看",
@@ -315,7 +326,8 @@
       "phone": "電話",
       "sessionId": "工作階段 ID",
       "lastActive": "上次活躍",
-      "error": "錯誤"
+      "error": "錯誤",
+      "restriction": "限制"
     },
     "forceKill": {
       "title": "強制終止卡住的工作階段",
@@ -333,11 +345,11 @@
       "warning": "WhatsApp 會將此裝置從帳戶的已連結裝置列表中移除，工作階段將停止。重新連接需要重新掃描 QR 碼或使用配對碼。如需同時清除所有本地資料，請隨後刪除該工作階段。",
       "confirm": "解除連結",
       "successTitle": "裝置已解除連結",
-      "success": "WhatsApp 已將裝置從帳戶的已連結裝置列表中移除。重新連接需要重新掃描 QR 碼或使用配對碼。",
-      "unconfirmedTitle": "解除連結未確認",
-      "unconfirmed": "工作階段已在本地停止，但 WhatsApp 未確認解除連結——裝置可能仍列於已連結裝置中。請啟動工作階段後重試。",
+      "success": "解除連結已完成：裝置已登出，本機工作階段憑證已清除。重新連線需要新的 QR 掃描或配對碼。",
       "failedTitle": "解除連結失敗",
-      "failed": "無法解除該工作階段的連結。"
+      "failed": "無法解除該工作階段的連結。",
+      "incompleteTitle": "解除連結未完成",
+      "incomplete": "工作階段已在本地停止，但登出操作未完成——裝置可能仍處於連結狀態。請啟動工作階段後重新嘗試解除連結。"
     },
     "pairing": {
       "tabQr": "QR 碼",
@@ -356,6 +368,16 @@
       "step3": "<strong>3.</strong> 點按<strong>連結裝置</strong>，然後點按<strong>改用電話號碼連結</strong>",
       "step4": "<strong>4.</strong> 在手機上輸入上方顯示的 8 位字元配對碼",
       "waitingConnection": "正在等待你的手機完成連結…"
+    },
+    "start": {
+      "teardownPendingTitle": "工作階段啟動中",
+      "teardownPending": "此工作階段的憑證拆除仍在進行中。請稍候再試。"
+    },
+    "restriction": {
+      "reachout_timelock": "新對話被封鎖",
+      "tos_block": "被 WhatsApp 封鎖",
+      "proxy_block": "連線被封鎖",
+      "until": "至 {{date}}"
     }
   },
   "webhooks": {
@@ -399,7 +421,10 @@
         "isNot": "不是",
         "contains": "包含",
         "equals": "等於"
-      }
+      },
+      "fieldLabel": "篩選欄位",
+      "operatorLabel": "篩選運算符",
+      "valueLabel": "篩選值"
     },
     "columns": {
       "url": "URL",
@@ -480,7 +505,8 @@
       "deleted": "範本刪除成功",
       "deleteFailed": "刪除範本失敗：{{message}}",
       "copied": "已複製範本名稱"
-    }
+    },
+    "sessionSelect": "工作階段"
   },
   "apiKeys": {
     "title": "API 金鑰",
@@ -552,7 +578,10 @@
     },
     "empty": {
       "title": "找不到記錄",
-      "description": "執行操作後，審計記錄會顯示在這裡"
+      "description": "執行操作後，審計記錄會顯示在這裡",
+      "filteredTitle": "本頁無符合項目",
+      "filteredDescription": "搜尋只會過濾目前頁面。請清除搜尋、翻頁，或使用嚴重程度篩選在伺服器端收窄。",
+      "filteredServerDescription": "沒有符合這些篩選條件的日誌。請調整嚴重程度篩選以擴大搜尋範圍。"
     }
   },
   "messageTester": {
@@ -756,7 +785,8 @@
     "toasts": {
       "saveFailed": "儲存失敗"
     },
-    "envPinNote": "已由環境變數鎖定 — 這是正在運行的值；在取消設定該變數之前，儀表板的變更不會生效。",
+    "envPinNote": "已由環境變數 {{name}} 鎖定 — 這是正在運行的值；在取消設定該變數之前，儀表板的變更不會生效。",
+    "pendingRestartNote": "已儲存，但尚未生效 — 請重新啟動伺服器以套用此變更。",
     "migration": {
       "title": "請注意 — 此操作會更改資料後端",
       "dbWarning": "新資料庫會以空白狀態啟動。請立即下載目前資料的備份（趁仍在舊資料庫時），然後在重新啟動後還原。",
@@ -767,6 +797,8 @@
       "export": "匯出資料",
       "import": "匯入資料",
       "exportFailed": "無法匯出資料",
+      "exportPartialTitle": "Backup is missing some media",
+      "exportPartial": "{{count}} attachment payload(s) exceeded the export media budget and were saved as placeholders. The messages restore; their media does not.",
       "importFailed": "無法匯入資料",
       "importOk": "資料已匯入",
       "importConfirm": "匯入將以備份（{{rows}} 列）取代所有目前資料。此操作無法復原。是否繼續？",
@@ -810,6 +842,7 @@
     "installModal": {
       "title": "安裝外掛",
       "hint": "上載打包成 .zip 的外掛（內含 manifest.json）。啟用後會以沙盒方式執行。",
+      "trustWarning": "外掛會以閘道處理程序的完整權限執行——沙盒只能隔離當機，不能阻擋惡意程式碼。請只安裝你信任的外掛。",
       "choose": "選擇 .zip 檔案…",
       "tooLarge": "檔案超出 5 MB 上限。",
       "catalogHint": "直接從 OpenWA 外掛目錄安裝。.zip 檔案由伺服器透過 SSRF 防護取得，然後經過驗證並在沙箱中執行。",

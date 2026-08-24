@@ -38,6 +38,11 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
+          # Both trees are installed in this job (the dashboard audit below), so both lockfiles
+          # belong in the cache key.
+          cache-dependency-path: |
+            package-lock.json
+            dashboard/package-lock.json
 
       - name: Install dependencies
         run: npm ci
@@ -58,9 +63,21 @@ jobs:
           echo "Tag $TAG matches package.json $PKG_VERSION"
 
       - name: Security audit
-        # Matches ci.yml's threshold: high (not critical). The release gate must not be laxer than the
-        # PR gate, or a HIGH advisory blocked on every PR would still sail through at tag time.
-        run: npm audit --audit-level=high
+        # Matches ci.yml exactly, including its per-advisory allowlist. The release gate must not be
+        # laxer than the PR gate, or a HIGH advisory blocked on every PR would still sail through at
+        # tag time — and it must not be STRICTER either, or a tag fails on something main has already
+        # accepted, which is how a release stalls with nothing actionable to fix.
+        run: npm run check:audit
+
+      # Second tree, same rule. The dashboard's runtime deps are bundled into dashboard/dist and the
+      # published image serves them to every operator's browser, so the tag path must scan them for
+      # the same reason ci.yml's audit job now does — otherwise this gate is laxer than the PR gate
+      # for exactly the dependencies that reach a user.
+      - name: Install dashboard dependencies
+        run: cd dashboard && npm ci
+
+      - name: Security audit (dashboard)
+        run: cd dashboard && npm audit --audit-level=high
 
       - name: Run ESLint
         run: npm run lint
@@ -84,9 +101,44 @@ jobs:
       - name: Check OpenAPI snapshot is up to date
         run: npm run openapi:check
 
+      # The same gates ci.yml runs. Its comment there notes this workflow never ran them, which is
+      # the gap: a tag pushed with `--follow-tags` starts both workflows, and only the branch one
+      # could see an SDK left behind by a contract change. The release path has to stand on its own,
+      # and it is the path that actually publishes the image and the GitHub Release.
+      - name: Check SDK routes against the contract
+        run: npm run check:sdk-routes
+
+      - name: Check the contract is covered by every SDK
+        run: npm run check:sdk-coverage
+
+      - name: Check SDK webhook events against the contract
+        run: npm run check:sdk-events
+
+      - name: Check SDK docs cover the shipped client surface
+        run: npm run check:sdk-docs
+
+      # The typed-SDK wire-shape gate: the last lane gate ci.yml runs that this workflow lacked, so
+      # a tag could publish SDK builds whose mapped response types had drifted from the contract
+      # while the branch path would have caught it.
+      - name: Check contract shapes across the typed SDKs
+        run: npm run check:contract-shapes
+
   test:
     name: Test
     runs-on: ubuntu-latest
+    # Mirrors ci.yml's test job. Without this service the queue-on e2e suite self-skips and the
+    # release path reports green on a suite it never actually ran — the tag is the one place that
+    # must not be verified less than the branch it came from.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -102,8 +154,21 @@ jobs:
       - name: Run unit tests
         run: npm test -- --coverage
 
+      # jest's rootDir is src/, so the repo-level script specs run on the plain node runner and were
+      # absent from the tag path entirely.
+      - name: Run script unit tests
+        run: npm run test:scripts
+
+      # The repo-file drift specs (docs, trees, gates) run on the branch path; a tag is the one
+      # place that must not be verified less than the branch it came from.
+      - name: Run docs unit tests
+        run: npm run test:docs
+
       - name: Run e2e smoke tests
         run: npm run test:e2e
+        env:
+          REDIS_HOST: localhost
+          REDIS_PORT: '6379'
 
   test-postgres:
     name: Test (PostgreSQL migrations)
@@ -150,10 +215,16 @@ jobs:
           DATABASE_NAME: openwa
 
       # Runtime-proves BuiltInFtsProvider on Postgres (websearch_to_tsquery + ts_headline against the
-      # STORED body_ts tsvector). The spec self-skips unless DATABASE_TYPE=postgres, so it is a no-op
-      # in the default test job and only executes here against the postgres:16 service.
-      - name: Postgres FTS provider spec
-        run: npx jest src/database/migrations/__tests__/1782400000000-AddMessagesFts.pg.spec.ts
+      # STORED body_ts tsvector) and the boot-migration advisory lock (two concurrent migrators on
+      # one database). Both specs self-skip unless DATABASE_TYPE=postgres, so they are a no-op
+      # in the default test job and only execute here against the postgres:16 service.
+      - name: Postgres specs (FTS provider + boot-migration lock)
+        # --runInBand: same reason the CI job passes it — both specs issue DDL against the one
+        # shared service database, and jest's default file-parallelism races their catalog writes
+        # (the first v0.19.0 tag failed this step on `relation "messages" already exists` over a
+        # tree CI had passed minutes earlier). The lock spec's own two-migrator race is in-file
+        # (Promise.all) and unaffected by runInBand.
+        run: npx jest --runInBand src/database/migrations/__tests__/1782400000000-AddMessagesFts.pg.spec.ts src/database/migrations/__tests__/pg-boot-migrations.pg.spec.ts
         env:
           DATABASE_TYPE: postgres
           DATABASE_HOST: localhost
@@ -181,6 +252,11 @@ jobs:
       - name: Run ESLint
         run: cd dashboard && npm run lint
 
+      # The root format:check globs are anchored at the repo root and never reach dashboard/, so
+      # this is the only gate on dashboard formatting — and it was present on the branch path only.
+      - name: Check formatting
+        run: cd dashboard && npm run format:check
+
       - name: Type-check dashboard tests
         run: cd dashboard && npm run typecheck
 
@@ -193,10 +269,87 @@ jobs:
       - name: Run dashboard unit tests
         run: cd dashboard && npm run test:unit
 
+  # Mirrors ci.yml's scripts-smoke job, which had no counterpart here at all: the shell scripts that
+  # ship inside the image were linted and exercised on the branch path and on nothing else.
+  scripts-smoke:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install sqlite3
+        # Bounded, and skipped when the runner image already ships the CLI. An unbounded apt-get
+        # against a slow mirror held this job open for over an hour with every other job already
+        # green, so the run never reported and main went without a signal.
+        timeout-minutes: 5
+        run: command -v sqlite3 >/dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends sqlite3; }
+
+      - name: Install shellcheck
+        # Runs its own update rather than inheriting one from the step above, which no longer
+        # always runs.
+        timeout-minutes: 5
+        run: command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck; }
+
+      - name: shellcheck every shell script
+        run: shellcheck docker-entrypoint.sh scripts/*.sh
+
+      - name: Run backup/restore smoke test
+        run: ./scripts/smoke-test-backup-restore.sh
+
+  # Mirrors ci.yml's chart job. The chart is published from the tag, so without this the only path
+  # that renders and validates it is the branch path — a chart that breaks between the last branch
+  # build and the tag ships unvalidated.
+  chart:
+    name: Helm chart and workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # For the behaviour check below. No `npm ci`: it imports only node: builtins, so pinning the
+      # runtime is the whole dependency — without this the step would silently take whatever Node the
+      # runner image happens to ship.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: helm lint
+        run: docker run --rm -v "$PWD/charts:/charts:ro" alpine/helm:4.2.3 lint /charts/openwa
+
+      # Two value sets: the defaults an operator gets, and every optional resource switched on, so a
+      # template that only breaks under a toggle cannot pass unnoticed.
+      - name: helm template
+        run: |
+          mkdir -p rendered
+          docker run --rm -v "$PWD/charts:/charts:ro" alpine/helm:4.2.3 \
+            template ci /charts/openwa > rendered/default.yaml
+          docker run --rm -v "$PWD/charts:/charts:ro" alpine/helm:4.2.3 \
+            template ci /charts/openwa \
+            --set ingress.enabled=true \
+            --set podDisruptionBudget.enabled=true \
+            --set serviceMonitor.enabled=true > rendered/toggled.yaml
+
+      # -ignore-missing-schemas so the ServiceMonitor CRD is skipped rather than failing the run;
+      # without it the toggled render exits 1 on a resource whose schema is not in the catalogue.
+      - name: Validate rendered manifests
+        run: |
+          docker run --rm -v "$PWD/rendered:/w:ro" ghcr.io/yannh/kubeconform:v0.8.0 \
+            -strict -ignore-missing-schemas -summary /w/default.yaml /w/toggled.yaml
+
+      # What the rendered chart would DO in a cluster, which neither helm lint nor kubeconform can
+      # see: config changes roll the pods, the startup budget exceeds the liveness budget, the
+      # metrics selector names one Service. Nothing here publishes the chart — operators install it
+      # from this ref — so the tag is the last gate it passes, and a chart that renders validly but
+      # misbehaves must not get past it.
+      - name: Check chart behaviour
+        run: npm run check:chart
+
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12 -color
+
   build:
     name: Build
     runs-on: ubuntu-latest
-    needs: [lint, test, dashboard]
+    needs: [lint, test, dashboard, scripts-smoke, chart]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -287,7 +440,7 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -336,6 +489,15 @@ jobs:
           sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Never serve the production stage's `apt-get update && apt-get install` from cache. That
+          # layer's cache key is its own command text, which does not change when Debian publishes a
+          # security update — so a cached hit silently installs whatever the apt index held when the
+          # layer was first built, and the release image ships known-vulnerable packages. It is not a
+          # theoretical risk: the first two v0.12.3 attempts installed chromium 150.0.7871.181 from a
+          # cached layer while bookworm-security already carried 151.0.7922.71 on BOTH architectures,
+          # and image-scan failed with 228 then 240 findings. The builder stage keeps its cache, so
+          # only the OS-package layer is rebuilt.
+          no-cache-filters: production
 
   # ──── Boot Smoke (amd64 + arm64) ──────────────────────────────────
   # The docker job proves the image BUILDS for both architectures; this proves the just-pushed image
@@ -351,11 +513,16 @@ jobs:
       packages: read
     needs: [docker]
     steps:
+      # Required by the non-root check below, which runs a script from the repo. Without it the
+      # step exits 127 and this job — the only gate between a root image and `latest` — fails on
+      # every tag instead of guarding anything.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -370,6 +537,15 @@ jobs:
         env:
           REPO: ${{ github.repository }}
         run: echo "ref=ghcr.io/${REPO,,}:smoke-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+
+      # The tag path is the one that promotes to `latest`, so it must not be laxer than the PR gate —
+      # the same rule this workflow's own audit step states. ci.yml verifies the root→openwa drop on
+      # the built image; without it here, a change leaving Node on uid 0 reaches `latest` through the
+      # only path that publishes it.
+      - name: Verify the image drops from root to the openwa user
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: OPENWA_SMOKE_IMAGE="$IMAGE" ./scripts/smoke-test-non-root.sh
 
       - name: Boot + liveness check on each architecture
         env:
@@ -433,7 +609,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -483,7 +659,7 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -493,7 +669,7 @@ jobs:
       # pull count lives (GHCR exposes no download metrics). Requires the DOCKERHUB_USERNAME /
       # DOCKERHUB_TOKEN repo secrets; without them this step fails before any tag is applied.
       - name: Login to Docker Hub
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

@@ -13,17 +13,54 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { planSteps, failureReason, run } = require('./postinstall.js');
+const { sanitizeEnv, planSteps, failureReason, run } = require('./postinstall.js');
 
 const OK = { status: 0, signal: null, error: null };
 
-/** Bare temp dir optionally holding a dashboard/ and/or the patch script. */
-function makeRoot({ dashboard = false, patcher = false } = {}) {
+/** Bare temp dir optionally holding a dashboard/ and/or the patch scripts. */
+function makeRoot({
+  dashboard = false,
+  patcher = false,
+  previewPatcher = false,
+  statusPatcher = false,
+  readySyncPatcher = false,
+  participantArityPatcher = false,
+  baileysPatcher = false,
+  baileysNewsletterPatcher = false,
+} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openwa-postinstall-'));
   if (dashboard) fs.mkdirSync(path.join(root, 'dashboard'));
-  if (patcher) {
+  if (
+    patcher ||
+    previewPatcher ||
+    statusPatcher ||
+    readySyncPatcher ||
+    participantArityPatcher ||
+    baileysPatcher ||
+    baileysNewsletterPatcher
+  ) {
     fs.mkdirSync(path.join(root, 'scripts'));
+  }
+  if (patcher) {
     fs.writeFileSync(path.join(root, 'scripts', 'patch-wwebjs-201832.js'), '// stub\n');
+  }
+  if (previewPatcher) {
+    fs.writeFileSync(path.join(root, 'scripts', 'patch-wwebjs-newsletter-preview.js'), '// stub\n');
+  }
+  if (statusPatcher) {
+    fs.writeFileSync(path.join(root, 'scripts', 'patch-wwebjs-status.js'), '// stub\n');
+  }
+  if (readySyncPatcher) {
+    fs.writeFileSync(path.join(root, 'scripts', 'patch-wwebjs-ready-sync.js'), '// stub\n');
+  }
+  if (participantArityPatcher) {
+    fs.writeFileSync(path.join(root, 'scripts', 'patch-wwebjs-participant-arity.js'), '// stub\n');
+  }
+  if (baileysPatcher) {
+    fs.writeFileSync(path.join(root, 'scripts', 'patch-baileys-appstate.js'), '// stub\n');
+  }
+  if (baileysNewsletterPatcher) {
+    fs.writeFileSync(path.join(root, 'scripts', 'patch-baileys-newsletter-create.js'), '// stub\n');
   }
   return root;
 }
@@ -44,11 +81,13 @@ test('planSteps: empty root plans nothing', () => {
 });
 
 test('planSteps: dashboard only plans the dashboard install (shell, inherited stdio)', () => {
-  const steps = planSteps(makeRoot({ dashboard: true }));
+  const root = makeRoot({ dashboard: true });
+  const steps = planSteps(root);
   assert.equal(steps.length, 1);
-  assert.equal(steps[0].command, 'npm run dashboard:ci');
+  assert.equal(steps[0].command, 'npm ci');
   assert.equal(steps[0].options.shell, true);
   assert.equal(steps[0].options.stdio, 'inherit');
+  assert.equal(steps[0].options.cwd, path.join(root, 'dashboard'));
 });
 
 test('planSteps: patcher only plans the best-effort backport via the current node', () => {
@@ -59,11 +98,69 @@ test('planSteps: patcher only plans the best-effort backport via the current nod
   assert.deepEqual(steps[0].args.slice(1), ['--best-effort']);
 });
 
+test('planSteps: newsletter preview patcher plans its own best-effort backport', () => {
+  const steps = planSteps(makeRoot({ previewPatcher: true }));
+  assert.equal(steps.length, 1);
+  assert.equal(steps[0].command, process.execPath);
+  assert.match(steps[0].args[0], /patch-wwebjs-newsletter-preview\.js$/);
+  assert.deepEqual(steps[0].args.slice(1), ['--best-effort']);
+});
+
 test('planSteps: both present plans dashboard first, patcher second', () => {
   const steps = planSteps(makeRoot({ dashboard: true, patcher: true }));
   assert.equal(steps.length, 2);
-  assert.equal(steps[0].command, 'npm run dashboard:ci');
+  assert.equal(steps[0].command, 'npm ci');
   assert.equal(steps[1].command, process.execPath);
+});
+
+test('planSteps: status patcher plans its own best-effort repair', () => {
+  const steps = planSteps(makeRoot({ statusPatcher: true }));
+  assert.equal(steps.length, 1);
+  assert.equal(steps[0].command, process.execPath);
+  assert.match(steps[0].args[0], /patch-wwebjs-status\.js$/);
+  assert.deepEqual(steps[0].args.slice(1), ['--best-effort']);
+});
+
+test('planSteps: ready-sync patcher plans its own best-effort repair', () => {
+  const steps = planSteps(makeRoot({ readySyncPatcher: true }));
+  assert.equal(steps.length, 1);
+  assert.equal(steps[0].command, process.execPath);
+  assert.match(steps[0].args[0], /patch-wwebjs-ready-sync\.js$/);
+  assert.deepEqual(steps[0].args.slice(1), ['--best-effort']);
+});
+
+test('planSteps: participant-arity patcher plans its own best-effort repair', () => {
+  const steps = planSteps(makeRoot({ participantArityPatcher: true }));
+  assert.equal(steps.length, 1);
+  assert.equal(steps[0].command, process.execPath);
+  assert.match(steps[0].args[0], /patch-wwebjs-participant-arity\.js$/);
+  assert.deepEqual(steps[0].args.slice(1), ['--best-effort']);
+});
+
+test('planSteps: dashboard and all patchers run in stable order', () => {
+  const steps = planSteps(
+    makeRoot({
+      dashboard: true,
+      patcher: true,
+      previewPatcher: true,
+      statusPatcher: true,
+      readySyncPatcher: true,
+      participantArityPatcher: true,
+      baileysPatcher: true,
+      baileysNewsletterPatcher: true,
+    }),
+  );
+  // One assertion per patcher on disk: the test is named for ALL of them, so a patcher that is
+  // planned but never named here would leave the claim false while the suite stayed green.
+  assert.equal(steps.length, 8);
+  assert.equal(steps[0].command, 'npm ci');
+  assert.match(steps[1].args[0], /patch-wwebjs-201832\.js$/);
+  assert.match(steps[2].args[0], /patch-wwebjs-newsletter-preview\.js$/);
+  assert.match(steps[3].args[0], /patch-wwebjs-status\.js$/);
+  assert.match(steps[4].args[0], /patch-wwebjs-ready-sync\.js$/);
+  assert.match(steps[5].args[0], /patch-wwebjs-participant-arity\.js$/);
+  assert.match(steps[6].args[0], /patch-baileys-appstate\.js$/);
+  assert.match(steps[7].args[0], /patch-baileys-newsletter-create\.js$/);
 });
 
 test('run: nothing to do exits 0 and never spawns', () => {
@@ -82,7 +179,7 @@ test('run: non-zero dashboard install exits 1 and never reaches the patcher (fai
   const { calls, spawn } = fakeSpawn([{ status: 1, signal: null, error: null }]);
   assert.equal(run(makeRoot({ dashboard: true, patcher: true }), spawn), 1);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].command, 'npm run dashboard:ci');
+  assert.equal(calls[0].command, 'npm ci');
 });
 
 test('run: spawn error (npm not found) exits 1', () => {
@@ -106,4 +203,55 @@ test('failureReason: maps each spawnSync outcome to a cause (null = success)', (
   assert.equal(failureReason({ status: 2, signal: null, error: null }), 'exit code 2');
   assert.equal(failureReason({ status: null, signal: 'SIGKILL', error: null }), 'killed by SIGKILL');
   assert.match(failureReason({ status: null, signal: null, error: new Error('boom') }), /failed to start — boom/);
+});
+
+test('sanitizeEnv: strips allow-scripts environment variables across case and separator variations', () => {
+  const input = {
+    PATH: '/usr/bin',
+    npm_config_allow_scripts: 'true',
+    NPM_CONFIG_ALLOW_SCRIPTS: 'true',
+    'npm_config_allow-scripts': 'true',
+    'NPM_CONFIG_ALLOW-SCRIPTS': 'true',
+    npm_config_allow_scripts_extra: 'keep',
+  };
+  const result = sanitizeEnv(input);
+  assert.deepEqual(result, {
+    PATH: '/usr/bin',
+    npm_config_allow_scripts_extra: 'keep',
+  });
+  assert.equal(input.npm_config_allow_scripts, 'true');
+});
+
+test('planSteps: strips npm_config_allow_scripts from step options.env to avoid EALLOWSCRIPTS in npm 11', () => {
+  const env = {
+    PATH: '/usr/bin',
+    npm_config_allow_scripts: 'true',
+    NPM_CONFIG_ALLOW_SCRIPTS: 'true',
+  };
+  const steps = planSteps(
+    makeRoot({
+      dashboard: true,
+      patcher: true,
+      previewPatcher: true,
+      statusPatcher: true,
+      readySyncPatcher: true,
+      baileysPatcher: true,
+    }),
+    env,
+  );
+  assert.equal(steps.length, 6);
+  for (const step of steps) {
+    assert.equal('npm_config_allow_scripts' in step.options.env, false);
+    assert.equal('NPM_CONFIG_ALLOW_SCRIPTS' in step.options.env, false);
+    assert.equal(step.options.env.PATH, '/usr/bin');
+  }
+});
+
+test('run: passes sanitized environment to spawn calls', () => {
+  const { calls, spawn } = fakeSpawn([OK]);
+  const env = { PATH: '/usr/bin', npm_config_allow_scripts: 'true' };
+  run(makeRoot({ dashboard: true }), spawn, env);
+  assert.equal(calls.length, 1);
+  assert.equal('npm_config_allow_scripts' in calls[0].options.env, false);
+  assert.equal(calls[0].options.env.PATH, '/usr/bin');
 });

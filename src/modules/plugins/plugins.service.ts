@@ -1,21 +1,14 @@
-import {
-  Injectable,
-  NotFoundException,
-  BadRequestException,
-  ConflictException,
-  ForbiddenException,
-  HttpException,
-} from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ConflictException, HttpException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
-import { PluginLoaderService, PluginStatus, resolvePluginMainPath } from '../../core/plugins';
+import { PluginLoaderService, PluginStatus, resolvePluginEntryPath } from '../../core/plugins';
 import { pluginUpdateBackupDirName, pluginUpdateStagingDirName } from '../../core/plugins';
 import type { PluginConfigSchema } from '../../core/plugins';
 import { PluginDto } from './dto/plugin.dto';
 import { redactSecretConfig, restoreSecretConfig } from './redact-config';
 import { parsePluginPackage } from './plugin-installer';
-import { assertDownloadSha256, fetchSafeBuffer } from './plugin-download';
+import { assertDownloadSha256, assertPluginInstallUrl, fetchSafeBuffer } from './plugin-download';
 import { annotateCatalog, CatalogEntry, CatalogPlugin } from './catalog';
 import { redactSsrfError } from '../../common/security/ssrf-guard';
 import { createLogger } from '../../common/services/logger.service';
@@ -158,7 +151,18 @@ export class PluginsService {
     const plugin = this.pluginLoader.getPlugin(id);
 
     if (!plugin) {
-      throw new NotFoundException(`Plugin ${id} not found`);
+      // Not loaded, but the registry may still hold its entry — and with it `enabledByOperator`, the
+      // standing instruction to enable it on every boot. A plugin whose code went missing (an
+      // interrupted update, a package directory outside the data volume) is exactly that case: there is
+      // no runtime to tear down, so `disablePlugin` can never run, and until now the operator had no way
+      // to withdraw the decision at all. `disable` expresses intent rather than performing a runtime
+      // operation, so honour it against the registry; reinstalling the code must not silently resurrect
+      // a plugin the operator switched off. A 404 now means only what it should: an id nobody knows.
+      if (!this.pluginLoader.getRegistryEntry(id)) {
+        throw new NotFoundException(`Plugin ${id} not found`);
+      }
+      this.pluginLoader.setOperatorEnabled(id, false);
+      return { success: true, message: `Plugin ${id} is not loaded; it will not be enabled on boot` };
     }
 
     if (plugin.status !== PluginStatus.ENABLED) {
@@ -180,20 +184,14 @@ export class PluginsService {
     }
   }
 
-  updateSessions(id: string, sessions: string[], allowedSessions?: string[] | null): PluginDto {
+  updateSessions(id: string, sessions: string[]): PluginDto {
     const plugin = this.pluginLoader.getPlugin(id);
     if (!plugin) {
       throw new NotFoundException(`Plugin ${id} not found`);
     }
-    // A session-restricted key (non-empty allowedSessions) may only activate the plugin for sessions
-    // in its own scope — never '*' (all) or another tenant's session. An unrestricted key (null/empty)
-    // is the normal dashboard/admin path and may activate for any session, including '*'.
-    if (allowedSessions && allowedSessions.length > 0) {
-      const outOfScope = sessions.filter(s => s === '*' || !allowedSessions.includes(s));
-      if (outOfScope.length > 0) {
-        throw new ForbiddenException(`API key not authorized for session(s): ${outOfScope.join(', ')}`);
-      }
-    }
+    // Full-replacement PUT: setPluginSessions overwrites the ENTIRE activeSessions array. The route
+    // is fenced with @RequireUnscopedKey, so only an unrestricted key can reach this — a scoped key
+    // must never be allowed to delete another tenant's activation by sending [] or its own session.
     try {
       this.pluginLoader.setPluginSessions(id, sessions);
     } catch (error) {
@@ -283,10 +281,12 @@ export class PluginsService {
     if (!entry || typeof entry !== 'string') {
       throw new NotFoundException(`Plugin ${id} has no config UI`);
     }
-    const base = path.resolve(this.pluginLoader.getPluginsDir(), id);
+    // Anchored to the package's own directory: the plugin is loaded by this point, and a package
+    // found in the legacy plugins directory does not live under the configured root.
+    const base = path.resolve(this.pluginLoader.getPluginPackageDir(id));
     let file: string;
     try {
-      file = resolvePluginMainPath(this.pluginLoader.getPluginsDir(), id, entry);
+      file = resolvePluginEntryPath(base, entry);
     } catch {
       throw new NotFoundException(`Config UI entry not found for plugin ${id}`);
     }
@@ -315,22 +315,55 @@ export class PluginsService {
     if (this.pluginLoader.getPlugin(manifest.id)) {
       throw new ConflictException(`Plugin "${manifest.id}" is already installed`);
     }
-    const dir = path.join(this.pluginLoader.getPluginsDir(), manifest.id);
-    if (fs.existsSync(dir)) {
-      throw new ConflictException(`A plugin directory "${manifest.id}" already exists`);
+    const pluginsDir = this.pluginLoader.getPluginsDir();
+    const dir = path.join(pluginsDir, manifest.id);
+    // A surviving directory does not prove a surviving package. Under the shipped layout it is also
+    // the plugin's `ctx.storage` root, created the first time the plugin was enabled and left behind
+    // when the code goes (a container recreate with the packages in the image layer and the data on
+    // a volume). Reinstalling is the recovery the boot warning prescribes, so refuse only a
+    // directory the gateway never installed — a loaded plugin is already refused above.
+    const dirExisted = fs.existsSync(dir);
+    if (dirExisted) {
+      if (!this.pluginLoader.getRegistryEntry(manifest.id)) {
+        throw new ConflictException(`A plugin directory "${manifest.id}" already exists`);
+      }
+      // `existsSync` answers for the link's TARGET, so narrowing the guard above must not also
+      // narrow containment: a link planted at this path would send every write below — and the
+      // rollback's delete — wherever it points.
+      if (fs.realpathSync(dir) !== path.join(fs.realpathSync(pluginsDir), manifest.id)) {
+        throw new ConflictException(`A plugin directory "${manifest.id}" already exists`);
+      }
+      // Merging into a pre-existing directory means an entry path can already be occupied by a
+      // directory. Refusing here keeps that a conflict; writing into it fails with EISDIR, which
+      // the rollback below cannot clean up either.
+      for (const entry of entries) {
+        const dest = path.join(dir, entry.relPath);
+        if (fs.existsSync(dest) && fs.statSync(dest).isDirectory()) {
+          throw new ConflictException(`Cannot install "${manifest.id}": "${entry.relPath}" is a directory`);
+        }
+      }
     }
 
-    // Write the validated entries then load; roll back the directory on any failure so a bad
-    // package never leaves a half-installed plugin behind.
+    // Write the validated entries then load; roll back on any failure so a bad package never leaves
+    // a half-installed plugin behind. Into a pre-existing directory the rollback removes only the
+    // files this install actually wrote: the directory holds the operator's stored data, and
+    // deleting it to undo a failed reinstall would destroy exactly what the reinstall promised to
+    // keep.
+    const written: string[] = [];
     try {
       for (const entry of entries) {
         const dest = path.join(dir, entry.relPath);
         fs.mkdirSync(path.dirname(dest), { recursive: true });
         fs.writeFileSync(dest, entry.data);
+        written.push(dest);
       }
       this.pluginLoader.loadPlugin(dir);
     } catch (error) {
-      fs.rmSync(dir, { recursive: true, force: true });
+      if (dirExisted) {
+        for (const dest of written) fs.rmSync(dest, { force: true });
+      } else {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
       if (error instanceof HttpException) throw error;
       throw new BadRequestException(
         `Failed to install plugin: ${error instanceof Error ? error.message : String(error)}`,
@@ -341,14 +374,35 @@ export class PluginsService {
   }
 
   /**
-   * Install a plugin from an HTTPS URL: download the .zip through the SSRF guard (host validated,
-   * connection pinned, redirects refused, size-capped), then run the exact same validate-write-load
+   * Install a plugin from a URL: download the .zip through the SSRF guard (host validated,
+   * connection pinned, redirects followed with every hop re-validated through the guard and the
+   * chain capped at 5 hops, size-capped), then run the exact same validate-write-load
    * pipeline as an uploaded package. The downloaded buffer is treated as untrusted, identical to an
    * upload. When the URL pins a digest (`#sha256=<hex>` fragment — the only honored marker; query
    * params are deliberately ignored, see plugin-download.ts), the bytes MUST match it: a mismatch
    * means the package was substituted in transit and the install fails closed.
    */
   async installFromUrl(url: string): Promise<PluginDto> {
+    const buffer = await this.downloadPackage(url);
+    // Peek the id (the SSRF download stays outside the lock) so the install — which writes the plugin
+    // directory — is serialized against any concurrent uninstall/update of the same id.
+    const { manifest } = parsePluginPackage(buffer);
+    return this.serialize(manifest.id, () => Promise.resolve(this.install({ buffer })));
+  }
+
+  /**
+   * The single funnel every URL-sourced package download passes through (install + update):
+   * enforce the transport rule (https, or plain http carrying a `#sha256=` content pin) BEFORE any
+   * fetch, download through the SSRF-guarded path, then verify a pinned digest against the bytes.
+   * The remote catalog is deliberately NOT routed through here — its URL is operator configuration
+   * and its JSON is data, not executable code.
+   */
+  private async downloadPackage(url: string): Promise<Buffer> {
+    try {
+      assertPluginInstallUrl(url);
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+    }
     const maxBytes = this.configService.get<number>('plugins.downloadMaxBytes') ?? 5 * 1024 * 1024;
     let buffer: Buffer;
     try {
@@ -365,10 +419,7 @@ export class PluginsService {
         `Plugin download integrity check failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    // Peek the id (the SSRF download stays outside the lock) so the install — which writes the plugin
-    // directory — is serialized against any concurrent uninstall/update of the same id.
-    const { manifest } = parsePluginPackage(buffer);
-    return this.serialize(manifest.id, () => Promise.resolve(this.install({ buffer })));
+    return buffer;
   }
 
   /**
@@ -436,11 +487,15 @@ export class PluginsService {
     }
 
     const wasEnabled = plugin.status === PluginStatus.ENABLED;
-    const pluginsDir = this.pluginLoader.getPluginsDir();
-    const dir = path.join(pluginsDir, id);
-    // Dot-prefixed siblings inside pluginsDir: same filesystem (so the renames stay EXDEV-safe) but
-    // skipped by the loader's directory scan, so a crash mid-update can't leave them loaded as a
-    // duplicate. The loader's boot-time recovery keys off these exact names.
+    // The tree the package was loaded from, which is the legacy plugins directory for a host that
+    // has not migrated. Updating in the configured root instead renames a directory that is not
+    // there, after unloadPlugin has already dropped the plugin from the runtime.
+    const dir = this.pluginLoader.getPluginPackageDir(id);
+    const pluginsDir = path.dirname(dir);
+    // Dot-prefixed siblings inside that same directory: same filesystem (so the renames stay
+    // EXDEV-safe) but skipped by the loader's directory scan, so a crash mid-update can't leave them
+    // loaded as a duplicate. The loader's boot-time recovery runs per scanned directory and keys off
+    // these exact names, so it reconciles the legacy tree too.
     const backup = path.join(pluginsDir, pluginUpdateBackupDirName(id));
     const staging = path.join(pluginsDir, pluginUpdateStagingDirName(id));
 
@@ -558,22 +613,7 @@ export class PluginsService {
 
   /** Update an installed plugin by downloading the new package from a URL (SSRF-guarded), then in place. */
   async updateFromUrl(id: string, url: string): Promise<PluginDto> {
-    const maxBytes = this.configService.get<number>('plugins.downloadMaxBytes') ?? 5 * 1024 * 1024;
-    let buffer: Buffer;
-    try {
-      buffer = await fetchSafeBuffer(url, { maxBytes });
-    } catch (error) {
-      throw new BadRequestException(
-        `Failed to download plugin from URL: ${redactSsrfError(error, logger, 'plugin download')}`,
-      );
-    }
-    try {
-      assertDownloadSha256(url, buffer);
-    } catch (error) {
-      throw new BadRequestException(
-        `Plugin download integrity check failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+    const buffer = await this.downloadPackage(url);
     return this.updatePackage(id, buffer);
   }
 
@@ -583,8 +623,11 @@ export class PluginsService {
   }
 
   private async uninstallInner(id: string): Promise<{ success: boolean; message: string }> {
-    const plugin = this.pluginLoader.getPlugin(id);
-    if (!plugin) {
+    // As in `disable`: not loaded is not unknown. A plugin whose code went missing still owns a
+    // registry entry with its config and secrets, and `uninstallPlugin` already tolerates having no
+    // runtime to tear down — so removing it is the one recovery left when the package cannot be
+    // obtained again. A 404 means only what it should: an id nobody knows.
+    if (!this.pluginLoader.getPlugin(id) && !this.pluginLoader.getRegistryEntry(id)) {
       throw new NotFoundException(`Plugin ${id} not found`);
     }
 

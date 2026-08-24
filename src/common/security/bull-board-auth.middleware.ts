@@ -7,6 +7,7 @@ import { AuditService } from '../../modules/audit/audit.service';
 import { AuditAction } from '../../modules/audit/entities/audit-log.entity';
 import { KeyRateLimiter, readIpRateLimitConfig } from '../../modules/mcp/mcp-rate-limit';
 import { resolveClientIp } from '../utils/ip';
+import { setRequestActor } from '../services/request-context';
 
 /**
  * Protects the Bull Board UI (/admin/queues).
@@ -31,6 +32,8 @@ import { resolveClientIp } from '../utils/ip';
  *    This is a boundary trace of queue-mutation attempts reaching the Bull Board router (the UI's
  *    retry/remove/pause actions are POSTs); it deliberately does NOT model Bull Board's internal
  *    per-action outcomes, which are invisible from middleware.
+ * Session-restricted keys are refused outright: the board is deployment-global, so a key confined to
+ * a subset of sessions has no scope to enforce against it.
  * Both are fire-and-forget: audit logging is best-effort and must never affect the auth decision.
  */
 @Injectable()
@@ -67,8 +70,26 @@ export class BullBoardAuthMiddleware implements NestMiddleware {
       }
 
       const apiKey = await this.authService.validateApiKey(rawKey, clientIp);
+
+      // Stamp the resolved actor before the two authorization checks below, matching ApiKeyGuard.
+      // Both of those throw, and the catch that audits the denial cannot see `apiKey` — it is a const
+      // inside this try. Without the stamp, a denial on the most privileged UI in the deployment was
+      // recorded against an IP alone, so the operator could not tell which key had tried to reach the
+      // queue dashboard without ADMIN, or which confined key had tried to escape its session fence.
+      // This mount runs inside the request-context scope (requestContextMiddleware is installed
+      // ahead of it in main.ts), so the stamp reaches AuditService.
+      setRequestActor({ apiKeyId: apiKey.id, apiKeyName: apiKey.name, ipAddress: clientIp });
+
       if (!this.authService.hasPermission(apiKey, ApiKeyRole.ADMIN)) {
         throw new ForbiddenException('Admin role required to access the queue dashboard');
+      }
+
+      // The board shows and mutates every queue in the deployment, and carries no session dimension
+      // to scope against. validateApiKey above is called without a session id, so a key restricted to
+      // specific sessions passes its scope check by default — reject it here instead. This mirrors
+      // @RequireUnscopedKey on the REST surface, which cannot reach this raw-Express mount.
+      if ((apiKey.allowedSessions?.length ?? 0) > 0) {
+        throw new ForbiddenException('API keys restricted to specific sessions cannot access the queue dashboard');
       }
 
       // Boundary trace of queue-mutation attempts. GET/HEAD are the UI's read/poll traffic; every

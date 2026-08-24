@@ -1,4 +1,4 @@
-import { readFileSync } from 'fs';
+import { readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { DockerService, MANAGED_DOCKER_PROFILES } from './docker.service';
 
@@ -235,6 +235,147 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
     expect(cfg.Env).toBeUndefined();
   });
 
+  // docker-compose.yml has NO env_file — the `environment:` list is an explicit allow-list, so a
+  // variable missing from it never reaches the container and the feature it gates stays silently
+  // off however the operator's .env is written. Exactly how AUTO_START_SESSIONS was inert before
+  // v0.12.0, how SEND_PACING_* / MEDIA_CONVERSION_* shipped inert alongside CHAT_MEDIA_*, and how
+  // the v0.20.0 WEBHOOK_SSRF_REDIRECTS / PLUGIN_INSTALL_REQUIRE_PIN opt-outs spent a release
+  // unreachable from .env. Family-by-family and strict-boolean derivations only ever caught these
+  // one prefix or one type at a time, so the rule is now wholesale: every knob .env.example
+  // documents that the app actually reads must be forwarded in BOTH compose files, unless a
+  // NOT_FORWARDED entry names it with a reason. env-precedence.spec.ts covers the other direction
+  // (every blank forward must be cleared when blank, and must not ship uncommented in .env.example).
+  const apiForwards = (file: string): Set<string> => {
+    const text = readFileSync(join(__dirname, '../../..', file), 'utf8');
+    const keys = new Set<string>();
+    for (const line of text.split('\n')) {
+      const match = /^\s*-\s*([A-Z0-9_]+)=/.exec(line);
+      if (match) keys.add(match[1]);
+    }
+    return keys;
+  };
+
+  /** Keys .env.example documents (commented or not): `#?KEY=`. */
+  const documentedKeys = (): Set<string> => {
+    const example = readFileSync(join(__dirname, '../../../.env.example'), 'utf8');
+    const keys = new Set<string>();
+    for (const match of example.matchAll(/^\s*#?\s*([A-Z][A-Z0-9_]{2,})=/gm)) keys.add(match[1]);
+    return keys;
+  };
+
+  /**
+   * Keys the backend reads from the environment, excluding specs. Beyond the direct
+   * `process.env.KEY` form, three indirections appear in src and must count as reads, or a knob
+   * routed through one of them ships unreachable while the gate stays green:
+   *   `env.KEY` / `env['KEY']`: a parameter defaulting to `process.env` (reapers, rate limits)
+   *   `xyzEnv('KEY')`:          env-helper wrappers (resolveNonNegativeIntEnv & friends)
+   *   `.get('KEY')`:            ConfigService.get with an UPPER_SNAKE literal (METRICS_TOKEN)
+   */
+  const READ_PATTERNS: RegExp[] = [
+    /process\.env\.([A-Z][A-Z0-9_]{2,})/g,
+    /\benv\??\.([A-Z][A-Z0-9_]{2,})/g,
+    /\benv\[\s*['"]([A-Z][A-Z0-9_]{2,})['"]\s*\]/g,
+    /\b[A-Za-z]+Env\(\s*['"]([A-Z][A-Z0-9_]{2,})['"]/g,
+    /\.get<[^>]*>\(\s*['"]([A-Z][A-Z0-9_]{2,})['"]\s*\)/g,
+    /\.get\(\s*['"]([A-Z][A-Z0-9_]{2,})['"]\s*\)/g,
+  ];
+  const readKeys = (): Set<string> => {
+    const walk = (dir: string): string[] =>
+      readdirSync(dir, { withFileTypes: true }).flatMap(entry =>
+        entry.isDirectory()
+          ? walk(join(dir, entry.name))
+          : entry.name.endsWith('.ts') && !entry.name.endsWith('.spec.ts')
+            ? [join(dir, entry.name)]
+            : [],
+      );
+    const keys = new Set<string>();
+    for (const file of walk(join(__dirname, '../../..', 'src'))) {
+      const src = readFileSync(file, 'utf8');
+      for (const pattern of READ_PATTERNS) {
+        for (const match of src.matchAll(pattern)) keys.add(match[1]);
+      }
+    }
+    return keys;
+  };
+
+  // Deliberately NOT forwarded. Each entry states why, so adding a key here is a decision rather
+  // than an omission. Shared by both files unless a per-file entry overrides the reason.
+  const NOT_FORWARDED: Record<string, Record<string, string>> = {
+    'docker-compose.yml': {
+      // Owned by the dashboard's Infrastructure page, which writes data/.env.generated on the mounted
+      // volume — that file IS read inside the container, so these are settable, just not via .env.
+      POSTGRES_BUILTIN: 'dashboard-managed',
+      REDIS_BUILTIN: 'dashboard-managed',
+      MINIO_BUILTIN: 'dashboard-managed',
+      DATABASE_SSL: 'dashboard-managed',
+      DATABASE_SSL_REJECT_UNAUTHORIZED: 'dashboard-managed',
+      QUEUE_ENABLED: 'dashboard-managed (.env.example documents that a host value is not forwarded)',
+      // A typo or an absent value leaves these at the SECURE / documented-default state, so not
+      // forwarding them cannot degrade a deployment.
+      WEBHOOK_SSRF_PROTECT: 'fails safe (default on)',
+      ALLOW_DEV_API_KEY: 'refused outright in production',
+    },
+    'docker-compose.dev.yml': {
+      POSTGRES_BUILTIN: 'dashboard-managed',
+      REDIS_BUILTIN: 'dashboard-managed',
+      MINIO_BUILTIN: 'dashboard-managed',
+      DATABASE_SSL: 'dashboard-managed',
+      DATABASE_SSL_REJECT_UNAUTHORIZED: 'dashboard-managed',
+      WEBHOOK_SSRF_PROTECT: 'fails safe (default on)',
+      // The dev stack manages no built-in datastores; its daemon is the host's local socket, and a
+      // stray DOCKER_HOST would point the app at an unrelated daemon.
+      DOCKER_HOST: 'local socket is the dev default (production pins its socket-proxy)',
+    },
+  };
+
+  it.each(['docker-compose.yml', 'docker-compose.dev.yml'])(
+    '%s forwards every documented knob the app reads, or names it in the allowlist',
+    file => {
+      const documented = documentedKeys();
+      const read = readKeys();
+      // Guards the derivation: either set silently matching nothing would make the test vacuous.
+      expect(documented.size).toBeGreaterThan(150);
+      expect([...documented].filter(key => read.has(key)).length).toBeGreaterThan(120);
+
+      const forwarded = apiForwards(file);
+      const allowlist = NOT_FORWARDED[file];
+      const required = [...documented].filter(key => read.has(key));
+      expect(required.filter(key => !forwarded.has(key) && !(key in allowlist))).toEqual([]);
+
+      // Keep the allowlist honest in the other direction too: an entry that IS forwarded, or that is
+      // no longer a documented knob the app reads, is stale and should be deleted.
+      const stale = Object.keys(allowlist).filter(key => forwarded.has(key) || !documented.has(key) || !read.has(key));
+      expect(stale).toEqual([]);
+    },
+  );
+
+  // A compose `environment:` entry overrides the image ENV even when it renders BLANK, and the blank
+  // is then cleared by load-env, so a `- PUPPETEER_EXECUTABLE_PATH=${PUPPETEER_EXECUTABLE_PATH:-}`
+  // forward deletes the Dockerfile's path inside the container and puppeteer falls back to a
+  // bundled Chromium the image deliberately does not ship (PUPPETEER_SKIP_CHROMIUM_DOWNLOAD). The
+  // forward must therefore carry the image's own value as its default, kept in sync by this test.
+  it('forwards PUPPETEER_EXECUTABLE_PATH with the Dockerfile default, not blank', () => {
+    const imageValue = /^ENV PUPPETEER_EXECUTABLE_PATH=(\S+)$/m.exec(
+      readFileSync(join(__dirname, '../../../Dockerfile'), 'utf8'),
+    )?.[1];
+    expect(imageValue).toBeDefined();
+    for (const file of ['docker-compose.yml', 'docker-compose.dev.yml']) {
+      const line = readFileSync(join(__dirname, '../../..', file), 'utf8')
+        .split('\n')
+        .find(l => l.trim().startsWith('- PUPPETEER_EXECUTABLE_PATH='));
+      expect(line?.trim()).toBe(`- PUPPETEER_EXECUTABLE_PATH=\${PUPPETEER_EXECUTABLE_PATH:-${imageValue}}`);
+    }
+  });
+
+  it('redis: sets the noeviction maxmemory policy BullMQ requires, on both launch paths', async () => {
+    const cfg = await capture('redis');
+    // The parity assertion above only proves the two launch paths AGREE — dropping the flag from
+    // both would keep it green. BullMQ needs noeviction: under any other policy Redis may evict
+    // queue keys once maxmemory is reached, losing queued jobs with no error surfaced anywhere.
+    expect(compose.services.redis.command).toContain('--maxmemory-policy noeviction');
+    expect(cfg.Cmd).toEqual(expect.arrayContaining(['--maxmemory-policy', 'noeviction']));
+  });
+
   it('redis: publishes no host ports, like compose', async () => {
     const cfg = await capture('redis');
     expect(compose.services.redis.ports).toBeUndefined();
@@ -277,5 +418,36 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
       '9000/tcp': [{ HostIp: '127.0.0.1', HostPort: '9000' }],
       '9001/tcp': [{ HostIp: '127.0.0.1', HostPort: '9001' }],
     });
+  });
+});
+
+/**
+ * The image's pg_dump/psql must never be OLDER than the Postgres it talks to: pg_dump refuses a
+ * newer server outright ("aborting because of server version mismatch"), so an in-container
+ * backup of a DATABASE_TYPE=postgres deployment fails on version alone. The server major is
+ * declared once for the compose stack and again for the container the app orchestrates itself,
+ * while the client major lives in the Dockerfile, so bumping either server silently breaks backups
+ * until this fails.
+ */
+describe('PostgreSQL client is not older than the servers the stack ships', () => {
+  const root = join(__dirname, '../../..');
+
+  const major = (file: string, pattern: RegExp): number => {
+    const match = readFileSync(join(root, file), 'utf8').match(pattern);
+    if (!match) throw new Error(`could not read a Postgres major version from ${file} via ${String(pattern)}`);
+    return Number(match[1]);
+  };
+
+  it('the Dockerfile client covers both the compose server and the managed-container server', () => {
+    const client = major('Dockerfile', /postgresql-client-(\d+)/);
+    const composeServer = major('docker-compose.yml', /image:\s*postgres:(\d+)/);
+    const managedServer = major('src/modules/docker/docker.service.ts', /image: 'postgres:(\d+)/);
+
+    // Reported together so a failure names every version at once rather than the first mismatch.
+    expect({
+      client,
+      composeServerCovered: composeServer <= client,
+      managedServerCovered: managedServer <= client,
+    }).toEqual({ client, composeServerCovered: true, managedServerCovered: true });
   });
 });

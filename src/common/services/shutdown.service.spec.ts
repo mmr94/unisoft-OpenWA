@@ -86,9 +86,9 @@ describe('ShutdownService.shutdown (idempotent, bounded grace)', () => {
     expect(cb).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps the 3s drain window when NODE_ENV is UNSET (a bare `docker run` / k8s pod)', async () => {
-    // Regression guard: the runtime image does not set NODE_ENV, so an unset env must NOT collapse the
-    // drain to 0 — only an explicit dev/test does. Otherwise a rolling deploy loses its readiness window.
+  it('keeps the 3s drain window when NODE_ENV is UNSET (an ad-hoc run outside the packaged runtimes)', async () => {
+    // Regression guard: an unset NODE_ENV must NOT collapse the drain to 0 — only an explicit
+    // dev/test does. Otherwise a rolling deploy loses its readiness window.
     delete process.env.NODE_ENV;
     delete process.env.SHUTDOWN_DELAY_MS;
     const { svc, cb } = svcWithCb();

@@ -22,5 +22,8 @@ public enum SessionStatus {
     @SerializedName("action_required")
     ACTION_REQUIRED,
     @SerializedName("failed")
-    FAILED
+    FAILED,
+    /** Engine unloaded after inactivity to free RAM; resuming needs no QR scan (Unisoft fork). */
+    @SerializedName("hibernated")
+    HIBERNATED
 }

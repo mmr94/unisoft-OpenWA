@@ -77,6 +77,8 @@ describe('IntegrationModule queue wiring (QUEUE_ENABLED conditional)', () => {
       require('../../core/plugins/plugins.module') as typeof import('../../core/plugins/plugins.module');
     const { AuditService } = require('../audit/audit.service') as typeof import('../audit/audit.service');
     const { EventsGateway } = require('../events/events.gateway') as typeof import('../events/events.gateway');
+    const { EngineRegistry } =
+      require('../../engine/engine-registry.service') as typeof import('../../engine/engine-registry.service');
     const { QueueModule } = require('../queue/queue.module') as typeof import('../queue/queue.module');
     const { QUEUE_NAMES } = require('../queue/queue-names') as typeof import('../queue/queue-names');
     /* eslint-enable @typescript-eslint/no-require-imports */
@@ -97,8 +99,12 @@ describe('IntegrationModule queue wiring (QUEUE_ENABLED conditional)', () => {
         { provide: getDataSourceToken('data'), useValue: dataSourceStub },
         { provide: AuditService, useValue: { record: jest.fn() } },
         { provide: EventsGateway, useValue: {} },
+        // IngressService's liveness probe reads this registry (EngineModule is @Global in the real
+        // app, imported once by app.module.ts; this spec never boots that far, so it is stubbed the
+        // same way as the other app-level globals above).
+        { provide: EngineRegistry, useValue: {} },
       ],
-      exports: [getDataSourceToken('data'), AuditService, EventsGateway],
+      exports: [getDataSourceToken('data'), AuditService, EventsGateway, EngineRegistry],
     };
 
     const moduleRef = await Test.createTestingModule({

@@ -32,50 +32,50 @@ export class IngressEvent {
   // Host-minted uuid (crypto.randomUUID()), NOT DB-generated — the id and the jobId (= deliveryId)
   // are decoupled on purpose. @PrimaryColumn, not @PrimaryGeneratedColumn.
   @PrimaryColumn()
-  id: string;
+  id!: string;
 
   @Column()
-  instanceId: string;
+  instanceId!: string;
 
   @Column()
-  pluginId: string;
+  pluginId!: string;
 
   @Column()
-  providerDeliveryId: string;
+  providerDeliveryId!: string;
 
   @Column()
-  route: string;
+  route!: string;
 
   // NULL once the dispatch outcome is recorded (see the storage-shape comment above). The reconciler
   // only replays 'pending' rows, which always still carry the payload. NULL on a 'pending' row is
   // unreadable history (e.g. imported without one) — the reconciler skips it loudly.
   @Column({ type: jsonColumnType(), nullable: true })
-  payload: { headers: Record<string, string>; query: Record<string, string>; body: string; rawBody: string } | null;
+  payload!: { headers: Record<string, string>; query: Record<string, string>; body: string; rawBody: string } | null;
 
   // sha256 hex of the rawBody, written at recordOrSkip. Survives payload retirement so operators can
   // still correlate a dedup row with a provider delivery without storing the payload. NULL on rows
   // that predate the column (no backfill — their payloads are retired anyway).
   @Column({ type: 'varchar', nullable: true })
-  payloadHash: string | null;
+  payloadHash!: string | null;
 
   @Column({ type: 'varchar', nullable: true })
-  sessionId: string | null;
+  sessionId!: string | null;
 
   // Nullable by design (see the IngressDispatchState comment above): NO DB default, because the
   // default 'pending' would also stamp pre-upgrade rows on the synchronize path and the reconciler
   // would replay the whole dedup log on deploy. New rows are 'pending' via recordOrSkip explicitly;
   // migration-managed DBs backfill existing rows to 'dispatched' instead.
   @Column({ type: 'varchar', nullable: true })
-  dispatchState: IngressDispatchState | null;
+  dispatchState!: IngressDispatchState | null;
 
   // Dispatch-attempt counter the reconciler caps its replay budget against; the live path bumps it
   // on a swallowed inline-dispatch failure so those retries count too.
   @Column({ type: 'int', default: 0 })
-  dispatchAttempts: number;
+  dispatchAttempts!: number;
 
   @Column({ type: dateColumnType(), nullable: true, transformer: DateTransformer })
-  lastDispatchAt: Date | null;
+  lastDispatchAt!: Date | null;
 
   @CreateDateColumn()
-  createdAt: Date;
+  createdAt!: Date;
 }

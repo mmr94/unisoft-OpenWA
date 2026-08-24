@@ -2,10 +2,11 @@ import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { LidMapping } from './lid-mapping.entity';
+import { userPart } from './wa-id';
 import { createLogger } from '../../common/services/logger.service';
 import { resolveNonNegativeIntEnv } from '../../config/configuration';
 
-// Default cap on the in-memory lid->phone mirror. Every other long-lived map in the audited surface is
+// Default cap on the in-memory lid->phone mirror. Every other long-lived map in the engine surface is
 // bounded (the per-session lidPhoneCache is 5000); the LID mirror was the lone exception. A miss falls
 // back to engine re-resolution, so the cap trades a re-resolution for bounded memory, never data loss.
 export const LID_MAPPING_CACHE_DEFAULT = 5000;
@@ -22,6 +23,12 @@ export interface LidMappingStore {
    * seen. A miss is warmed from the persisted table in the background, so a later read can hit.
    */
   getCached(lid: string): string | null | undefined;
+  /**
+   * Resolve any WA JID through the mirror: the phone digits for its user part, `null` when the lid
+   * is known-unresolved or never seen. The webhook filter match, automation-rule match, plugin
+   * engine reads, and status contact grouping all resolve through this one method so they agree.
+   */
+  resolveLid(jid: string): string | null;
   /** Sync reverse lookup: the lids currently mapped to this phone (used by the message from-filter). */
   lidsForPhone(phone: string): string[];
   /** Write-through, last-write-wins: update the cache + persist. A `null` phone records a negative result. */
@@ -48,7 +55,7 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
   private readonly phoneToLids = new Map<string, Set<string>>();
   /** Repository fallbacks in flight, one per lid, so a hot miss path can't stack duplicate queries. */
   private readonly pendingLookups = new Set<string>();
-  // 0 = unbounded (legacy behaviour). Every other long-lived map in the audited surface is bounded, so
+  // 0 = unbounded (legacy behaviour). Every other long-lived map in the engine surface is bounded, so
   // the default is finite; the env override exists for operators who explicitly want the old behaviour.
   private readonly maxCachedLids: number;
 
@@ -104,6 +111,10 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
     }
     this.warmFromTable(lid);
     return undefined;
+  }
+
+  resolveLid(jid: string): string | null {
+    return this.getCached(userPart(jid)) ?? null;
   }
 
   lidsForPhone(phone: string): string[] {

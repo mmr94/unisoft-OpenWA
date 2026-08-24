@@ -76,6 +76,18 @@ export class ApiKeyGuard implements CanActivate {
     // Validate API key
     const apiKey = await this.authService.validateApiKey(apiKeyHeader, clientIp, sessionId);
 
+    // Stamp the resolved actor into the per-request async context so downstream audit log writes —
+    // which fire from services deep in the call stack without DI access to the key — can attribute
+    // the action to this key + IP. Without this every audit row's apiKey/ipAddress column is blank
+    // because call sites pass only { sessionId } etc.
+    //
+    // Stamped HERE, the moment the key is known, rather than after the authorization checks below:
+    // both of those throw, and the catch that audits the denial cannot see `apiKey` (it is a const
+    // inside this method). Stamping afterwards meant every 403 the guard raised was recorded against
+    // an IP alone — behind NAT or a proxy without TRUSTED_PROXIES that IP is common to every tenant,
+    // so the operator could see that a key had been denied but not which one to revoke.
+    setRequestActor({ apiKeyId: apiKey.id, apiKeyName: apiKey.name, ipAddress: clientIp });
+
     if (requiredRole && !this.authService.hasPermission(apiKey, requiredRole)) {
       throw new ForbiddenException(`Insufficient permissions. Required: ${requiredRole}`);
     }
@@ -97,12 +109,6 @@ export class ApiKeyGuard implements CanActivate {
     // Expose the trusted-proxy-aware client IP so controllers (e.g. the audit trail on key lifecycle
     // ops) reuse the already-resolved value instead of re-deriving it.
     (request as Request & { clientIp?: string }).clientIp = clientIp;
-
-    // Stamp the resolved actor into the per-request async context so downstream audit log writes —
-    // which fire from services deep in the call stack without DI access to the key — can attribute
-    // the action to this key + IP. Without this every audit row's apiKey/ipAddress column is blank
-    // because call sites pass only { sessionId } etc.
-    setRequestActor({ apiKeyId: apiKey.id, apiKeyName: apiKey.name, ipAddress: clientIp });
 
     return true;
   }

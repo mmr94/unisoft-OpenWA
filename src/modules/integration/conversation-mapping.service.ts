@@ -3,6 +3,9 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { QueryDeepPartialEntity, Repository } from 'typeorm';
 import { ConversationMapping, HandoverState } from './entities/conversation-mapping.entity';
 import { isUniqueViolation } from '../../common/utils/db-errors';
+// Type-only: PluginsModule binds this class to PLUGIN_CONVERSATION_MAPPING_PORT with a `useExisting`
+// alias, which TypeScript does not check, so `implements` is what keeps the two in step.
+import type { PluginConversationMappingPort } from '../../core/plugins/plugin-host-ports';
 
 export interface MappingKey {
   sessionId: string;
@@ -30,7 +33,7 @@ export class ConversationMappingConflict extends Error {
 }
 
 @Injectable()
-export class ConversationMappingService {
+export class ConversationMappingService implements PluginConversationMappingPort {
   constructor(@InjectRepository(ConversationMapping, 'data') private readonly repo: Repository<ConversationMapping>) {}
 
   async upsert(key: MappingKey, providerConversationId: string, patch?: Partial<ConversationMapping>): Promise<void> {

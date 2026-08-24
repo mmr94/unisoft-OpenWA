@@ -2,7 +2,11 @@ import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import type { MessageService } from '../../../modules/message/message.service';
 import type { GroupService } from '../../../modules/group/group.service';
-import { MESSAGE_TEXT_MAX_LENGTH } from '../../../modules/message/dto/send-message.dto';
+import {
+  MENTIONS_MAX,
+  MESSAGE_TEXT_MAX_LENGTH,
+  SendTextMessageDto,
+} from '../../../modules/message/dto/send-message.dto';
 import {
   CONTACT_NAME_MAX_LENGTH,
   CONTACT_NUMBER_MAX_LENGTH,
@@ -22,7 +26,7 @@ import {
   GroupSubjectDto,
   ParticipantsDto,
 } from '../../../modules/group/dto/group.dto';
-import type { ToolDescriptor } from '../tool-descriptor';
+import type { AnyToolDescriptor } from '../tool-descriptor';
 import { messageTools } from './message.tools';
 import { groupTools } from './group.tools';
 
@@ -33,7 +37,7 @@ const PIPE_TRANSFORM_OPTS = { enableImplicitConversion: true };
 const messages = messageTools({} as unknown as MessageService);
 const groups = groupTools({} as unknown as GroupService);
 
-function tool(name: string): ToolDescriptor {
+function tool(name: string): AnyToolDescriptor {
   const found = [...messages, ...groups].find(t => t.name === name);
   if (!found) throw new Error(`tool not registered: ${name}`);
   return found;
@@ -155,6 +159,17 @@ const PARTICIPANT_CASES: CapCase[] = [
     toolInput: { sessionId: 's1', groupId: '120363@g.us' },
     dtoClass: ParticipantsDto,
     dtoPayload: {},
+  },
+  {
+    // The tool path calls the service directly, so the ValidationPipe never runs and the zod schema
+    // is the only cap between an agent and the engine. This case fails if either side moves.
+    label: 'MessageSendText.mentions ↔ SendTextMessageDto.mentions',
+    toolName: 'MessageSendText',
+    field: 'mentions',
+    cap: MENTIONS_MAX,
+    toolInput: { sessionId: 's1', chatId: '120363@g.us', text: 'hi' },
+    dtoClass: SendTextMessageDto,
+    dtoPayload: { chatId: '120363@g.us', text: 'hi' },
   },
 ];
 

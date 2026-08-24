@@ -14,17 +14,25 @@ export class CreateSessionDto {
   @Matches(/^[a-zA-Z0-9-]+$/, {
     message: 'Session name can only contain letters, numbers, and hyphens',
   })
-  name: string;
+  name!: string;
 
   @ApiPropertyOptional({
     description:
-      'Session configuration options. Supported keys: ' +
-      'maxReconnectAttempts (number), reconnectBaseDelay (ms), ' +
-      'keepAlive (boolean — exclude this session from idle hibernation), ' +
-      'idleTimeoutMs (number — per-session override of the global idle window before hibernation), ' +
-      'autoRejectCalls (boolean, default false — automatically reject incoming calls; the ' +
-      'call.received event is still emitted).',
-    example: { autoReconnect: true, keepAlive: false, idleTimeoutMs: 5400000, autoRejectCalls: false },
+      'Session configuration. Five keys are read: autoRejectCalls (boolean, default false) ' +
+      'rejects incoming calls as soon as they ring — the call.received event is still emitted ' +
+      'first; maxReconnectAttempts (0-20, default unlimited) caps consecutive reconnects; ' +
+      'reconnectBaseDelay (1000-300000 ms, default 5000) sets the backoff base; and, on this ' +
+      'Unisoft build, keepAlive (boolean — exclude this session from idle hibernation) and ' +
+      'idleTimeoutMs (number — per-session override of the global idle window before ' +
+      'hibernation). Anything else is stored but ignored. The first three can be changed later ' +
+      'with PATCH /api/sessions/{sessionId}/config, without restarting the session.',
+    example: {
+      autoRejectCalls: false,
+      maxReconnectAttempts: 5,
+      reconnectBaseDelay: 5000,
+      keepAlive: false,
+      idleTimeoutMs: 5400000,
+    },
   })
   @IsOptional()
   config?: Record<string, unknown>;

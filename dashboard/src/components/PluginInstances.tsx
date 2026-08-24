@@ -12,7 +12,7 @@ import {
 import { isValidInstanceId, isValidInstanceSecret, parseInstanceConfig } from '../utils/instanceForm';
 import { copyToClipboard } from '../utils/clipboard';
 import { Modal } from './Modal';
-import { useToast } from './Toast';
+import { useToast } from '../hooks/useToast';
 import './PluginInstances.css';
 
 const emptyForm = { instanceId: '', sessionScope: '', verifyToken: '', secret: '', config: '' };
@@ -183,16 +183,28 @@ export function PluginInstances({ pluginId }: { pluginId: string }) {
                 {inst.enabled ? t('plugins.instances.enabled') : t('plugins.instances.disabled')}
               </span>
               <div className="pi-actions">
-                <button className="icon-btn" onClick={() => void toggleEnabled(inst)} title={t(`plugins.instances.actions.${inst.enabled ? 'disable' : 'enable'}`)}>
+                <button
+                  className="icon-btn"
+                  onClick={() => void toggleEnabled(inst)}
+                  title={t(`plugins.instances.actions.${inst.enabled ? 'disable' : 'enable'}`)}
+                >
                   <Power size={16} />
                 </button>
-                <button className="icon-btn" onClick={() => setConfirm({ type: 'regenerate', inst })} title={t('plugins.instances.actions.regenerate')}>
+                <button
+                  className="icon-btn"
+                  onClick={() => setConfirm({ type: 'regenerate', inst })}
+                  title={t('plugins.instances.actions.regenerate')}
+                >
                   <RefreshCw size={16} />
                 </button>
                 <button className="icon-btn" onClick={() => openEdit(inst)} title={t('plugins.instances.actions.edit')}>
                   <Pencil size={16} />
                 </button>
-                <button className="icon-btn danger" onClick={() => setConfirm({ type: 'delete', inst })} title={t('plugins.instances.actions.delete')}>
+                <button
+                  className="icon-btn danger"
+                  onClick={() => setConfirm({ type: 'delete', inst })}
+                  title={t('plugins.instances.actions.delete')}
+                >
                   <Trash2 size={16} />
                 </button>
               </div>
@@ -213,44 +225,53 @@ export function PluginInstances({ pluginId }: { pluginId: string }) {
               <button className="btn-secondary" onClick={() => setShowForm(false)}>
                 {t('common.cancel')}
               </button>
-              <button className="btn-primary" onClick={() => void submitCreate()} disabled={createM.isPending || !form.instanceId}>
+              <button
+                className="btn-primary"
+                onClick={() => void submitCreate()}
+                disabled={createM.isPending || !form.instanceId}
+              >
                 {createM.isPending ? <Loader2 className="animate-spin" size={16} /> : t('common.create')}
               </button>
             </>
           }
         >
-          <label>{t('plugins.instances.form.instanceId')}</label>
+          <label htmlFor="pi-1">{t('plugins.instances.form.instanceId')}</label>
           <input
+            id="pi-1"
             type="text"
             value={form.instanceId}
             placeholder={t('plugins.instances.form.instanceIdPlaceholder')}
             onChange={e => setForm({ ...form, instanceId: e.target.value })}
           />
           <p className="pi-hint">{t('plugins.instances.form.instanceIdHint')}</p>
-          <label>{t('plugins.instances.form.sessionScope')}</label>
+          <label htmlFor="pi-2">{t('plugins.instances.form.sessionScope')}</label>
           <input
+            id="pi-2"
             type="text"
             value={form.sessionScope}
             placeholder={t('plugins.instances.form.sessionScopePlaceholder')}
             onChange={e => setForm({ ...form, sessionScope: e.target.value })}
           />
-          <label>{t('plugins.instances.form.verifyToken')}</label>
+          <label htmlFor="pi-3">{t('plugins.instances.form.verifyToken')}</label>
           <input
+            id="pi-3"
             type="text"
             value={form.verifyToken}
             placeholder={t('plugins.instances.form.verifyTokenPlaceholder')}
             onChange={e => setForm({ ...form, verifyToken: e.target.value })}
           />
-          <label>{t('plugins.instances.form.secret')}</label>
+          <label htmlFor="pi-4">{t('plugins.instances.form.secret')}</label>
           <input
+            id="pi-4"
             type="text"
             value={form.secret}
             placeholder={t('plugins.instances.form.secretPlaceholder')}
             onChange={e => setForm({ ...form, secret: e.target.value })}
           />
           <p className="pi-hint">{t('plugins.instances.form.secretHint')}</p>
-          <label>{t('plugins.instances.form.config')}</label>
+          <label htmlFor="pi-5">{t('plugins.instances.form.config')}</label>
           <textarea
+            id="pi-5"
             value={form.config}
             placeholder={t('plugins.instances.form.configPlaceholder')}
             onChange={e => setForm({ ...form, config: e.target.value })}
@@ -264,7 +285,11 @@ export function PluginInstances({ pluginId }: { pluginId: string }) {
         <Modal
           open
           onClose={() => setMinted(null)}
-          title={mintedKind === 'regenerated' ? t('plugins.instances.regenerate.title') : t('plugins.instances.created.title')}
+          title={
+            mintedKind === 'regenerated'
+              ? t('plugins.instances.regenerate.title')
+              : t('plugins.instances.created.title')
+          }
           closeLabel={t('common.close')}
           footer={
             <button className="btn-secondary" onClick={() => setMinted(null)}>
@@ -305,20 +330,26 @@ export function PluginInstances({ pluginId }: { pluginId: string }) {
                 {t('common.cancel')}
               </button>
               <button className="btn-primary" onClick={() => void submitEdit()} disabled={updateM.isPending}>
-                {updateM.isPending ? <Loader2 className="animate-spin" size={16} /> : t('plugins.instances.actions.save')}
+                {updateM.isPending ? (
+                  <Loader2 className="animate-spin" size={16} />
+                ) : (
+                  t('plugins.instances.actions.save')
+                )}
               </button>
             </>
           }
         >
-          <label>{t('plugins.instances.form.sessionScope')}</label>
+          <label htmlFor="pi-6">{t('plugins.instances.form.sessionScope')}</label>
           <input
+            id="pi-6"
             type="text"
             value={editForm.sessionScope}
             placeholder={t('plugins.instances.form.sessionScopePlaceholder')}
             onChange={e => setEditForm({ ...editForm, sessionScope: e.target.value })}
           />
-          <label>{t('plugins.instances.form.config')}</label>
+          <label htmlFor="pi-7">{t('plugins.instances.form.config')}</label>
           <textarea
+            id="pi-7"
             value={editForm.config}
             placeholder={t('plugins.instances.form.configPlaceholder')}
             onChange={e => setEditForm({ ...editForm, config: e.target.value })}

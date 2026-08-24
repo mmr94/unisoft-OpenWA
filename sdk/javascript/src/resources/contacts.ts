@@ -8,6 +8,7 @@
 import { encodeSegment } from '../http.js';
 import type { OpenWAClient } from '../client.js';
 import type {
+  UpsertContactRequest,
   CheckNumberResponse,
   ContactPhoneResponse,
   ContactRecord,
@@ -85,11 +86,44 @@ export class ContactsResource {
     });
   }
 
+  /**
+   * Save a contact to the account's addressbook, or edit an existing entry.
+   * Requires an OPERATOR-level key.
+   */
+  upsert(sessionId: string, contactId: string, body: UpsertContactRequest): Promise<SuccessResult> {
+    return this.client.request<SuccessResult>({
+      method: 'PUT',
+      path: `/api/sessions/${encodeSegment(sessionId)}/contacts/${encodeSegment(contactId)}`,
+      body,
+    });
+  }
+
+  /** Remove a contact from the account's addressbook. Requires an OPERATOR-level key. */
+  delete(sessionId: string, contactId: string): Promise<SuccessResult> {
+    return this.client.request<SuccessResult>({
+      method: 'DELETE',
+      path: `/api/sessions/${encodeSegment(sessionId)}/contacts/${encodeSegment(contactId)}`,
+    });
+  }
+
   /** Unblock a contact. Requires an OPERATOR-level key. */
   unblock(sessionId: string, contactId: string): Promise<SuccessResult> {
     return this.client.request<SuccessResult>({
       method: 'DELETE',
       path: `/api/sessions/${encodeSegment(sessionId)}/contacts/${encodeSegment(contactId)}/block`,
+    });
+  }
+
+  /**
+   * List the JIDs this account has blocked.
+   *
+   * Session-wide, so it takes no contact id — unlike {@link block} and {@link unblock}, which act on
+   * one contact. Resolves a bare array of ids, not contact records.
+   */
+  listBlocked(sessionId: string): Promise<string[]> {
+    return this.client.request<string[]>({
+      method: 'GET',
+      path: `/api/sessions/${encodeSegment(sessionId)}/contacts/blocked`,
     });
   }
 }

@@ -17,8 +17,8 @@ import { claimHttpRequestMetrics } from '../middleware/request-metrics.middlewar
  * is claimed here synchronously so the middleware (which runs first) skips it — exactly one
  * observation per response across the pair.
  *
- * Route label: the Express route pattern when available (bounded — `/api/sessions/:id`, not the raw
- * URL), falling back to `Controller#handler` (always available, strictly bounded).
+ * Route label: the Express route pattern when available (bounded — `/api/sessions/:sessionId`, not
+ * the raw URL), falling back to `Controller#handler` (always available, strictly bounded).
  */
 const SKIPPED_PREFIXES = ['/api/health', '/api/metrics'];
 

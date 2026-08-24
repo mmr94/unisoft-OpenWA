@@ -1,11 +1,13 @@
 import { useState, useEffect, useMemo } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import {
-  useReactTable,
-  getCoreRowModel,
-  flexRender,
+  useTable,
+  tableFeatures,
   createColumnHelper,
-  type VisibilityState,
+  createCoreRowModel,
+  columnVisibilityFeature,
+  flexRender,
+  type ColumnVisibilityState,
 } from '@tanstack/react-table';
 import {
   Plus,
@@ -30,7 +32,7 @@ import {
 } from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
 import { Modal } from '../components/Modal';
-import { useToast } from '../components/Toast';
+import { useToast } from '../hooks/useToast';
 import { copyToClipboard } from '../utils/clipboard';
 import './ApiKeys.css';
 
@@ -46,7 +48,12 @@ function useWindowSize() {
   return width;
 }
 
-const columnHelper = createColumnHelper<ApiKey>();
+const features = tableFeatures({
+  columnVisibilityFeature,
+  coreRowModel: createCoreRowModel(),
+});
+
+const columnHelper = createColumnHelper<typeof features, ApiKey>();
 
 export function ApiKeys() {
   const { t } = useTranslation();
@@ -68,7 +75,7 @@ export function ApiKeys() {
   const windowWidth = useWindowSize();
   const isMobile = windowWidth < 768;
   const isSmall = windowWidth < 640;
-  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
+  const [columnVisibility, setColumnVisibility] = useState<ColumnVisibilityState>({});
 
   useEffect(() => {
     setColumnVisibility({ key: !isSmall, lastUsed: !isMobile });
@@ -128,90 +135,91 @@ export function ApiKeys() {
   };
 
   const columns = useMemo(
-    () => [
-      columnHelper.accessor('name', {
-        header: () => t('apiKeys.columns.name'),
-        cell: info => <span className="name-cell">{info.getValue()}</span>,
-      }),
-      columnHelper.accessor('keyPrefix', {
-        id: 'key',
-        header: () => t('apiKeys.columns.key'),
-        cell: info => {
-          const apiKey = info.row.original;
-          return (
-            <span className="key-cell">
-              <code>{visibleKeys.has(apiKey.id) ? apiKey.keyPrefix + '...' : apiKey.keyPrefix + '****'}</code>
-              <button
-                className="icon-btn-sm"
-                onClick={() => toggleKeyVisibility(apiKey.id)}
-                aria-label={visibleKeys.has(apiKey.id) ? t('common.hideApiKey') : t('common.showApiKey')}
-              >
-                {visibleKeys.has(apiKey.id) ? <EyeOff size={14} /> : <Eye size={14} />}
-              </button>
-            </span>
-          );
-        },
-      }),
-      columnHelper.accessor('role', {
-        header: () => t('apiKeys.columns.role'),
-        cell: info => <span className="permission-badge">{info.getValue()}</span>,
-      }),
-      columnHelper.accessor('isActive', {
-        header: () => t('apiKeys.columns.status'),
-        cell: info => (
-          <span className={`status-badge ${info.getValue() ? 'active' : 'inactive'}`}>
-            {info.getValue() ? t('apiKeys.statuses.active') : t('apiKeys.statuses.revoked')}
-          </span>
-        ),
-      }),
-      columnHelper.accessor('lastUsedAt', {
-        id: 'lastUsed',
-        header: () => t('apiKeys.columns.lastUsed'),
-        cell: info => (
-          <span className="last-used">
-            {info.getValue() ? new Date(info.getValue()!).toLocaleDateString() : t('common.never')}
-          </span>
-        ),
-      }),
-      columnHelper.display({
-        id: 'actions',
-        header: () => t('apiKeys.columns.actions'),
-        cell: info => {
-          const apiKey = info.row.original;
-          return (
-            <span className="actions-cell">
-              {/* No per-row copy: the full key only exists once (post-creation modal); the row
-                  only has the prefix, so a copy button here could only copy a useless fragment. */}
-              {apiKey.isActive && (
+    () =>
+      columnHelper.columns([
+        columnHelper.accessor('name', {
+          header: () => t('apiKeys.columns.name'),
+          cell: info => <span className="name-cell">{info.getValue()}</span>,
+        }),
+        columnHelper.accessor('keyPrefix', {
+          id: 'key',
+          header: () => t('apiKeys.columns.key'),
+          cell: info => {
+            const apiKey = info.row.original;
+            return (
+              <span className="key-cell">
+                <code>{visibleKeys.has(apiKey.id) ? apiKey.keyPrefix + '...' : apiKey.keyPrefix + '****'}</code>
                 <button
-                  className="icon-btn"
-                  onClick={() => setConfirmAction({ type: 'revoke', id: apiKey.id, name: apiKey.name })}
-                  title={t('apiKeys.actions.revoke')}
+                  className="icon-btn-sm"
+                  onClick={() => toggleKeyVisibility(apiKey.id)}
+                  aria-label={visibleKeys.has(apiKey.id) ? t('common.hideApiKey') : t('common.showApiKey')}
                 >
-                  <RefreshCw size={16} />
+                  {visibleKeys.has(apiKey.id) ? <EyeOff size={14} /> : <Eye size={14} />}
                 </button>
-              )}
-              <button
-                className="icon-btn danger"
-                onClick={() => setConfirmAction({ type: 'delete', id: apiKey.id, name: apiKey.name })}
-                title={t('apiKeys.actions.delete')}
-              >
-                <Trash2 size={16} />
-              </button>
+              </span>
+            );
+          },
+        }),
+        columnHelper.accessor('role', {
+          header: () => t('apiKeys.columns.role'),
+          cell: info => <span className="permission-badge">{info.getValue()}</span>,
+        }),
+        columnHelper.accessor('isActive', {
+          header: () => t('apiKeys.columns.status'),
+          cell: info => (
+            <span className={`status-badge ${info.getValue() ? 'active' : 'inactive'}`}>
+              {info.getValue() ? t('apiKeys.statuses.active') : t('apiKeys.statuses.revoked')}
             </span>
-          );
-        },
-      }),
-    ],
+          ),
+        }),
+        columnHelper.accessor('lastUsedAt', {
+          id: 'lastUsed',
+          header: () => t('apiKeys.columns.lastUsed'),
+          cell: info => (
+            <span className="last-used">
+              {info.getValue() ? new Date(info.getValue()!).toLocaleDateString() : t('common.never')}
+            </span>
+          ),
+        }),
+        columnHelper.display({
+          id: 'actions',
+          header: () => t('apiKeys.columns.actions'),
+          cell: info => {
+            const apiKey = info.row.original;
+            return (
+              <span className="actions-cell">
+                {/* No per-row copy: the full key only exists once (post-creation modal); the row
+                    only has the prefix, so a copy button here could only copy a useless fragment. */}
+                {apiKey.isActive && (
+                  <button
+                    className="icon-btn"
+                    onClick={() => setConfirmAction({ type: 'revoke', id: apiKey.id, name: apiKey.name })}
+                    title={t('apiKeys.actions.revoke')}
+                  >
+                    <RefreshCw size={16} />
+                  </button>
+                )}
+                <button
+                  className="icon-btn danger"
+                  onClick={() => setConfirmAction({ type: 'delete', id: apiKey.id, name: apiKey.name })}
+                  title={t('apiKeys.actions.delete')}
+                >
+                  <Trash2 size={16} />
+                </button>
+              </span>
+            );
+          },
+        }),
+      ]),
     [visibleKeys, t],
   );
 
-  const table = useReactTable({
+  const table = useTable({
+    features,
     data: apiKeys,
     columns,
     state: { columnVisibility },
     onColumnVisibilityChange: setColumnVisibility,
-    getCoreRowModel: getCoreRowModel(),
   });
 
   if (loading) {
@@ -293,15 +301,16 @@ export function ApiKeys() {
             </div>
           ) : (
             <>
-              <label>{t('common.name')}</label>
+              <label htmlFor="ak-1">{t('common.name')}</label>
               <input
+                id="ak-1"
                 type="text"
                 placeholder={t('apiKeys.namePlaceholder')}
                 value={newKey.name}
                 onChange={e => setNewKey({ ...newKey, name: e.target.value })}
               />
-              <label>{t('common.role')}</label>
-              <select value={newKey.role} onChange={e => setNewKey({ ...newKey, role: e.target.value })}>
+              <label htmlFor="ak-2">{t('common.role')}</label>
+              <select id="ak-2" value={newKey.role} onChange={e => setNewKey({ ...newKey, role: e.target.value })}>
                 {roleNames.map(r => (
                   <option key={r} value={r}>
                     {t(`apiKeys.roles.${r}`)}
@@ -383,7 +392,9 @@ export function ApiKeys() {
           </div>
           <p className="confirm-message">
             <Trans
-              i18nKey={confirmAction.type === 'delete' ? 'apiKeys.confirm.deleteMessage' : 'apiKeys.confirm.revokeMessage'}
+              i18nKey={
+                confirmAction.type === 'delete' ? 'apiKeys.confirm.deleteMessage' : 'apiKeys.confirm.revokeMessage'
+              }
               values={{ name: confirmAction.name }}
               components={{ strong: <strong /> }}
             />

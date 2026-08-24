@@ -66,3 +66,36 @@ describe('isMissingTableError', () => {
     expect(isMissingTableError(qfe('duplicate key value violates unique constraint', '23505'))).toBe(false);
   });
 });
+
+describe('isUniqueViolation', () => {
+  it('recognizes a PostgreSQL unique_violation (code 23505), wrapped or raw-shaped', () => {
+    expect(isUniqueViolation(qfe('duplicate key value violates unique constraint', '23505'))).toBe(true);
+    expect(isUniqueViolation({ driverError: { code: '23505' } })).toBe(true);
+  });
+
+  it('recognizes a SQLite unique violation by its precise code (unique or primary key)', () => {
+    expect(isUniqueViolation(qfe('UNIQUE constraint failed: templates.name', 'SQLITE_CONSTRAINT_UNIQUE'))).toBe(true);
+    expect(isUniqueViolation({ driverError: { code: 'SQLITE_CONSTRAINT_PRIMARYKEY' } })).toBe(true);
+  });
+
+  it('recognizes a SQLite unique violation by message when no code is present', () => {
+    expect(isUniqueViolation(new Error('SQLITE_CONSTRAINT: UNIQUE constraint failed: messages.sessionId'))).toBe(true);
+  });
+
+  // SQLite prefixes EVERY constraint failure with SQLITE_CONSTRAINT; a prefix match here would
+  // swallow a genuine persistence failure as "already stored" (dropped inbound messages, wrong 409s).
+  it.each([
+    ['a foreign-key violation', 'SQLITE_CONSTRAINT_FOREIGNKEY'],
+    ['a NOT NULL violation', 'SQLITE_CONSTRAINT_NOTNULL'],
+    ['a CHECK violation', 'SQLITE_CONSTRAINT_CHECK'],
+    ['the Postgres FK code', '23503'],
+  ])('returns false for %s, even when the message mentions uniqueness', (_label, code) => {
+    expect(isUniqueViolation(qfe('UNIQUE constraint failed: x', code))).toBe(false);
+    expect(isUniqueViolation({ driverError: { code } })).toBe(false);
+  });
+
+  it('returns false for an unrelated error and for null', () => {
+    expect(isUniqueViolation(new Error('boom'))).toBe(false);
+    expect(isUniqueViolation(null)).toBe(false);
+  });
+});

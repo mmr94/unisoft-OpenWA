@@ -53,7 +53,7 @@ describe('RedriveService', () => {
     (repo.find as jest.Mock).mockResolvedValue(rows);
     const svc = makeSvc();
 
-    const res = await svc.redriveInstance('p', 'i');
+    const res = await svc.redriveInstance('p', 'i', null);
 
     expect(res.redriven).toBe(2);
     expect(res).toEqual({ redriven: 2, remaining: 0, batchSize: 100 });
@@ -94,7 +94,7 @@ describe('RedriveService', () => {
     (repo.find as jest.Mock).mockResolvedValue(rows);
     const svc = makeSvc();
 
-    const res = await svc.redriveInstance('p', 'i');
+    const res = await svc.redriveInstance('p', 'i', null);
 
     expect(res.redriven).toBe(1);
     expect(events.update).toHaveBeenCalledTimes(1);
@@ -126,7 +126,7 @@ describe('RedriveService', () => {
     (ingressEnqueue.enqueue as jest.Mock).mockResolvedValue({ outcome: 'failed' });
     const svc = makeSvc();
 
-    const res = await svc.redriveInstance('p', 'i');
+    const res = await svc.redriveInstance('p', 'i', null);
 
     expect(res.redriven).toBe(0);
     expect(ingressEnqueue.enqueue).toHaveBeenCalledTimes(1);
@@ -138,7 +138,7 @@ describe('RedriveService', () => {
     (repo.find as jest.Mock).mockResolvedValue([]);
     const svc = makeSvc();
 
-    const res = await svc.redriveInstance('p', 'i');
+    const res = await svc.redriveInstance('p', 'i', null);
 
     expect(repo.find).toHaveBeenCalledWith({
       where: { pluginId: 'p', instanceId: 'i', direction: 'inbound', redriven: false },
@@ -148,6 +148,49 @@ describe('RedriveService', () => {
     expect(res.redriven).toBe(0);
     expect(ingressEnqueue.enqueue).not.toHaveBeenCalled();
     expect(repo.update).not.toHaveBeenCalled();
+  });
+
+  it('filters the DLQ batch by the session provenance so a rebind cannot replay foreign historical rows', async () => {
+    // After an instance is rebound sess-old -> sess-current, a key scoped to sess-current must NOT
+    // replay retained rows that still carry sessionId 'sess-old'. The authorized binding is threaded
+    // in as a concrete filter that enters BOTH the find() and count() query — foreign rows neither
+    // consume the batch nor leak through `remaining`.
+    (repo.find as jest.Mock).mockResolvedValue([]);
+    const svc = makeSvc();
+
+    await svc.redriveInstance('p', 'i', 'sess-current');
+
+    expect(repo.find).toHaveBeenCalledWith({
+      where: {
+        pluginId: 'p',
+        instanceId: 'i',
+        direction: 'inbound',
+        redriven: false,
+        sessionId: 'sess-current',
+      },
+      order: { attempts: 'ASC', createdAt: 'ASC' },
+      take: 100,
+    });
+    const [countCall] = (repo.count as jest.Mock).mock.calls[0] as [{ where: Record<string, unknown> }];
+    expect(countCall.where).toMatchObject({ sessionId: 'sess-current' });
+  });
+
+  it('leaves the sessionId predicate ABSENT for an unrestricted (null) caller so legacy/null-session rows stay replayable', async () => {
+    // null means the caller is unrestricted: the DLQ is drained across every sessionId, including
+    // legacy rows written before sessionId provenance existed (sessionId null). The where object must
+    // NOT carry a sessionId key at all — emitting `sessionId: null` would exclude those legacy rows.
+    (repo.find as jest.Mock).mockResolvedValue([]);
+    const svc = makeSvc();
+
+    await svc.redriveInstance('p', 'i', null);
+
+    expect(repo.find).toHaveBeenCalledWith({
+      where: { pluginId: 'p', instanceId: 'i', direction: 'inbound', redriven: false },
+      order: { attempts: 'ASC', createdAt: 'ASC' },
+      take: 100,
+    });
+    const [countArg] = (repo.count as jest.Mock).mock.calls[0] as [{ where: Record<string, unknown> }];
+    expect(countArg.where).not.toHaveProperty('sessionId');
   });
 
   it('falls back to the failure row id as deliveryId when deliveryId is null', async () => {
@@ -166,7 +209,7 @@ describe('RedriveService', () => {
     (repo.find as jest.Mock).mockResolvedValue(rows);
     const svc = makeSvc();
 
-    await svc.redriveInstance('p', 'i');
+    await svc.redriveInstance('p', 'i', null);
 
     expect(ingressEnqueue.enqueue).toHaveBeenCalledWith(
       expect.objectContaining({ deliveryId: 'f3', sessionId: undefined }),

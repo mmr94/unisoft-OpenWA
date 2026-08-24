@@ -364,7 +364,11 @@ export class BaileysSessionStore {
       name: c.name ?? c.verifiedName,
       pushName: c.notify,
       number,
-      isMyContact: true, // best-effort: present in the synced address book / chat list
+      // Baileys distinguishes the two names: `name` is documented as the one YOU saved on your
+      // WhatsApp, `notify` as the pushname the contact set themselves. Reporting true for everyone
+      // told an automation that every chat partner was in the addressbook, which is what
+      // whatsapp-web.js reports honestly from the Contact model.
+      isMyContact: Boolean(c.name),
       isBlocked: false, // best-effort: blocklist state is not tracked in this slice
       profilePicUrl: c.imgUrl ?? undefined,
     };

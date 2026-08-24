@@ -17,9 +17,7 @@ export const INTENTIONALLY_UNEMITTED_ACTIONS: Partial<Record<AuditAction, string
   [AuditAction.API_KEY_USED]:
     'Not emitted: would fire on every authenticated request, which is too high-volume for the audit log. Authentication failures are audited (API_KEY_AUTH_FAILED); successful authentication is intentionally not.',
   [AuditAction.SESSION_CONNECTED]:
-    'Not emitted: an engine-level lifecycle transition, redundant with sessions.status and the SessionService lastDispatchedStatus map. User-initiated lifecycle (SESSION_STARTED / SESSION_STOPPED) is audited.',
-  [AuditAction.SESSION_DISCONNECTED]:
-    'Not emitted: an engine-level lifecycle transition, redundant with sessions.status and the SessionService lastDispatchedStatus map; reconnect storms would flood the audit log.',
+    'Not emitted: an engine-level lifecycle transition, redundant with sessions.status and the SessionEngineLifecycle lastDispatchedStatus map. User-initiated lifecycle (SESSION_STARTED / SESSION_STOPPED) is audited.',
   [AuditAction.SESSION_HIBERNATED]:
     'Not emitted: an automatic idle-lifecycle transition (idle checker → hibernate), redundant with sessions.status (HIBERNATED) and already surfaced via the session:hibernated hook and the session.status WebSocket/webhook event. User-initiated lifecycle (SESSION_STARTED / SESSION_STOPPED) is audited.',
   [AuditAction.MESSAGE_SENT]:

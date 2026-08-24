@@ -242,4 +242,93 @@ fi
 pass "(e) min-content check fails hard and removes the defective archive"
 
 echo ""
+echo "==> (f) data/.env.generated supplies paths the environment does not"
+# The dangerous shape: the app was pointed elsewhere through the dashboard, and a database from
+# before that switch is still sitting at the DEFAULT path. Resolving from the process environment
+# alone then archives the abandoned file and exits 0 — a backup that only reveals itself as wrong
+# during a restore. A missing default would at least fail loudly; a stale one does not.
+F="$WORK/f"
+mkdir -p "$F/state" "$F/live" "$F/data" "$F/extract" "$F/restore/state"
+make_fixture "$F/live/auth.sqlite" "foxtrot-live-main"
+make_fixture "$F/live/store.sqlite" "foxtrot-live-data"
+make_fixture "$F/data/main.sqlite" "STALE-main"
+make_fixture "$F/data/openwa.sqlite" "STALE-data"
+printf 'DATABASE_TYPE=sqlite\nMAIN_DATABASE_NAME=%s\nDATABASE_NAME=%s\n' \
+  "$F/live/auth.sqlite" "$F/live/store.sqlite" >"$F/state/.env.generated"
+(
+  cd "$F"
+  OPENWA_DATA_DIR="$F/state" BACKUP_DIR="$F/out" "$BACKUP" >/dev/null
+)
+ARCHIVE_F="$(ls "$F"/out/openwa-backup-*.tar.gz)"
+tar -xzf "$ARCHIVE_F" -C "$F/extract"
+if [ "$(db_fingerprint "$F/extract/main.sqlite")" != "foxtrot-live-main" ]; then
+  fail "(f) backup archived the stale default main DB instead of the one data/.env.generated names"
+fi
+if [ "$(db_fingerprint "$F/extract/openwa.sqlite")" != "foxtrot-live-data" ]; then
+  fail "(f) backup archived the stale default data DB instead of the one data/.env.generated names"
+fi
+# restore.sh must read the SAME layer, or it writes the databases somewhere backup.sh never looked.
+printf 'DATABASE_TYPE=sqlite\nMAIN_DATABASE_NAME=%s\nDATABASE_NAME=%s\n' \
+  "$F/restore/auth.sqlite" "$F/restore/store.sqlite" >"$F/restore/state/.env.generated"
+(
+  cd "$F/restore"
+  OPENWA_DATA_DIR="$F/restore/state" "$RESTORE" "$ARCHIVE_F" >/dev/null
+)
+if [ "$(db_fingerprint "$F/restore/auth.sqlite")" != "foxtrot-live-main" ]; then
+  fail "(f) restore ignored the MAIN_DATABASE_NAME in data/.env.generated"
+fi
+if [ "$(db_fingerprint "$F/restore/store.sqlite")" != "foxtrot-live-data" ]; then
+  fail "(f) restore ignored the DATABASE_NAME in data/.env.generated"
+fi
+# An explicit environment value must still win — that is the app's precedence, not ours to change.
+(
+  cd "$F"
+  MAIN_DATABASE_NAME="$F/data/main.sqlite" DATABASE_NAME="$F/data/openwa.sqlite" \
+    OPENWA_DATA_DIR="$F/state" BACKUP_DIR="$F/out2" "$BACKUP" >/dev/null
+)
+rm -rf "${F:?}/extract2" && mkdir -p "$F/extract2"
+tar -xzf "$(ls "$F"/out2/openwa-backup-*.tar.gz)" -C "$F/extract2"
+if [ "$(db_fingerprint "$F/extract2/main.sqlite")" != "STALE-main" ]; then
+  fail "(f) an explicit environment path lost to data/.env.generated — precedence is inverted"
+fi
+pass "(f) data/.env.generated resolves paths for both scripts, and the environment still wins"
+
+echo ""
+echo "==> (g) PLUGIN_STATE_DIR moves the registry and ctx.storage, and both scripts follow it"
+# The knob names the ROOT; the app keeps plugin state at <root>/plugins. Both scripts hardcoded
+# $OPENWA_DATA_DIR/plugins, so with the knob set the archive carried neither the registry nor any
+# plugin's persisted storage, and the restore put nothing back. Silent both ways: an empty source
+# directory simply produces no plugin-state entry.
+G="$WORK/g"
+mkdir -p "$G/state" "$G/elsewhere/plugins/chatwoot" "$G/extract" "$G/restore/state"
+make_fixture "$G/state/main.sqlite" "golf-main"
+make_fixture "$G/state/openwa.sqlite" "golf-data"
+printf '{"plugins":[{"id":"chatwoot"}]}' >"$G/elsewhere/plugins/registry.json"
+printf 'mapped-conversation' >"$G/elsewhere/plugins/chatwoot/key-Zm9v.json"
+(
+  cd "$G"
+  OPENWA_DATA_DIR="$G/state" PLUGIN_STATE_DIR="$G/elsewhere" BACKUP_DIR="$G/out" \
+    MAIN_DATABASE_NAME="$G/state/main.sqlite" DATABASE_NAME="$G/state/openwa.sqlite" "$BACKUP" >/dev/null
+)
+ARCHIVE_G="$(ls "$G"/out/openwa-backup-*.tar.gz)"
+tar -xzf "$ARCHIVE_G" -C "$G/extract"
+if [ ! -f "$G/extract/plugin-state/registry.json" ]; then
+  fail "(g) backup ignored PLUGIN_STATE_DIR: the plugin registry is missing from the archive"
+fi
+if [ ! -f "$G/extract/plugin-state/chatwoot/key-Zm9v.json" ]; then
+  fail "(g) backup ignored PLUGIN_STATE_DIR: a plugin's persisted ctx.storage is missing"
+fi
+# And the restore has to put them back where the knob points, not under the default data dir.
+(
+  cd "$G"
+  OPENWA_DATA_DIR="$G/restore/state" PLUGIN_STATE_DIR="$G/restored-elsewhere" \
+    MAIN_DATABASE_NAME="$G/restore/state/main.sqlite" DATABASE_NAME="$G/restore/state/openwa.sqlite" \
+    "$RESTORE" "$ARCHIVE_G" --force >/dev/null
+)
+if [ ! -f "$G/restored-elsewhere/plugins/registry.json" ]; then
+  fail "(g) restore ignored PLUGIN_STATE_DIR: the registry did not land under the configured root"
+fi
+pass "(g) PLUGIN_STATE_DIR is honoured by backup and by restore"
+
+echo ""
 echo "All smoke tests passed!"

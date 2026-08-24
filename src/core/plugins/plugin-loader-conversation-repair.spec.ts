@@ -5,11 +5,8 @@ import { PluginLoaderService } from './plugin-loader.service';
 import { PluginStorageService } from './plugin-storage.service';
 import { HookManager } from '../hooks';
 import { PluginContext, PluginInstance, PluginManifest, PluginStatus, PluginType } from './plugin.interfaces';
-import { SessionService } from '../../modules/session/session.service';
-import {
-  ConversationMappingConflict,
-  ConversationMappingService,
-} from '../../modules/integration/conversation-mapping.service';
+import { ConversationMappingConflict } from '../../modules/integration/conversation-mapping.service';
+import { PLUGIN_CONVERSATION_MAPPING_PORT, PLUGIN_SESSION_PORT } from './plugin-host-ports';
 
 /**
  * Stale-mapping repair after a session is deleted and re-paired under a new id. The cross-session
@@ -37,8 +34,8 @@ describe('PluginLoaderService — stale conversation-mapping repair', () => {
     sessionService = { findOne: jest.fn() };
     const moduleRef = {
       get: jest.fn().mockImplementation((token: unknown) => {
-        if (token === ConversationMappingService) return mappingService;
-        if (token === SessionService) return sessionService;
+        if (token === PLUGIN_CONVERSATION_MAPPING_PORT) return mappingService;
+        if (token === PLUGIN_SESSION_PORT) return sessionService;
         return messageService;
       }),
     };
@@ -55,9 +52,11 @@ describe('PluginLoaderService — stale conversation-mapping repair', () => {
   });
 
   function contextFor(plugin: PluginInstance): PluginContext {
-    return (loader as unknown as { createPluginContext: (p: PluginInstance) => PluginContext }).createPluginContext(
-      plugin,
-    );
+    // The capability surface moved to PluginCapabilityContext; the loader holds one. Every assertion
+    // below is unchanged — only the reach-in points at the object that owns the surface now.
+    return (
+      loader as unknown as { capabilities: { createPluginContext: (p: PluginInstance) => PluginContext } }
+    ).capabilities.createPluginContext(plugin);
   }
 
   function makePlugin(activeSessions?: string[]): PluginInstance {

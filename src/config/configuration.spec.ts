@@ -1,4 +1,10 @@
-import configuration, { resolveNonNegativeIntEnv } from './configuration';
+import * as path from 'path';
+import configuration, {
+  DEFAULT_DATA_DIR,
+  PINNED_BROWSER_LOCALE,
+  resolveNonNegativeIntEnv,
+  withPinnedBrowserLocale,
+} from './configuration';
 
 describe('configuration — main DB synchronize', () => {
   const orig = process.env.MAIN_DATABASE_SYNCHRONIZE;
@@ -48,12 +54,14 @@ describe('configuration — Puppeteer args delimiter', () => {
   // (a single glued token like "--no-sandbox --disable-gpu" silently neuters --no-sandbox).
   it('splits space-separated PUPPETEER_ARGS into discrete flags (dashboard-written form)', () => {
     process.env.PUPPETEER_ARGS = '--no-sandbox --disable-gpu';
-    expect(configuration().engine.puppeteer.args).toEqual(['--no-sandbox', '--disable-gpu']);
+    // The locale pin is appended after the split (see withPinnedBrowserLocale) — assert the split
+    // itself, not the whole list, so this test keeps testing the delimiter and nothing else.
+    expect(configuration().engine.puppeteer.args.slice(0, 2)).toEqual(['--no-sandbox', '--disable-gpu']);
   });
 
   it('still splits comma-separated PUPPETEER_ARGS (.env / docker-compose form)', () => {
     process.env.PUPPETEER_ARGS = '--no-sandbox,--disable-setuid-sandbox';
-    expect(configuration().engine.puppeteer.args).toEqual(['--no-sandbox', '--disable-setuid-sandbox']);
+    expect(configuration().engine.puppeteer.args.slice(0, 2)).toEqual(['--no-sandbox', '--disable-setuid-sandbox']);
   });
 
   it('defaults to the Docker-relevant sandbox flag set when unset', () => {
@@ -63,6 +71,7 @@ describe('configuration — Puppeteer args delimiter', () => {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
+      `--lang=${PINNED_BROWSER_LOCALE}`,
     ]);
   });
 });
@@ -94,6 +103,38 @@ describe('configuration — Postgres pool timeouts', () => {
     expect(cfg.statementTimeoutMs).toBe(0);
     expect(cfg.idleTimeoutMs).toBe(15000);
     expect(cfg.connectionTimeoutMs).toBe(2000);
+  });
+});
+
+describe('configuration — plugins directory default', () => {
+  const orig = process.env.PLUGINS_DIR;
+  afterEach(() => {
+    if (orig === undefined) delete process.env.PLUGINS_DIR;
+    else process.env.PLUGINS_DIR = orig;
+  });
+
+  // The package dir and the registry are two halves of one install: PluginStorageService writes
+  // <dataDir>/plugins/registry.json, so a package dir defaulting anywhere else means the loader scans
+  // an empty tree while the registry still lists every plugin as installed — and, in Docker, an
+  // install lands in the container layer instead of on the data volume.
+  it('defaults plugins.dir to <dataDir>/plugins so plugin code and the registry share one tree', () => {
+    delete process.env.PLUGINS_DIR;
+    const cfg = configuration();
+    expect(cfg.dataDir).toBe(DEFAULT_DATA_DIR);
+    expect(cfg.plugins.dir).toBe(path.join(cfg.dataDir, 'plugins'));
+  });
+
+  it('exposes the historical ./plugins default as legacyDir so an existing install keeps loading', () => {
+    delete process.env.PLUGINS_DIR;
+    expect(configuration().plugins.legacyDir).toBe('./plugins');
+  });
+
+  it('lets an explicit PLUGINS_DIR win, and drops the legacy fallback with it', () => {
+    process.env.PLUGINS_DIR = '/srv/openwa-plugins';
+    const cfg = configuration();
+    expect(cfg.plugins.dir).toBe('/srv/openwa-plugins');
+    // An operator who named the directory has said where plugins live; nothing may second-guess it.
+    expect(cfg.plugins.legacyDir).toBeNull();
   });
 });
 
@@ -305,5 +346,56 @@ describe('resolveNonNegativeIntEnv', () => {
     for (const bad of ['abc', '-1', '1.5', '1e6', '0x100']) {
       expect(resolveNonNegativeIntEnv(bad, 5000)).toBe(5000);
     }
+  });
+});
+
+// WhatsApp Web renders its chrome in the BROWSER's language, and the onboarding-modal detector (#982)
+// matches visible English text. Pinning the locale is what makes that match deterministic across the
+// amd64 (Chrome for Testing) and arm64 (Debian chromium) images and any host install.
+describe('withPinnedBrowserLocale', () => {
+  it('appends the pin when the args carry no --lang', () => {
+    expect(withPinnedBrowserLocale(['--no-sandbox'])).toEqual(['--no-sandbox', `--lang=${PINNED_BROWSER_LOCALE}`]);
+  });
+
+  it('leaves an operator-supplied --lang alone (theirs wins, and it is not duplicated)', () => {
+    expect(withPinnedBrowserLocale(['--no-sandbox', '--lang=de-DE'])).toEqual(['--no-sandbox', '--lang=de-DE']);
+    // `--lang` with no value, and the `--lang foo` spelling, both count as operator-supplied.
+    expect(withPinnedBrowserLocale(['--lang'])).toEqual(['--lang']);
+  });
+
+  it('never mutates the input array', () => {
+    // The resolved puppeteer args object is shared by every session; mutating it leaked one session's
+    // proxy flag into the others once already (#840).
+    const original = ['--no-sandbox'];
+    const result = withPinnedBrowserLocale(original);
+    expect(original).toEqual(['--no-sandbox']);
+    expect(result).not.toBe(original);
+  });
+});
+
+describe('configuration — puppeteer locale pin', () => {
+  const orig = process.env.PUPPETEER_ARGS;
+
+  afterEach(() => {
+    if (orig === undefined) delete process.env.PUPPETEER_ARGS;
+    else process.env.PUPPETEER_ARGS = orig;
+  });
+
+  it('pins the locale on the default args', () => {
+    delete process.env.PUPPETEER_ARGS;
+    expect(configuration().engine.puppeteer.args).toContain(`--lang=${PINNED_BROWSER_LOCALE}`);
+  });
+
+  // PUPPETEER_ARGS REPLACES the defaults, so applying the pin only to the default string would let any
+  // deployment that customises args for an unrelated reason silently lose the onboarding detector.
+  it('still pins the locale when the operator overrides PUPPETEER_ARGS', () => {
+    process.env.PUPPETEER_ARGS = '--no-sandbox,--disable-gpu';
+    const args = configuration().engine.puppeteer.args;
+    expect(args).toEqual(['--no-sandbox', '--disable-gpu', `--lang=${PINNED_BROWSER_LOCALE}`]);
+  });
+
+  it('respects an explicit --lang inside PUPPETEER_ARGS', () => {
+    process.env.PUPPETEER_ARGS = '--no-sandbox --lang=id-ID';
+    expect(configuration().engine.puppeteer.args).toEqual(['--no-sandbox', '--lang=id-ID']);
   });
 });

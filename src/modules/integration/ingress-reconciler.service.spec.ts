@@ -295,7 +295,7 @@ describe('IngressReconcilerService.sweep', () => {
     );
     const redrive = new RedriveService(failures, events, { enqueue } as unknown as IngressEnqueueService);
 
-    const res = await redrive.redriveInstance('plug', 'inst');
+    const res = await redrive.redriveInstance('plug', 'inst', null);
 
     expect(res.redriven).toBe(1);
     expect((await stored(id)).dispatchState).toBe('dispatched');

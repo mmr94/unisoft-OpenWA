@@ -1,6 +1,41 @@
+import * as path from 'path';
 import { computeFeatureFlags } from './feature-flags';
+import { computeSendPacingConfig } from '../modules/message/send-pacing.config';
 import { resolveInflightBodyBudgetBytes } from './inflight-body-budget';
 import { readWsRateLimitConfig } from '../modules/events/ws-rate-limit';
+
+/**
+ * Root of the host's persistent state. Relative on purpose: the image sets WORKDIR /app and mounts
+ * the data volume at /app/data, so this resolves onto the volume without the config having to know
+ * whether it runs in a container.
+ *
+ * Exposed as the `dataDir` key because PluginStorageService already reads it — the key never existed,
+ * so `get('dataDir')` always fell through to its own literal while the plugin package dir defaulted
+ * from an unrelated string. Deriving both from one value is what keeps a plugin's code and its
+ * registry entry in the same tree.
+ *
+ * There is deliberately no DATA_DIR knob: every other data path (DATABASE_NAME, MAIN_DATABASE_NAME,
+ * SESSION_DATA_PATH, BAILEYS_AUTH_DIR, STORAGE_LOCAL_PATH) carries its own override and none of them
+ * would follow it, so a knob by that name would move part of the state while looking like it moved
+ * all of it.
+ *
+ * PLUGIN_STATE_DIR is that objection answered rather than repeated: this value reaches exactly one
+ * consumer, PluginStorageService, so the knob is named for the registry and per-plugin storage it
+ * actually moves and claims nothing about the rest of the tree. Without it the plugin registry is
+ * the one piece of state a test lane cannot redirect, which is why every e2e suite in a run shares
+ * one registry file and rewrites the developer's copy of it.
+ */
+export const DEFAULT_DATA_DIR = './data';
+
+/** Where installed plugin packages live when PLUGINS_DIR is unset — the tree the registry is in. */
+export const DEFAULT_PLUGINS_DIR = path.join(DEFAULT_DATA_DIR, 'plugins');
+
+/**
+ * The plugin package dir OpenWA ≤ 0.12.1 defaulted to. A host that ran on that default has working
+ * plugin code sitting here, so the loader still scans it (and says so, loudly) when PLUGINS_DIR is
+ * unset — see PluginLoaderService.onModuleInit.
+ */
+export const LEGACY_PLUGINS_DIR = './plugins';
 
 /**
  * Shared parser for numeric env knobs whose 0 is a documented opt-out (unlimited / disabled).
@@ -17,8 +52,35 @@ export function resolveNonNegativeIntEnv(raw: string | undefined, fallback: numb
   return Number(trimmed);
 }
 
+/**
+ * The UI locale Chromium is pinned to. WhatsApp Web renders its chrome — including the new-account
+ * onboarding modal the whatsapp-web.js adapter dismisses (#982) — in the browser's language, and that
+ * detector matches visible English text. Without a pin the language is whatever the launched binary
+ * defaults to, which differs between the amd64 (Chrome for Testing) and arm64 (Debian chromium) images
+ * and between host installs.
+ */
+export const PINNED_BROWSER_LOCALE = 'en-US';
+
+/**
+ * Append the locale pin unless the operator already set one. Deliberately applied AFTER the
+ * PUPPETEER_ARGS override rather than baked into the default string: that variable REPLACES the
+ * defaults, so a deployment that customises args for an unrelated reason would otherwise silently
+ * lose the pin and the onboarding detector with it. An explicit `--lang` always wins.
+ *
+ * Returns a NEW array — never mutates the input — because the resolved args object is shared by every
+ * session, and pushing per-session flags onto a shared array leaked proxy settings across sessions
+ * once already (#840).
+ */
+export function withPinnedBrowserLocale(args: string[]): string[] {
+  return args.some(arg => arg.startsWith('--lang')) ? [...args] : [...args, `--lang=${PINNED_BROWSER_LOCALE}`];
+}
+
 export default () => ({
   port: parseInt(process.env.PORT || '2785', 10),
+
+  // Root of the persistent state tree (see DEFAULT_DATA_DIR). Read by PluginStorageService for the
+  // plugin registry and per-plugin storage; the other data paths keep their own env-specific keys.
+  dataDir: process.env.PLUGIN_STATE_DIR || DEFAULT_DATA_DIR,
 
   // HTTP server timeouts (Node http.Server). Pinned explicitly so they are operator-tunable and
   // observable at boot rather than left at Node's implicit defaults. requestTimeout defaults to
@@ -58,6 +120,10 @@ export default () => ({
   // Runtime feature flags. Single source of truth: src/config/feature-flags.ts. Exposed here so the
   // full set is discoverable via ConfigService (`features.*`) instead of scattered process.env reads.
   features: computeFeatureFlags(),
+
+  // Outbound send pacing. Its own object rather than a feature flag: every field needs clamping,
+  // because a bad value here decides whether messages are refused. See message/send-pacing.config.ts.
+  sendPacing: computeSendPacingConfig(),
 
   // Redis configuration
   redis: {
@@ -136,11 +202,11 @@ export default () => ({
       // Accept either delimiter: .env/compose use commas, the dashboard Infrastructure form
       // persists space-separated. Splitting on both keeps each flag a discrete argv token —
       // a single glued token like "--no-sandbox --disable-gpu" silently neuters --no-sandbox.
-      args: (
-        process.env.PUPPETEER_ARGS || '--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu'
-      )
-        .split(/[\s,]+/)
-        .filter(Boolean),
+      args: withPinnedBrowserLocale(
+        (process.env.PUPPETEER_ARGS || '--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu')
+          .split(/[\s,]+/)
+          .filter(Boolean),
+      ),
       // Optional path to a system Chromium/Chrome binary. When unset, whatsapp-web.js
       // uses Puppeteer's bundled Chromium. Required on hosts where the bundled binary
       // is missing or incompatible (Alpine, ARM, custom base images).
@@ -152,20 +218,6 @@ export default () => ({
     baileys: {
       authDir: process.env.BAILEYS_AUTH_DIR || './data/baileys',
     },
-  },
-
-  // Session lifecycle / hibernation configuration
-  session: {
-    // When enabled, sessions that have not SENT a message for `idleTimeoutMs`
-    // are hibernated (engine/Chromium destroyed to free RAM). The WhatsApp auth
-    // data stays on disk, so resuming does not require a new QR scan.
-    hibernationEnabled: process.env.SESSION_HIBERNATION_ENABLED === 'true',
-    // Idle window before hibernation (default: 90 min, between the 1-2h range).
-    idleTimeoutMs: parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '5400000', 10),
-    // How often the idle checker runs (default: 5 min).
-    checkIntervalMs: parseInt(process.env.SESSION_IDLE_CHECK_INTERVAL_MS || '300000', 10),
-    // Max time to wait for a session to become READY when waking it transparently.
-    wakeTimeoutMs: parseInt(process.env.SESSION_WAKE_TIMEOUT_MS || '45000', 10),
   },
 
   sessions: {
@@ -254,8 +306,19 @@ export default () => ({
 
   // Plugin platform configuration
   plugins: {
-    // Where installed plugins live on disk (matches the plugin loader's default).
-    dir: process.env.PLUGINS_DIR || './plugins',
+    // Where installed plugin packages live on disk. This MUST resolve to the same tree as the plugin
+    // registry (<dataDir>/plugins/registry.json, see PluginStorageService): a plugin's code and its
+    // registry entry — status, operator config, secrets, enabledByOperator — are two halves of one
+    // install. While the two defaults were independent, an unset PLUGINS_DIR put the code under
+    // ./plugins and the registry under ./data/plugins, so the loader scanned a directory that did not
+    // exist and reported "Loaded 0 plugins" while the registry still listed every plugin as installed;
+    // in Docker the install also landed in the ephemeral container layer instead of the /app/data
+    // volume, destroying the code on the next recreate while its config and secrets survived.
+    dir: process.env.PLUGINS_DIR || DEFAULT_PLUGINS_DIR,
+    // Compatibility only: the pre-fix default, scanned as a fallback so a host that installed plugins
+    // there keeps loading them. Null once PLUGINS_DIR is set — an operator who named the directory
+    // has said where plugins live, and nothing may second-guess that.
+    legacyDir: process.env.PLUGINS_DIR ? null : LEGACY_PLUGINS_DIR,
     // Remote catalog of installable plugins (JSON array; the OpenWA-plugins repo's plugins.json).
     // Fetched through the SSRF guard — add its host to SSRF_ALLOWED_HOSTS if it is not publicly resolvable.
     catalogUrl:
@@ -309,6 +372,135 @@ export default () => ({
     orphanGraceMs: (() => {
       const n = parseInt(process.env.STATUS_ORPHAN_GRACE_MS ?? '', 10);
       return Number.isFinite(n) && n > 0 ? n : 60 * 60 * 1000;
+    })(),
+  },
+
+  // Chat-media archiving (opt-in): a copy of each message's media in the file store, addressable
+  // after delivery. Independent of the inline base64 the message row already carries.
+  chatMedia: {
+    // Off by default: archiving doubles storage for media under the cap, since the inline copy stays.
+    archiveEnabled: process.env.CHAT_MEDIA_ARCHIVE_ENABLED === 'true',
+    // Extend archiving to media this account SENT. A sub-flag rather than a mode of its own, so what
+    // it writes lands under the same prefix and is maintained by the same retention purge and orphan
+    // sweep. Off by default because it doubles storage again for the outbound half, and because a
+    // URL-based send stores no bytes to archive in the first place.
+    archiveOutbound: process.env.CHAT_MEDIA_ARCHIVE_OUTBOUND === 'true',
+    // Per-file cap on archived chat media (default 25 MiB). Media above it is simply not archived —
+    // the message row and its inline copy are unaffected.
+    maxBytes: (() => {
+      const n = parseInt(process.env.CHAT_MEDIA_ARCHIVE_MAX_BYTES ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 25 * 1024 * 1024;
+    })(),
+    // How long an archived file is kept, in days. 0 (the default) means forever. Unlike statuses,
+    // chat messages have no WhatsApp-side expiry, so retention is purely an operator policy.
+    ttlDays: (() => {
+      const n = parseInt(process.env.CHAT_MEDIA_ARCHIVE_TTL_DAYS ?? '', 10);
+      return Number.isFinite(n) && n >= 0 ? n : 0;
+    })(),
+    // Cadence of the reconciliation sweep that reaps chat-media files no row references (default 1h).
+    orphanSweepIntervalMs: (() => {
+      const n = parseInt(process.env.CHAT_MEDIA_ORPHAN_SWEEP_INTERVAL_MS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 60 * 60 * 1000;
+    })(),
+    // How long an unreferenced chat-media file must be observed by the sweep before deletion
+    // (default 1h), so a file mid-write is never reaped.
+    orphanGraceMs: (() => {
+      const n = parseInt(process.env.CHAT_MEDIA_ORPHAN_GRACE_MS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 60 * 60 * 1000;
+    })(),
+  },
+
+  // Session ownership across processes. A session's engine runs in exactly one process; these
+  // record which, so a second process booting beside a live one does not disturb its sessions.
+  session: {
+    // Stable across restarts by design — a restarted process must recognise its own leftover rows
+    // in order to reset them. Defaults to the hostname, which is the container or host boundary.
+    nodeId: process.env.NODE_ID || '',
+    // Where THIS node answers HTTP for its peers (e.g. http://10.0.0.5:2785). Written onto every
+    // session this node claims, so a peer can forward a request to the engine's host. Empty (the
+    // default) disables request forwarding entirely — the right setting for single-node
+    // deployments, where the lookup would be pure overhead.
+    nodeUrl: process.env.NODE_URL || '',
+    // Ceiling for one forwarded request (default 60s): engine operations can legitimately take
+    // tens of seconds (a send with typing simulation, a media fetch), but a peer must not hold a
+    // caller forever when the owner hangs.
+    proxyTimeoutMs: (() => {
+      const n = parseInt(process.env.SESSION_PROXY_TIMEOUT_MS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 60_000;
+    })(),
+    // How long a claim is honoured without renewal (default 60s). This is the worst-case delay
+    // before a peer may take over from a process that died without releasing.
+    leaseTtlMs: (() => {
+      const n = parseInt(process.env.SESSION_LEASE_TTL_MS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 60_000;
+    })(),
+    // Renewal cadence (default 20s). Comfortably under the TTL so a single missed tick — a slow
+    // query, a brief database blip — never costs a live process its sessions.
+    leaseHeartbeatMs: (() => {
+      const n = parseInt(process.env.SESSION_LEASE_HEARTBEAT_MS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 20_000;
+    })(),
+    // Takeover sweep cadence (default 30s): how often a node looks for sessions whose holder's
+    // lease has lapsed — a crashed peer, or this node's own previous identity after a container
+    // recreate — and starts them here. Gated by the AUTO_START_SESSIONS feature flag.
+    takeoverSweepMs: (() => {
+      const n = parseInt(process.env.SESSION_TAKEOVER_SWEEP_MS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 30_000;
+    })(),
+
+    // ── Unisoft: idle hibernation ────────────────────────────────────────────────
+    // When enabled, sessions that have not SENT a message for `idleTimeoutMs` are hibernated
+    // (engine/Chromium destroyed to free RAM). The WhatsApp auth data stays on disk, so
+    // resuming does not require a new QR scan.
+    hibernationEnabled: process.env.SESSION_HIBERNATION_ENABLED === 'true',
+    // Idle window before hibernation (default: 90 min, between the 1-2h range).
+    idleTimeoutMs: parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '5400000', 10),
+    // How often the idle checker runs (default: 5 min).
+    checkIntervalMs: parseInt(process.env.SESSION_IDLE_CHECK_INTERVAL_MS || '300000', 10),
+    // Max time to wait for a session to become READY when waking it transparently.
+    wakeTimeoutMs: parseInt(process.env.SESSION_WAKE_TIMEOUT_MS || '45000', 10),
+  },
+
+  // Autoreply rules
+  automation: {
+    // Max rules per session. Every inbound message is evaluated against every rule of its session,
+    // so an unbounded count turns each message into unbounded work. Creating a NEW rule above the
+    // cap is rejected with 400; existing ones are grandfathered. Default 32; 0 disables the cap.
+    maxPerSession: (() => {
+      const n = parseInt(process.env.AUTOMATION_MAX_PER_SESSION ?? '', 10);
+      return Number.isFinite(n) && n >= 0 ? n : 32;
+    })(),
+  },
+
+  // Server-side media conversion (opt-in): transcodes caller-supplied audio and video into the
+  // shapes WhatsApp clients actually play, by running the ffmpeg binary. Nothing is converted
+  // implicitly — only the explicit conversion endpoints use this.
+  mediaConversion: {
+    // Off by default: it spawns an external process per request, so an operator opts in knowingly.
+    // Even when true the endpoints stay unavailable unless the binary is actually present, so
+    // enabling it on a host without ffmpeg degrades to a clear 503 rather than a spawn error.
+    enabled: process.env.MEDIA_CONVERSION_ENABLED === 'true',
+    // Absolute path to the binary, for hosts that keep it outside PATH. Resolved via PATH by default.
+    ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
+    // Wall-clock ceiling for one conversion (default 60s). A codec can spin on malformed input, and
+    // this process is spawned on a request path, so the timeout kills it rather than tying up a slot.
+    timeoutMs: (() => {
+      const n = parseInt(process.env.MEDIA_CONVERSION_TIMEOUT_MS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 60_000;
+    })(),
+    // Cap on the CONVERTED bytes (default 50 MiB, matching the inbound media cap). Transcoding can
+    // inflate as well as shrink, so the output needs its own ceiling and not just the input's.
+    maxOutputBytes: (() => {
+      const n = parseInt(process.env.MEDIA_CONVERSION_MAX_OUTPUT_BYTES ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 50 * 1024 * 1024;
+    })(),
+    // At most this many ffmpeg processes at once (default 2). Each conversion spawns an external
+    // process and holds its input in heap; without a bound, requests inside the rate-limit window
+    // can stack processes for as long as each one runs. A short queue absorbs bursts; beyond it
+    // the endpoint answers 503 rather than piling on.
+    concurrency: (() => {
+      const n = parseInt(process.env.MEDIA_CONVERSION_CONCURRENCY ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 2;
     })(),
   },
 

@@ -1,4 +1,8 @@
 import { UnauthorizedException } from '@nestjs/common';
+import type { ConfigService } from '@nestjs/config';
+
+// ConfigService stub for the media-shed knob: no override means the default cap applies.
+const asConfig = (): { get: jest.Mock } => ({ get: jest.fn((_key: string, defaultValue?: unknown) => defaultValue) });
 import { Socket } from 'socket.io';
 import { EventsGateway, isSessionSubscriptionAllowed } from './events.gateway';
 import { AuthService } from '../auth/auth.service';
@@ -68,7 +72,11 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
   beforeEach(() => {
     authService = { validateApiKey: jest.fn() };
     auditService = { logWarn: jest.fn().mockResolvedValue(null) };
-    gateway = new EventsGateway(authService as unknown as AuthService, auditService as unknown as AuditService);
+    gateway = new EventsGateway(
+      authService as unknown as AuthService,
+      auditService as unknown as AuditService,
+      asConfig() as unknown as ConfigService,
+    );
   });
 
   it('rejects a connection with no API key (and never calls validate)', async () => {
@@ -379,11 +387,84 @@ const makeCapturingServer = () => {
   return { server, emit, rooms };
 };
 
+describe('EventsGateway inline-media shedding on message events', () => {
+  const gwWithCap = (cap?: number) => {
+    const config = {
+      get: jest.fn((_key: string, defaultValue?: unknown) => (cap === undefined ? defaultValue : cap)),
+    };
+    return new EventsGateway(
+      { validateApiKey: jest.fn() } as unknown as AuthService,
+      { logWarn: jest.fn().mockResolvedValue(null) } as unknown as AuditService,
+      config as unknown as ConfigService,
+    );
+  };
+  const bigMedia = (): Record<string, unknown> => ({
+    id: 'm1',
+    media: { mimetype: 'image/jpeg', filename: 'big.jpg', data: 'A'.repeat(1024 * 1024 * 2) }, // ~1.5 MB decoded
+  });
+
+  it('replaces an over-cap inline media blob with the omitted marker on message.received', () => {
+    const gateway = gwWithCap();
+    const { server, emit } = makeCapturingServer();
+    (gateway as unknown as { server: unknown }).server = server;
+    const message = bigMedia();
+
+    gateway.emitMessage('sess-1', message);
+
+    const [, sent] = emit.mock.calls[0] as [string, WSEventMessage];
+    expect(sent.payload.event).toBe('message.received');
+    const media = (sent.payload.data as Record<string, unknown>).media as Record<string, unknown>;
+    expect(media.omitted).toBe(true);
+    expect(media.data).toBeUndefined();
+    expect(media.mimetype).toBe('image/jpeg');
+    expect(media.filename).toBe('big.jpg');
+    expect(typeof media.sizeBytes).toBe('number');
+    // The caller's event object is never mutated: the webhook fan-out receives the same object.
+    expect((message.media as Record<string, unknown>).data).toHaveLength(1024 * 1024 * 2);
+  });
+
+  it('sheds on message.sent with the same contract', () => {
+    const gateway = gwWithCap();
+    const { server, emit } = makeCapturingServer();
+    (gateway as unknown as { server: unknown }).server = server;
+
+    gateway.emitMessageSent('sess-1', bigMedia());
+
+    const [, sent] = emit.mock.calls[0] as [string, WSEventMessage];
+    expect(sent.payload.event).toBe('message.sent');
+    expect(((sent.payload.data as Record<string, unknown>).media as Record<string, unknown>).omitted).toBe(true);
+  });
+
+  it('passes small inline media through untouched', () => {
+    const gateway = gwWithCap();
+    const { server, emit } = makeCapturingServer();
+    (gateway as unknown as { server: unknown }).server = server;
+    const small = { id: 'm2', media: { mimetype: 'image/png', data: 'aGk=' } };
+
+    gateway.emitMessage('sess-1', small);
+
+    const [, sent] = emit.mock.calls[0] as [string, WSEventMessage];
+    expect((sent.payload.data as Record<string, unknown>).media).toEqual({ mimetype: 'image/png', data: 'aGk=' });
+  });
+
+  it('honors a tightened cap (0 sheds every inline blob, matching the webhook knob semantics)', () => {
+    const gateway = gwWithCap(0);
+    const { server, emit } = makeCapturingServer();
+    (gateway as unknown as { server: unknown }).server = server;
+
+    gateway.emitMessage('sess-1', { id: 'm3', media: { mimetype: 'image/png', data: 'aGk=' } });
+
+    const [, sent] = emit.mock.calls[0] as [string, WSEventMessage];
+    expect(((sent.payload.data as Record<string, unknown>).media as Record<string, unknown>).omitted).toBe(true);
+  });
+});
+
 describe('EventsGateway.emitToRooms fan-out', () => {
   const gw = () =>
     new EventsGateway(
       { validateApiKey: jest.fn() } as unknown as AuthService,
       { logWarn: jest.fn().mockResolvedValue(null) } as unknown as AuditService,
+      asConfig() as unknown as ConfigService,
     );
 
   it('delivers one event with a single broadcast across all four rooms (no per-room duplicate emit)', () => {
@@ -420,6 +501,7 @@ describe('event catalog ⇔ emitter invariants (drift guard)', () => {
     const gateway = new EventsGateway(
       { validateApiKey: jest.fn() } as unknown as AuthService,
       { logWarn: jest.fn().mockResolvedValue(null) } as unknown as AuditService,
+      asConfig() as unknown as ConfigService,
     );
     const captured: string[] = [];
     const op: { to: () => unknown; emit: (ch: string, msg: WSEventMessage) => boolean } = {
@@ -502,7 +584,11 @@ describe('EventsGateway rate limiting', () => {
   });
 
   const buildGateway = (): EventsGateway => {
-    gateway = new EventsGateway(authService as unknown as AuthService, auditService as unknown as AuditService);
+    gateway = new EventsGateway(
+      authService as unknown as AuthService,
+      auditService as unknown as AuditService,
+      asConfig() as unknown as ConfigService,
+    );
     return gateway;
   };
 

@@ -298,3 +298,84 @@ describe('StorageService local traversal (async + bounded)', () => {
     expect(seen.length).toBe(20); // complete where listFiles() above truncates at 5
   });
 });
+
+/**
+ * The export enumerated with listFiles(), which stops at STORAGE_LIST_MAX_FILES and returns without
+ * logging or throwing — so the documented local→S3 migration (export, repoint STORAGE_TYPE, import)
+ * silently left media behind, and the operator's own files/count pre-check was truncated by the same
+ * path. iterateFiles() exists for exactly this case: its own doc calls the cap "a per-call DoS guard,
+ * not a completeness contract" and tells callers needing the whole store to iterate instead.
+ */
+describe('StorageService.createExportStream enumerates the whole store', () => {
+  it('walks the uncapped iterator rather than the capped listing', async () => {
+    const { service } = makeLocalService();
+    const listFiles = jest.spyOn(service, 'listFiles');
+    const iterateFiles = jest.spyOn(service, 'iterateFiles').mockImplementation(async function* () {
+      yield await Promise.resolve('media/a.bin');
+    });
+    jest.spyOn(service, 'getFile').mockResolvedValue(Buffer.from('x'));
+
+    // The enumerator runs before the archive is constructed, so which one was used is settled even
+    // if archiving itself cannot run in this environment. That is the whole claim here.
+    await service.createExportStream().catch(() => undefined);
+
+    expect(iterateFiles).toHaveBeenCalled();
+    expect(listFiles).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The count is the OTHER half of the same fix and had no test of its own — reverting it to the
+   * capped listing left the suite green. It is the pre-check an operator runs before that migration,
+   * so a count truncated at the cap hides precisely the gap they are checking for, and hides it
+   * while agreeing with itself.
+   */
+  it('counts with the uncapped iterator too, so the pre-check cannot hide the gap', async () => {
+    const { service } = makeLocalService();
+    const listFiles = jest.spyOn(service, 'listFiles');
+    const iterateFiles = jest.spyOn(service, 'iterateFiles').mockImplementation(async function* () {
+      yield await Promise.resolve('media/a.bin');
+      yield await Promise.resolve('media/b.bin');
+    });
+
+    const { count } = await service.getFileCount();
+
+    expect(iterateFiles).toHaveBeenCalled();
+    expect(listFiles).not.toHaveBeenCalled();
+    expect(count).toBe(2); // the iterator's items are what was counted, not an unrelated walk
+  });
+
+  /**
+   * Removing the cap from the enumeration also removed the bound on the SIZE loop underneath it,
+   * which stat'ed every file synchronously. On a large store that holds the event loop for the whole
+   * walk: health checks, webhooks and every in-flight request wait behind a count.
+   *
+   * Measured, not asserted structurally. A single "did something run during the call?" flag is NOT
+   * discriminating here — the enumeration awaits before the stat loop begins, so that flag flips
+   * either way. Counting how many times the loop yields WHILE the call is pending does discriminate:
+   * measured at 1 tick for 2000 files with the synchronous loop, and it rises with the file count
+   * once each stat yields.
+   */
+  it('does not hold the event loop for the whole walk', async () => {
+    const { service, localPath } = makeLocalService();
+    fs.mkdirSync(localPath, { recursive: true });
+    const FILES = 2000;
+    for (let i = 0; i < FILES; i++) {
+      fs.writeFileSync(path.join(localPath, `f${i}.bin`), 'x');
+    }
+
+    let ticks = 0;
+    let finished = false;
+    const tick = (): void => {
+      if (finished) return;
+      ticks += 1;
+      setImmediate(tick);
+    };
+    setImmediate(tick);
+
+    const { count } = await service.getFileCount();
+    finished = true;
+
+    expect(count).toBe(FILES); // the walk really did the work being measured
+    expect(ticks).toBeGreaterThan(100);
+  }, 30000);
+});

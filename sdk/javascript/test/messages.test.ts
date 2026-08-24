@@ -84,7 +84,17 @@ describe('MessagesResource — exact paths', () => {
     const t = new MockTransport().on('GET', /\/messages$/, {
       body: {
         messages: [
-          { id: '1', sessionId: 's', chatId: 'a@c.us', from: 'a@c.us', to: 's', type: 'text', direction: 'incoming', status: 'delivered', createdAt: '' },
+          {
+            id: '1',
+            sessionId: 's',
+            chatId: 'a@c.us',
+            from: 'a@c.us',
+            to: 's',
+            type: 'text',
+            direction: 'incoming',
+            status: 'delivered',
+            createdAt: '',
+          },
         ],
         total: 1,
       },
@@ -92,6 +102,52 @@ describe('MessagesResource — exact paths', () => {
     const res = await client(t).messages.list('s', { chatId: 'a@c.us' });
     expect(res.total).toBe(1);
     expect(res.messages).toHaveLength(1);
+  });
+
+  // Asserted on the BODY, not the URL: the field is what this is about, and a URL assertion cannot
+  // see a dropped key. One case per request type, because each is a separate declaration — a type
+  // that forgot the field would still send it from JS but would not compile for a typed caller.
+  it.each([
+    [
+      'send-text',
+      (c: OpenWAClient) => c.messages.sendText('s1', { chatId: 'a@c.us', text: 'hi', quotedMessageId: 'q1' }),
+    ],
+    [
+      'send-image',
+      (c: OpenWAClient) => c.messages.sendImage('s1', { chatId: 'a@c.us', url: 'http://u', quotedMessageId: 'q1' }),
+    ],
+    [
+      'send-location',
+      (c: OpenWAClient) =>
+        c.messages.sendLocation('s1', { chatId: 'a@c.us', latitude: 1, longitude: 2, quotedMessageId: 'q1' }),
+    ],
+    [
+      'send-contact',
+      (c: OpenWAClient) =>
+        c.messages.sendContact('s1', {
+          chatId: 'a@c.us',
+          contactName: 'A',
+          contactNumber: '628',
+          quotedMessageId: 'q1',
+        }),
+    ],
+    [
+      'send-poll',
+      (c: OpenWAClient) =>
+        c.messages.sendPoll('s1', { chatId: 'a@c.us', name: 'Q', options: ['a', 'b'], quotedMessageId: 'q1' }),
+    ],
+  ])('%s forwards quotedMessageId in the body', async (route, call) => {
+    const t = new MockTransport().on('POST', new RegExp(`${route}$`), { body: { messageId: 'm', timestamp: 1 } });
+    await call(client(t));
+    expect(t.lastCall!.body).toMatchObject({ quotedMessageId: 'q1' });
+  });
+
+  // Known-negative control: an ordinary send must not carry the key at all, so an implementation
+  // that always emitted it (as `undefined`, which JSON.stringify drops but a proxy may not) fails.
+  it('omits quotedMessageId entirely on an ordinary send', async () => {
+    const t = new MockTransport().on('POST', /send-image$/, { body: { messageId: 'm', timestamp: 1 } });
+    await client(t).messages.sendImage('s1', { chatId: 'a@c.us', url: 'http://u' });
+    expect(t.lastCall!.body).not.toHaveProperty('quotedMessageId');
   });
 
   it('reply / forward / react / delete', async () => {
@@ -149,7 +205,11 @@ describe('MessagesResource — exact paths', () => {
         },
       })
       .on('POST', /\/batch\/b\/cancel$/, {
-        body: { batchId: 'b', status: 'cancelled', progress: { total: 1, sent: 0, failed: 0, pending: 0, cancelled: 1 } },
+        body: {
+          batchId: 'b',
+          status: 'cancelled',
+          progress: { total: 1, sent: 0, failed: 0, pending: 0, cancelled: 1 },
+        },
       });
     const c = client(t);
     await c.messages.sendBulk('s', { messages: [{ chatId: 'a@c.us', type: 'text', content: { text: 'x' } }] });

@@ -213,7 +213,7 @@ export class DockerService implements OnModuleInit {
    *  - Credentials: the compose services are the MANUAL operator path and deliberately ship no
    *    default secret (empty POSTGRES_PASSWORD / MINIO_ROOT_* fail fast on boot). The specs below
    *    are the dashboard built-in path: they provision the fixed built-in credentials
-   *    (openwa/openwa, minioadmin/minioadmin) that infra.controller writes to data/.env.generated
+   *    (openwa/openwa, minioadmin/minioadmin) that infra-config.controller writes to data/.env.generated
    *    and that the production boot guard (bootstrap-security.ts) exempts only while the
    *    *_BUILTIN flag is set AND the datastore host resolves to the internal-only container.
    *  - Postgres init script: compose bind-mounts scripts/postgres-init-schema.sh from the host
@@ -240,7 +240,9 @@ export class DockerService implements OnModuleInit {
         image: 'redis:7-alpine',
         name: 'openwa-redis',
         alias: 'redis', // DNS alias for resolution
-        cmd: ['redis-server', '--appendonly', 'yes'],
+        // noeviction mirrors docker-compose.yml: BullMQ requires it, or Redis may evict queue keys
+        // once maxmemory is reached and silently drop queued jobs.
+        cmd: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction'],
         volumes: [{ name: 'openwa_redis-data', path: '/data' }],
         healthcheck: {
           test: ['CMD', 'redis-cli', 'ping'],
@@ -259,7 +261,7 @@ export class DockerService implements OnModuleInit {
         name: 'openwa-postgres',
         alias: 'postgres',
         // Fixed built-in credentials — the dashboard saves these same values to
-        // data/.env.generated (infra.controller) and the production boot guard exempts them only
+        // data/.env.generated (infra-config.controller) and the production boot guard exempts them only
         // for the built-in, internal-host deployment (see the getContainerSpec docblock).
         env: ['POSTGRES_USER=openwa', 'POSTGRES_PASSWORD=openwa', 'POSTGRES_DB=openwa'],
         volumes: [{ name: 'openwa_postgres-data', path: '/var/lib/postgresql/data' }],
@@ -403,7 +405,9 @@ export class DockerService implements OnModuleInit {
       this.logger.log(`Created and started container: ${spec.name}`);
       return true;
     } catch (error) {
-      this.logger.error(`Failed to create service ${profile}: ${error instanceof Error ? error.message : error}`);
+      this.logger.error(
+        `Failed to create service ${profile}: ${error instanceof Error ? error.message : String(error)}`,
+      );
       return false;
     }
   }

@@ -32,15 +32,25 @@ export class RedriveService {
   redriveInstance(
     pluginId: string,
     instanceId: string,
+    sessionIdFilter: string | null,
   ): Promise<{ redriven: number; remaining: number; batchSize: number }> {
-    return this.lock.run(`redrive:${pluginId}:${instanceId}`, () => this.redriveBatch(pluginId, instanceId));
+    return this.lock.run(`redrive:${pluginId}:${instanceId}`, () =>
+      this.redriveBatch(pluginId, instanceId, sessionIdFilter),
+    );
   }
 
   private async redriveBatch(
     pluginId: string,
     instanceId: string,
+    sessionIdFilter: string | null,
   ): Promise<{ redriven: number; remaining: number; batchSize: number }> {
-    const where = { pluginId, instanceId, direction: 'inbound' as const, redriven: false };
+    const where = {
+      pluginId,
+      instanceId,
+      direction: 'inbound' as const,
+      redriven: false,
+      ...(sessionIdFilter === null ? {} : { sessionId: sessionIdFilter }),
+    };
     const rows = await this.repo.find({
       where,
       // Failed replays increment attempts and move behind never-retried rows, preventing one permanent

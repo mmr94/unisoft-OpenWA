@@ -1,7 +1,10 @@
 import { Injectable, OnApplicationBootstrap } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { AuditService } from '../audit/audit.service';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
+import { Session } from '../session/entities/session.entity';
 import { PluginInstanceService } from './plugin-instance.service';
 import { PluginInstance } from './entities/plugin-instance.entity';
 import { createLogger } from '../../common/services/logger.service';
@@ -21,6 +24,8 @@ export class ScopeBindingService implements OnApplicationBootstrap {
     private readonly instances: PluginInstanceService,
     private readonly loader: PluginLoaderService,
     private readonly audit: AuditService,
+    @InjectRepository(Session, 'data')
+    private readonly sessions: Repository<Session>,
   ) {}
 
   /**
@@ -64,7 +69,8 @@ export class ScopeBindingService implements OnApplicationBootstrap {
       if (!inst.enabled) continue;
       // Skip instances whose plugin isn't loaded — applyScopeBinding would only no-op/log for them.
       if (!this.loader.getPlugin(inst.pluginId)) continue;
-      await this.applyScopeBinding(inst.pluginId, inst.sessionScope, inst.config ?? {}, true);
+      await this.applyScopeBinding(inst.pluginId, inst.sessionScope, inst.config ?? {}, true, { additive: true });
+      await this.warnIfScopeHasNoSession(inst);
       count++;
     }
 
@@ -77,6 +83,41 @@ export class ScopeBindingService implements OnApplicationBootstrap {
   }
 
   /**
+   * Warn when a just-reconciled instance binds a concrete scope no session row matches — a session the
+   * operator deleted, or a scope typed/copied wrong. The plugin is then activated for nothing: the
+   * dispatch gate never matches that id, so it receives no events, while every signal an operator can
+   * read stays reassuring (the instance row says `enabled`, the plugin's status says `enabled`, hooks
+   * are registered and healthCheck is green). This log line is the only place that inertness surfaces.
+   *
+   * Diagnostic only — it never skips or alters the binding: the id may be recreated (an import or a
+   * re-provision can restore the same session id), in which case the restored binding is exactly right.
+   */
+  private async warnIfScopeHasNoSession(inst: PluginInstance): Promise<void> {
+    if (!inst.sessionScope || inst.sessionScope === '*') return;
+    try {
+      // The same row read SessionService.findOne performs ({ where: { id } }), straight through the
+      // repository: a missing row resolves to null instead of throwing NotFoundException, and the
+      // service's runtime-state projection is more than this existence check needs.
+      const session = await this.sessions.findOne({ where: { id: inst.sessionScope } });
+      // A null row (and only a null row) means the session is genuinely missing.
+      if (session) return;
+      this.logger.warn(
+        `Plugin instance ${inst.pluginId}:${inst.instanceId} is bound to session '${inst.sessionScope}', which does not exist — it will receive no events until that session is restored or the instance is re-scoped`,
+        {
+          action: 'scope_binding_session_missing',
+          pluginId: inst.pluginId,
+          instanceId: inst.instanceId,
+          sessionScope: inst.sessionScope,
+        },
+      );
+    } catch {
+      // A failure that throws (a DB hiccup mid-boot) is not evidence the session is gone, and
+      // reporting it as gone would send an operator hunting a binding that is in fact fine — so
+      // stay quiet rather than cry wolf.
+    }
+  }
+
+  /**
    * Bind an instance's config to the plugin's runtime so an ingress handler resolves it as ctx.config
    * (see PluginLoaderService.dispatchWebhookForInstance) and activate the session — iff `activate` (a
    * disabled or removed instance must not keep firing). A concrete scope writes sessionConfig[scope] and
@@ -85,12 +126,22 @@ export class ScopeBindingService implements OnApplicationBootstrap {
    * session + sessionConfig survive while a sibling binds the same scope, and '*' survives while a
    * sibling binds a wildcard/null scope.
    * Best-effort: provisioning must not fail because the plugin is momentarily unloaded.
+   *
+   * `additive` is for the boot reconciler, which RESTORES bindings rather than deciding them. Retiring
+   * '*' on a concrete activation is a provisioning-time decision — the operator just narrowed this
+   * plugin to one session, so it should stop firing on all of them. At boot there is no such new
+   * decision to apply: activeSessions (restored from registry.json) already encodes the outcome of
+   * every prior decision, including an explicit PUT /api/plugins/:id/sessions. Re-deriving it from the
+   * instance row would silently overwrite that operator choice — and bind the plugin to the row's
+   * scope even when that session has since been deleted, leaving it activated for nothing. So the boot
+   * path only ever ADDS the row's scope; it removes nothing.
    */
   async applyScopeBinding(
     pluginId: string,
     scope: string | null,
     config: Record<string, unknown>,
     activate: boolean,
+    opts: { additive?: boolean } = {},
   ): Promise<void> {
     try {
       if (!scope || scope === '*') {
@@ -123,13 +174,30 @@ export class ScopeBindingService implements OnApplicationBootstrap {
       // instance being torn down.
       const siblings = await this.instances.list(pluginId);
       if (!activate && siblings.some(i => i.enabled && i.sessionScope === scope)) {
-        // A sibling still binds this scope: leave the session active and its sessionConfig intact —
-        // stripping either would silence the sibling until the next boot-time reconciliation.
+        // A sibling still binds this scope, so the SESSION stays active: dropping it would silence
+        // that sibling until the next boot-time reconciliation.
+        //
+        // The config slice does NOT survive with it. It is keyed by scope, so it holds whichever
+        // instance was projected last — usually the one being retired here — and once this teardown
+        // leaves a single enabled instance on the scope, dispatch re-declares the slice attributable
+        // to that survivor (PluginSandboxBridge.scopeHasAtMostOneInstance) and merges it beneath the
+        // survivor's own row. A survivor relying on a plugin default for a key it does not define
+        // was handed the retired tenant's endpoint and credentials for it — the cross-tenant collapse
+        // per-instance resolution exists to prevent, reachable by disabling or deleting one of two
+        // instances. Clearing costs the survivor nothing it owns: resolveInstanceConfig layers its
+        // own row on top either way, and boot reconciliation re-projects it.
+        //
+        // An operator's per-session override (PUT /plugins/:id/config/:sessionId) shares this slice
+        // and is cleared with it. That is the safe direction — provisioning already overwrites such
+        // an override, and a missing default beats another tenant's credential.
+        this.loader.setPluginSessionConfig(pluginId, scope, {});
         return;
       }
       this.loader.setPluginSessionConfig(pluginId, scope, activate ? config : {});
       const current = this.loader.getPlugin(pluginId)?.activeSessions ?? [];
-      const set = new Set(current.filter(s => s !== '*'));
+      // Provisioning retires '*' (this instance narrows the plugin to one session); the additive boot
+      // path keeps the restored set whole, so an operator's PUT /plugins/:id/sessions survives a restart.
+      const set = new Set(opts.additive ? current : current.filter(s => s !== '*'));
       if (activate) set.add(scope);
       else set.delete(scope);
       // Preserve '*' while an enabled wildcard/null sibling still binds all sessions ('*' subsumes

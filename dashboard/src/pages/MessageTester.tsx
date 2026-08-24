@@ -315,6 +315,7 @@ export function MessageTester() {
           batchId: batch.batchId,
           status: 'pending',
           progress: { total: batch.totalMessages, sent: 0, failed: 0, pending: batch.totalMessages, cancelled: 0 },
+          results: [],
         });
         startBatchPolling(session, batch.batchId);
         return;
@@ -444,8 +445,8 @@ export function MessageTester() {
           <h2 className="eyebrow">{t('messageTester.compose')}</h2>
 
           <div className="form-group">
-            <label>{t('messageTester.session')}</label>
-            <select value={session} onChange={e => setSession(e.target.value)}>
+            <label htmlFor="mt-1">{t('messageTester.session')}</label>
+            <select id="mt-1" value={session} onChange={e => setSession(e.target.value)}>
               {sessions.length === 0 && <option value="">{t('messageTester.noReadySessions')}</option>}
               {sessions.map(s => (
                 <option key={s.id} value={s.id}>
@@ -459,15 +460,23 @@ export function MessageTester() {
           {messageType !== 'bulk' && (
             <>
               <div className="form-group">
-                <label>{t('messageTester.recipientType')}</label>
-                <div className="toggle-group">
+                {/* A caption, not a label: it names the group, and there is no single control to bind
+                    it to. The buttons are exclusive choices, so each reports its own pressed state. */}
+                <span className="group-label" id="recipient-type-label">
+                  {t('messageTester.recipientType')}
+                </span>
+                <div className="toggle-group" role="group" aria-labelledby="recipient-type-label">
                   <button
+                    type="button"
+                    aria-pressed={recipientType === 'personal'}
                     className={recipientType === 'personal' ? 'active' : ''}
                     onClick={() => setRecipientType('personal')}
                   >
                     {t('messageTester.personal')}
                   </button>
                   <button
+                    type="button"
+                    aria-pressed={recipientType === 'group'}
                     className={recipientType === 'group' ? 'active' : ''}
                     onClick={() => setRecipientType('group')}
                   >
@@ -477,12 +486,13 @@ export function MessageTester() {
               </div>
 
               <div className="form-group">
-                <label>
+                <label htmlFor="mt-13">
                   {recipientType === 'group' ? t('messageTester.selectGroup') : t('messageTester.recipientPhone')}
                 </label>
                 {recipientType === 'group' ? (
                   <>
                     <select
+                      id="mt-13"
                       value={selectedGroup}
                       onChange={e => setSelectedGroup(e.target.value)}
                       disabled={loadingGroups || groups.length === 0}
@@ -515,11 +525,15 @@ export function MessageTester() {
           )}
 
           <div className="form-group">
-            <label>{t('messageTester.messageType')}</label>
-            <div className="toggle-group toggle-group-wrap">
+            <span className="group-label" id="message-type-label">
+              {t('messageTester.messageType')}
+            </span>
+            <div className="toggle-group toggle-group-wrap" role="group" aria-labelledby="message-type-label">
               {messageTypes.map(type => (
                 <button
                   key={type}
+                  type="button"
+                  aria-pressed={messageType === type}
                   className={messageType === type ? 'active' : ''}
                   onClick={() => {
                     // A picked file's mimetype is bound to the category active at pick time, so dropping the
@@ -536,8 +550,9 @@ export function MessageTester() {
 
           {messageType === 'text' && (
             <div className="form-group">
-              <label>{t('messageTester.messageContent')}</label>
+              <label htmlFor="mt-2">{t('messageTester.messageContent')}</label>
               <textarea
+                id="mt-2"
                 value={content}
                 onChange={e => setContent(e.target.value)}
                 placeholder={t('messageTester.messagePlaceholder')}
@@ -549,8 +564,9 @@ export function MessageTester() {
           {isMediaMessageType && (
             <>
               <div className="form-group">
-                <label>{t('messageTester.mediaUrl')}</label>
+                <label htmlFor="mt-3">{t('messageTester.mediaUrl')}</label>
                 <input
+                  id="mt-3"
                   type="text"
                   value={mediaUrl}
                   onChange={e => {
@@ -590,11 +606,12 @@ export function MessageTester() {
               </div>
               {messageType !== 'audio' && messageType !== 'sticker' && (
                 <div className="form-group">
-                  <label>
+                  <label htmlFor="mt-14">
                     {messageType === 'document' ? t('messageTester.filename') : t('messageTester.caption')} (
                     {t('common.optional')})
                   </label>
                   <input
+                    id="mt-14"
                     type="text"
                     value={content}
                     onChange={e => setContent(e.target.value)}
@@ -613,8 +630,9 @@ export function MessageTester() {
             <>
               <div className="form-row">
                 <div className="form-group">
-                  <label>{t('messageTester.locationLatitude')}</label>
+                  <label htmlFor="mt-4">{t('messageTester.locationLatitude')}</label>
                   <input
+                    id="mt-4"
                     type="number"
                     step="any"
                     min={-90}
@@ -625,8 +643,9 @@ export function MessageTester() {
                   />
                 </div>
                 <div className="form-group">
-                  <label>{t('messageTester.locationLongitude')}</label>
+                  <label htmlFor="mt-5">{t('messageTester.locationLongitude')}</label>
                   <input
+                    id="mt-5"
                     type="number"
                     step="any"
                     min={-180}
@@ -638,16 +657,26 @@ export function MessageTester() {
                 </div>
               </div>
               <div className="form-group">
-                <label>
+                <label htmlFor="mt-15">
                   {t('messageTester.locationDescription')} ({t('common.optional')})
                 </label>
-                <input type="text" value={locationDescription} onChange={e => setLocationDescription(e.target.value)} />
+                <input
+                  id="mt-15"
+                  type="text"
+                  value={locationDescription}
+                  onChange={e => setLocationDescription(e.target.value)}
+                />
               </div>
               <div className="form-group">
-                <label>
+                <label htmlFor="mt-16">
                   {t('messageTester.locationAddress')} ({t('common.optional')})
                 </label>
-                <input type="text" value={locationAddress} onChange={e => setLocationAddress(e.target.value)} />
+                <input
+                  id="mt-16"
+                  type="text"
+                  value={locationAddress}
+                  onChange={e => setLocationAddress(e.target.value)}
+                />
               </div>
             </>
           )}
@@ -655,8 +684,9 @@ export function MessageTester() {
           {messageType === 'contact' && (
             <>
               <div className="form-group">
-                <label>{t('messageTester.contactName')}</label>
+                <label htmlFor="mt-6">{t('messageTester.contactName')}</label>
                 <input
+                  id="mt-6"
                   type="text"
                   value={contactName}
                   onChange={e => setContactName(e.target.value)}
@@ -664,8 +694,9 @@ export function MessageTester() {
                 />
               </div>
               <div className="form-group">
-                <label>{t('messageTester.contactNumber')}</label>
+                <label htmlFor="mt-7">{t('messageTester.contactNumber')}</label>
                 <input
+                  id="mt-7"
                   type="text"
                   value={contactNumber}
                   onChange={e => setContactNumber(e.target.value)}
@@ -678,8 +709,9 @@ export function MessageTester() {
           {messageType === 'poll' && (
             <>
               <div className="form-group">
-                <label>{t('messageTester.pollQuestion')}</label>
+                <label htmlFor="mt-8">{t('messageTester.pollQuestion')}</label>
                 <input
+                  id="mt-8"
                   type="text"
                   value={pollQuestion}
                   onChange={e => setPollQuestion(e.target.value)}
@@ -733,10 +765,11 @@ export function MessageTester() {
           {messageType === 'forward' && (
             <>
               <div className="form-group">
-                <label>
+                <label htmlFor="mt-17">
                   {t('messageTester.forwardFromChatId')} ({t('common.optional')})
                 </label>
                 <input
+                  id="mt-17"
                   type="text"
                   value={forwardFrom}
                   onChange={e => setForwardFrom(e.target.value)}
@@ -747,8 +780,9 @@ export function MessageTester() {
                 <span className="hint">{t('messageTester.forwardFromHint')}</span>
               </div>
               <div className="form-group">
-                <label>{t('messageTester.forwardToChatId')}</label>
+                <label htmlFor="mt-9">{t('messageTester.forwardToChatId')}</label>
                 <input
+                  id="mt-9"
                   type="text"
                   value={forwardTo}
                   onChange={e => setForwardTo(e.target.value)}
@@ -756,8 +790,13 @@ export function MessageTester() {
                 />
               </div>
               <div className="form-group">
-                <label>{t('messageTester.forwardMessageId')}</label>
-                <input type="text" value={forwardMessageId} onChange={e => setForwardMessageId(e.target.value)} />
+                <label htmlFor="mt-10">{t('messageTester.forwardMessageId')}</label>
+                <input
+                  id="mt-10"
+                  type="text"
+                  value={forwardMessageId}
+                  onChange={e => setForwardMessageId(e.target.value)}
+                />
                 <span className="hint">{t('messageTester.forwardMessageIdHint')}</span>
               </div>
             </>
@@ -766,8 +805,9 @@ export function MessageTester() {
           {messageType === 'bulk' && (
             <>
               <div className="form-group">
-                <label>{t('messageTester.bulkRecipients')}</label>
+                <label htmlFor="mt-11">{t('messageTester.bulkRecipients')}</label>
                 <textarea
+                  id="mt-11"
                   value={bulkRecipients}
                   onChange={e => setBulkRecipients(e.target.value)}
                   placeholder={t('messageTester.bulkRecipientsPlaceholder')}
@@ -779,8 +819,9 @@ export function MessageTester() {
                 </span>
               </div>
               <div className="form-group">
-                <label>{t('messageTester.messageContent')}</label>
+                <label htmlFor="mt-12">{t('messageTester.messageContent')}</label>
                 <textarea
+                  id="mt-12"
                   value={content}
                   onChange={e => setContent(e.target.value)}
                   placeholder={t('messageTester.messagePlaceholder')}
@@ -788,10 +829,11 @@ export function MessageTester() {
                 />
               </div>
               <div className="form-group">
-                <label>
+                <label htmlFor="mt-18">
                   {t('messageTester.bulkDelay')} ({t('common.optional')})
                 </label>
                 <input
+                  id="mt-18"
                   type="number"
                   min={1000}
                   max={60000}

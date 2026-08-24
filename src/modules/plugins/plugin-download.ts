@@ -53,6 +53,47 @@ export function assertDownloadSha256(url: string, body: Buffer): void {
 }
 
 /**
+ * Transport rule for a plugin install/update URL, enforced BEFORE any fetch. The downloaded bytes
+ * are executable code, so plain http is only accepted when the URL pins the expected content with a
+ * `#sha256=<64 hex>` fragment — the pin is then verified against the download (fail-closed) before
+ * anything is installed. https is accepted as-is (TLS is the integrity layer), and anything else —
+ * an unparseable URL or a non-http(s) scheme — is left for the SSRF guard to reject downstream.
+ */
+export function assertPluginInstallUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return; // not a parseable URL — resolveSafeFetchTarget rejects it with the clearer error
+  }
+  // expectedSha256FromUrl throws on a malformed marker. On http that surfaces here (fail-closed
+  // at the transport gate); on https it is left for the post-download integrity check to report,
+  // preserving that error's wording — either way an explicit-but-unusable pin never degrades to
+  // "no pin".
+  let pinned = false;
+  try {
+    pinned = expectedSha256FromUrl(url) !== null;
+  } catch (error) {
+    if (parsed.protocol === 'http:') throw error;
+  }
+  if (parsed.protocol === 'http:' && !pinned) {
+    throw new Error('plain http is only accepted with a content pin: append #sha256=<64 hex> to the URL, or use https');
+  }
+  // Installing a plugin is executing third-party code on the host. HTTPS authenticates the
+  // CHANNEL, not the bytes-as-reviewed — a compromised release host or a hijacked catalog still
+  // ships whatever it likes. In production (or wherever PLUGIN_INSTALL_REQUIRE_PIN says so) an
+  // install from a URL therefore requires the pin; dev keeps the lighter default.
+  const requirePin =
+    process.env.PLUGIN_INSTALL_REQUIRE_PIN === 'true' ||
+    (process.env.PLUGIN_INSTALL_REQUIRE_PIN !== 'false' && process.env.NODE_ENV === 'production');
+  if (requirePin && !pinned) {
+    throw new Error(
+      'installing from a URL requires an integrity pin in this deployment: append #sha256=<64 hex> to the URL (PLUGIN_INSTALL_REQUIRE_PIN=false disables this)',
+    );
+  }
+}
+
+/**
  * Fetch a remote resource (plugin .zip or catalog JSON) as a Buffer, always behind the SSRF guard:
  * every host (the original URL and every redirect hop) is validated before its socket opens and a hop
  * resolving to an internal/reserved address is refused. Redirects ARE followed — public release hosts

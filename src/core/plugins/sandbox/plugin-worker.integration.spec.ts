@@ -131,7 +131,16 @@ describe('plugin worker — real worker_threads round-trip (B1)', () => {
     // shutdown is impossible. terminate() must still reclaim the thread.
     const wedged = host.runLifecycle('onEnable');
     wedged.catch(() => undefined); // terminate() rejects this pending call; swallow it
-    await new Promise(resolve => setTimeout(resolve, 150));
+    // Poll until the loop is genuinely blocked rather than sleeping a fixed 150ms: the health-check
+    // message is queued behind the onEnable call (FIFO on one channel), so it can only time out once
+    // the infinite loop has actually started. Firing terminate() earlier would reclaim an idle worker
+    // and prove nothing.
+    const wedgeDeadline = Date.now() + 10_000;
+    for (;;) {
+      const health = await host.healthCheck(150);
+      if (!health.healthy) break;
+      if (Date.now() > wedgeDeadline) throw new Error('runaway plugin never blocked the worker event loop');
+    }
 
     await expect(host.terminate()).resolves.toBeUndefined();
   });

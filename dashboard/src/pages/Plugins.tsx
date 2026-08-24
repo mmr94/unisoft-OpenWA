@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { localizePlugin } from '../utils/localizePlugin';
+import { configUiSafeConfig, missingRequiredConfig, sparseSessionOverride } from '../utils/pluginConfigRules';
 import { coerceFieldInput, emptyForField } from '../utils/pluginConfigForm';
 import { useQueryClient } from '@tanstack/react-query';
 import {
@@ -23,6 +24,7 @@ import {
   Download,
   Plus,
   Search,
+  ArrowUpCircle,
 } from 'lucide-react';
 import { pluginsApi } from '../services/api';
 import type { Plugin, CatalogPlugin, PluginConfigField } from '../services/api';
@@ -32,7 +34,7 @@ import { useTheme } from '../hooks/useTheme';
 import { usePluginsQuery, useSessionsQuery, queryKeys } from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
 import { Modal } from '../components/Modal';
-import { useToast } from '../components/Toast';
+import { useToast } from '../hooks/useToast';
 import { PluginInstances } from '../components/PluginInstances';
 import './Plugins.css';
 
@@ -45,40 +47,6 @@ const pluginTypeIcons: Record<PluginType, typeof Puzzle> = {
   auth: Shield,
   extension: Zap,
 };
-
-/**
- * Build a sparse per-session config override from a full edited config: include only non-secret keys
- * whose value differs from the Global base (so untouched keys keep inheriting Global), plus every
- * TOP-LEVEL secret key (the backend restores an untouched `***` to the stored per-session value, or
- * drops it → the host's deep-merge then re-inherits it from Global). A key absent from the base whose
- * value is just the empty default is skipped, so an untouched optional field never creates a spurious
- * override. With no schema, the input is returned as-is.
- *
- * Inheritance of untouched secrets holds for top-level secret keys and secrets nested in an OBJECT
- * (deep-merged). It does NOT hold for a `secret` column inside an array-of-rows: arrays are replaced
- * wholesale at resolve time, so a first-time per-session override that edits any cell of such an array
- * loses the untouched rows' secrets (they redact to `***`, the dashboard can't resend the real value).
- * No bundled plugin ships that shape; a plugin needing per-session array secrets should re-enter them.
- */
-function sparseSessionOverride(full: Record<string, unknown>, plugin: Plugin): Record<string, unknown> {
-  const props = plugin.configSchema?.properties;
-  if (!props) return full;
-  const out: Record<string, unknown> = {};
-  for (const [key, field] of Object.entries(props)) {
-    if (!(key in full)) continue;
-    const val = full[key];
-    if (field.secret) {
-      out[key] = val;
-      continue;
-    }
-    if (JSON.stringify(val) === JSON.stringify(plugin.config[key])) continue; // unchanged → inherit Global
-    if (plugin.config[key] === undefined && JSON.stringify(val) === JSON.stringify(emptyForField(field))) {
-      continue; // untouched optional field with no Global value → don't pin a spurious empty override
-    }
-    out[key] = val;
-  }
-  return out;
-}
 
 /**
  * Renders one config field from a plugin's schema and reports edits via `onChange`. Recurses for
@@ -97,23 +65,37 @@ function ConfigField({
   onChange: (next: unknown) => void;
 }) {
   const { t } = useTranslation();
+  // Per-instance id: ConfigField renders once per schema property (and recurses), so a hardcoded
+  // id would collide on any schema with two boolean fields - the second label would toggle the
+  // first checkbox. useId is stable across re-renders and unique per instance.
+  const fieldId = React.useId();
   const desc = field.description ? <small>{field.description}</small> : null;
+  // Bound to the control it names. The boolean branch below builds its own pair because its caption
+  // and its checkbox sit in different containers.
   const labelEl = (
-    <label>
+    <label htmlFor={fieldId}>
       {label}
       {field.required && <span className="required-mark"> *</span>}
     </label>
+  );
+  // An array renders one control PER ROW, so there is no single input for a label to point at; a
+  // `<label>` here would be an orphan that names nothing. It is a caption, so it is marked up as one.
+  const captionEl = (
+    <span className="config-array-label">
+      {label}
+      {field.required && <span className="required-mark"> *</span>}
+    </span>
   );
 
   if (field.type === 'boolean') {
     return (
       <div className="form-group toggle-group">
         <div className="toggle-info">
-          <label>{label}</label>
+          <label htmlFor={fieldId}>{label}</label>
           {desc}
         </div>
         <label className="toggle-switch">
-          <input type="checkbox" checked={Boolean(value)} onChange={e => onChange(e.target.checked)} />
+          <input id={fieldId} type="checkbox" checked={Boolean(value)} onChange={e => onChange(e.target.checked)} />
           <span className="toggle-slider"></span>
         </label>
       </div>
@@ -126,6 +108,7 @@ function ConfigField({
       <div className="form-group">
         {labelEl}
         <select
+          id={fieldId}
           value={String(value ?? '')}
           // Restore the option's original type (e.g. a number/boolean enum), not the raw string value.
           onChange={e => onChange(options.find(o => String(o) === e.target.value) ?? e.target.value)}
@@ -169,14 +152,14 @@ function ConfigField({
       // that would stringify the array to "[object Object]"/"" and corrupt it).
       return (
         <div className="config-array">
-          {labelEl}
+          {captionEl}
           {desc}
         </div>
       );
     }
     return (
       <div className="config-array">
-        {labelEl}
+        {captionEl}
         {desc}
         {rows.map((row, i) => (
           <div className="config-array-row" key={i}>
@@ -211,6 +194,7 @@ function ConfigField({
       <div className="form-group">
         {labelEl}
         <textarea
+          id={fieldId}
           value={value === undefined || value === null ? '' : String(value)}
           placeholder={field.default !== undefined ? String(field.default) : undefined}
           required={field.required}
@@ -229,6 +213,7 @@ function ConfigField({
     <div className="form-group">
       {labelEl}
       <input
+        id={fieldId}
         type={inputType}
         value={value === undefined || value === null ? '' : String(value)}
         placeholder={field.default !== undefined ? String(field.default) : undefined}
@@ -330,17 +315,12 @@ function PluginConfigUi({ plugin, sessionId }: { plugin: Plugin; sessionId?: str
         // schema there is nothing safe to send. The plugin must declare its fields to pre-fill them.
         // For a per-session editor (sessionId set), expose the resolved slice: the session's override
         // value where set, else the base value.
-        const props = plugin.configSchema?.properties;
-        const override = sessionId ? (plugin.sessionConfig?.[sessionId] ?? {}) : {};
-        const safeConfig = props
-          ? Object.fromEntries(
-              Object.keys(props).flatMap(k => {
-                if (sessionId && k in override) return [[k, override[k]]];
-                return k in plugin.config ? [[k, plugin.config[k]]] : [];
-              }),
-            )
-          : {};
-        post({ type: 'config:value', config: safeConfig, schema: plugin.configSchema, theme: resolvedTheme });
+        post({
+          type: 'config:value',
+          config: configUiSafeConfig(plugin, sessionId),
+          schema: plugin.configSchema,
+          theme: resolvedTheme,
+        });
       } else if (msg?.type === 'config:save') {
         void (async () => {
           try {
@@ -525,7 +505,14 @@ function SessionsTab({ plugin }: { plugin: Plugin }) {
         <section className="sessions-section">
           <h3>{t('plugins.sessions.perSessionTitle')}</h3>
           <small>{t('plugins.sessions.perSessionDesc')}</small>
-          <select className="sessions-select" value={selSession} onChange={e => setSelSession(e.target.value)}>
+          {/* The heading above is a sibling, not a label, so the select had no accessible name of its
+              own: a screen reader announced an unnamed combobox. */}
+          <select
+            className="sessions-select"
+            aria-label={t('plugins.sessions.selectSession')}
+            value={selSession}
+            onChange={e => setSelSession(e.target.value)}
+          >
             <option value="">{t('plugins.sessions.selectSession')}</option>
             {sessions.map(s => (
               <option key={s.id} value={s.id}>
@@ -602,17 +589,6 @@ export default function Plugins() {
   // INSIDE the sandbox with a raw "<id>: <field> is required" error and flips the card to ERROR.
   // Open the config modal instead so the user completes the fields first — cures the whole class
   // (after-hours `schedule`/`awayMessage`, faq-bot `rules`, any catalog plugin with required fields).
-  const missingRequiredConfig = (plugin: Plugin): string[] => {
-    const props = plugin.configSchema?.properties ?? {};
-    return Object.entries(props)
-      .filter(
-        ([key, field]) =>
-          field.required === true &&
-          (plugin.config[key] === undefined || plugin.config[key] === null || plugin.config[key] === ''),
-      )
-      .map(([key]) => key);
-  };
-
   const handleToggle = async (plugin: Plugin) => {
     if (plugin.status !== 'enabled') {
       const missing = missingRequiredConfig(plugin);
@@ -636,9 +612,7 @@ export default function Plugins() {
         plugin.status === 'enabled' ? await pluginsApi.disable(plugin.id) : await pluginsApi.enable(plugin.id);
       if (!res.success) {
         toast.warning(
-          plugin.status === 'enabled'
-            ? t('plugins.toasts.disableFailedTitle')
-            : t('plugins.toasts.enableFailedTitle'),
+          plugin.status === 'enabled' ? t('plugins.toasts.disableFailedTitle') : t('plugins.toasts.enableFailedTitle'),
           res.message,
         );
       }
@@ -726,13 +700,17 @@ export default function Plugins() {
     }
   };
 
-  const loadCatalog = async () => {
+  const loadCatalog = async (silent = false) => {
     setCatalogLoading(true);
     setCatalogError(null);
     try {
       setCatalog(await pluginsApi.catalog());
     } catch (err) {
-      setCatalogError(err instanceof Error ? err.message : String(err));
+      // Silent mode is the page-mount prefetch that powers the update chips: a catalog that
+      // cannot be reached just means no chips, so the failure is not surfaced here — the
+      // drawer's own lazy-load effect (which skips while an error is set) retries loudly
+      // when the user actually opens the Catalog tab.
+      if (!silent) setCatalogError(err instanceof Error ? err.message : String(err));
     } finally {
       setCatalogLoading(false);
     }
@@ -745,6 +723,19 @@ export default function Plugins() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showInstallModal, installMode]);
+
+  // Prefetch once on mount so installed-plugin cards can flag newer catalog versions without the
+  // user having to open the Install drawer first. Silent: an unreachable catalog hides the chips.
+  useEffect(() => {
+    void loadCatalog(true);
+  }, []);
+
+  // Catalog entries with a strictly newer version than the installed one, keyed by plugin id —
+  // drives both the per-card update chip and the counter on the Install button.
+  const updatesById = useMemo(
+    () => new Map(catalog.filter(entry => entry.updateAvailable).map(entry => [entry.id, entry])),
+    [catalog],
+  );
 
   const handleInstallFromCatalog = async (entry: CatalogPlugin) => {
     if (!entry.download) {
@@ -833,6 +824,11 @@ export default function Plugins() {
             <button className="btn-primary" onClick={() => setShowInstallModal(true)}>
               <Upload size={16} />
               {t('plugins.install', 'Install plugin')}
+              {updatesById.size > 0 && (
+                <span className="install-update-count" title={t('plugins.catalog.updateAvailable', 'Update available')}>
+                  {updatesById.size}
+                </span>
+              )}
             </button>
           </>
         }
@@ -893,6 +889,23 @@ export default function Plugins() {
                       <div>
                         <h3 className="plugin-name">{lz.name}</h3>
                         <span className="plugin-version">v{plugin.version}</span>
+                        {updatesById.has(plugin.id) && (
+                          <button
+                            type="button"
+                            className="plugin-update-chip"
+                            title={`${t('plugins.catalog.updateAvailable', 'Update available')} (v${plugin.version} → v${updatesById.get(plugin.id)!.version})`}
+                            aria-label={t('plugins.catalog.updateAvailable', 'Update available')}
+                            onClick={() => {
+                              // Land the user directly on this plugin's catalog entry, where the
+                              // existing Update button (and its confirmation flow) lives.
+                              setInstallMode('catalog');
+                              setCatalogSearch(plugin.id);
+                              setShowInstallModal(true);
+                            }}
+                          >
+                            <ArrowUpCircle size={12} />v{updatesById.get(plugin.id)!.version}
+                          </button>
+                        )}
                       </div>
                     </div>
                     {plugin.builtIn && <span className="plugin-builtin-badge">{t('plugins.builtIn')}</span>}
@@ -1035,6 +1048,15 @@ export default function Plugins() {
             )
           }
         >
+          {/* Trusted-code warning sits ABOVE the tab conditional: upload and catalog land the
+              same payload in the same process, so it must show on both. */}
+          <p className="install-hint install-hint-warning">
+            <AlertCircle size={15} />
+            {t(
+              'plugins.installModal.trustWarning',
+              "Plugins run with the gateway's full process privileges — the sandbox contains crashes, not malicious code. Install only plugins you trust.",
+            )}
+          </p>
           {installMode === 'upload' ? (
             <>
               <p className="install-hint">
@@ -1229,7 +1251,7 @@ export default function Plugins() {
                   {/* The Sessions and Instances tabs have their own actions; the footer Save is config-tab
                       only. A plugin with its own editor saves through that editor, so the footer Save is
                       omitted rather than left to save a form the operator cannot see. */}
-                  {showTabs && (configTab === 'sessions' || configTab === 'instances') ||
+                  {(showTabs && (configTab === 'sessions' || configTab === 'instances')) ||
                   configPlugin.configUi ? null : lz.configSchema &&
                     Object.keys(lz.configSchema.properties).length > 0 ? (
                     <button className="btn-primary" onClick={handleSaveSchemaConfig} disabled={savingConfig}>

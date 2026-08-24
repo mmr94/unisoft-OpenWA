@@ -113,6 +113,20 @@ curl -X POST 'http://localhost:2785/api/infra/import-data' \
   -d @data-backup.json
 ```
 
+> [!IMPORTANT]
+> Post the whole exported file, as the `-d @data-backup.json` above does. The import empties all 14
+> migration tables before repopulating, so a hand-built body carrying only some keys restores the rest
+> **empty**. The export also bounds the inline media it carries
+> (`EXPORT_INLINE_MEDIA_BUDGET_BYTES`, 8 MiB by default); for a byte-exact copy including media, use
+> `scripts/backup.sh`, which snapshots the database file itself.
+
+> [!NOTE]
+> **Session statuses in the backup describe the source host.** An active status (`ready`,
+> `initializing`, ...) is restored as `disconnected` (the import response counts them in a notice),
+> so the migrated sessions are immediately startable - via `POST /api/sessions/:id/start`, or by
+> the auto-start/takeover paths - without restarting the process. A session held by a live peer
+> whose claim the import preserves keeps the backup's status.
+
 > [!NOTE]
 > **Dual-Database Architecture**
 >
@@ -142,7 +156,8 @@ curl -X POST 'http://localhost:2785/api/infra/import-data' \
     "ingressEvents": [...],
     "webhookDeliveryFailures": [...],
     "integrationDeliveryFailures": [...],
-    "statusUpdates": [...]
+    "statusUpdates": [...],
+    "automationRules": [...]
   },
   "counts": {
     "sessions": 5,
@@ -157,7 +172,8 @@ curl -X POST 'http://localhost:2785/api/infra/import-data' \
     "ingressEvents": 12,
     "webhookDeliveryFailures": 0,
     "integrationDeliveryFailures": 0,
-    "statusUpdates": 19
+    "statusUpdates": 19,
+    "automationRules": 7
   },
   "skippedTables": []
 }
@@ -221,12 +237,18 @@ REDIS_USERNAME=optional
 REDIS_PASSWORD=optional
 ```
 
-| Scenario                  | Support | Notes                                     |
-| ------------------------- | ------- | ----------------------------------------- |
-| Built-in → External Redis | ✅      | Config change only                        |
-| External → Built-in Redis | ✅      | Config change only                        |
+> Setting `REDIS_BUILTIN` in `.env` **pins** it: the env value wins, so the dashboard's built-in
+> Redis toggle can no longer switch the container back on. That is the right trade for a deployment
+> whose configuration lives in `.env` — but if you manage datastores from the dashboard, leave the
+> key unset (as the shipped templates do) and set only the connection details above. The same holds
+> for `POSTGRES_BUILTIN` and `MINIO_BUILTIN`.
+
+| Scenario                  | Support | Notes                                      |
+| ------------------------- | ------- | ------------------------------------------ |
+| Built-in → External Redis | ✅      | Config change only                         |
+| External → Built-in Redis | ✅      | Config change only                         |
 | Enable → Disable Redis    | ✅      | Cache no-ops; reads fall through to the DB |
-| Disable → Enable Redis    | ✅      | Cache rebuilds automatically              |
+| Disable → Enable Redis    | ✅      | Cache rebuilds automatically               |
 
 > [!TIP]
 > **Cache Warm-up**: After switching Redis instances, the cache will automatically rebuild as requests come in. No data migration is necessary.
@@ -241,7 +263,7 @@ BullMQ stores job data in Redis. When switching Redis instances, pending jobs ma
 # Step 1: Check queue status via Bull Board
 # Visit: http://localhost:2785/api/admin/queues
 
-# Step 2: Wait until MESSAGE and WEBHOOK queues are empty
+# Step 2: Wait until the webhook and ingress queues are empty (Bull Board shows webhook-queue and ingress-queue; there is no MESSAGE queue)
 # Or check via API:
 curl -s 'http://localhost:2785/api/infra/status' \
   -H 'X-API-Key: YOUR_KEY' | jq '.queue'
@@ -261,7 +283,7 @@ docker compose up -d
 | Built-in → External Redis | ⚠️      | Drain queue first |
 
 > [!WARNING]
-> **Job Loss Prevention**: Always ensure the MESSAGE and WEBHOOK queues are empty before switching Redis instances. Check the `/api/admin/queues` dashboard.
+> **Job Loss Prevention**: Always ensure the `webhook-queue` and `ingress-queue` queues are empty before switching Redis instances (there is no MESSAGE queue). Check the `/api/admin/queues` dashboard.
 
 ### Infrastructure Migration Summary
 
@@ -337,6 +359,8 @@ async function migrateSqliteToPostgres(config: MigrationConfig): Promise<Migrati
     'webhook_delivery_failures',
     'integration_delivery_failures',
     'status_updates',
+    // ON DELETE CASCADE FK to sessions, so it must follow them.
+    'automation_rules',
   ];
 
   // 4. Migrate each table
@@ -551,9 +575,9 @@ Baileys — BAILEYS_AUTH_DIR, default ./data/baileys
 
 > [!IMPORTANT]
 > **Directories are keyed by session NAME, not by the REST id.** The API addresses a session by its
-> UUID (`/api/sessions/{id}`), but the engine receives `session.name` as its client id, so the on-disk
+> UUID (`/api/sessions/{sessionId}`), but the engine receives `session.name` as its client id, so the on-disk
 > profile is `session-<name>` (whatsapp-web.js) or `<name>` (Baileys). Resolve the name via
-> `GET /api/sessions/{id}` before copying anything.
+> `GET /api/sessions/{sessionId}` before copying anything.
 
 ### Transfer Methods
 
@@ -568,7 +592,7 @@ Under the shipped compose the data directory lives in a named Docker volume
 (`openwa-data:/app/data`), not a host bind mount, so the profile is copied through the container
 with `docker compose cp` rather than straight off the host filesystem. `APP_DIR` is the directory
 holding `docker-compose.yml` on each server; `SESSION_NAME` is the session `name` (resolve it via
-`GET /api/sessions/{id}` — the on-disk directory is keyed by name, not by the REST id).
+`GET /api/sessions/{sessionId}` — the on-disk directory is keyed by name, not by the REST id).
 
 ```bash
 APP_DIR=/srv/openwa            # docker compose project directory on both hosts
@@ -657,6 +681,12 @@ chain by hand with `npm run migration:run:main`.
 # upgrade.sh — same shape for a patch or a minor
 set -e
 
+# Started with docker-compose.dev.yml (the README Quick Start)? Add `-f docker-compose.dev.yml` to
+# every docker compose command in this script, in the migration block right after it, and in 14.6
+# Rollback Procedures, and write `openwa` wherever a command names the `openwa-api` service. Do NOT
+# carry the flag up to the `--profile postgres` commands in 14.3: postgres exists only in the
+# production compose file.
+
 # 1. Backup: both databases + session auth + media + plugin state
 ./scripts/backup.sh
 
@@ -678,8 +708,8 @@ for i in {1..30}; do
   sleep 2
 done
 
-# 5. Confirm the running version
-curl -s http://localhost:2785/api/health | jq '.version'
+# 5. Confirm the running version (`version` is only included for an authenticated request)
+curl -s -H "X-API-Key: $API_KEY" http://localhost:2785/api/health | jq '.version'
 
 # 6. Verify sessions came back
 curl -s -H "X-API-Key: $API_KEY" \
@@ -703,12 +733,33 @@ docker compose run --rm openwa-api npm run migration:run:prod
 
 ### Known Upgrade Hazards
 
-| Release  | Change                                                                              | Action                                                                                                     |
-| -------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `0.8.15` | PostgreSQL schemas bootstrapped with `DATABASE_SYNCHRONIZE=true` crash-loop on boot | Self-healing guard migration; see [14.9](#149-troubleshooting-migration-issues) for the large-table window |
-| `0.9.0`  | `GET /api/settings` no longer returns the always-zero `general.sessionTimeout`      | Remove reads of that field — there is no replacement                                                       |
-| `0.10.3` | Boolean/numeric request fields are parsed strictly (`1`, `yes`, `""` now `400`)     | Send canonical JSON values; JSON clients and the SDKs are unaffected                                       |
-| `0.10.3` | Status posts pass the `message:sending` plugin gate, with no `chatId` in the input  | Branch on `source`/`type` before reading `input.chatId`                                                    |
+| Release  | Change                                                                                                                                                                                                                                                                                                                       | Action                                                                                                                                                                                                                                            |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0.23.0` | Typed SDK clients: `markRead` and `subscribePresence` each take their own request type instead of the shared `MarkChatRequest`, which now serves `markUnread` alone                                                                                                                                                          | Go and Java: swap the type at both call sites. Typed Python: only at `markRead`, its `subscribePresence` body being structurally identical. JavaScript and PHP need no change; the wire body is unchanged                                         |
+| `0.22.0` | Baileys refuses a reply whose quoted id, or a forward whose `fromChatId`, does not name the addressed chat, with the `404` whatsapp-web.js already answered; leaving a group, unsubscribing from a channel and labelling a channel surface WhatsApp's refusal; membership requests for an id that is not a group are refused | Handle a refusal on those six calls, which previously answered `200` whatever happened                                                                                                                                                            |
+| `0.22.0` | Typed SDK clients narrow their request bodies: 19 Python request types mark the fields the server requires, and Go and Java type the proxy scheme, call kind, membership method, chat state, pin window and status font as enums                                                                                             | Pass the named constants instead of bare strings or numbers and supply every required field; untyped callers are unaffected                                                                                                                       |
+| `0.22.0` | `isReadOnly` on a group answers for the calling account rather than repeating the group setting, and `isMyContact` reflects whether the contact is actually saved                                                                                                                                                            | Re-read either field wherever logic branched on the old value                                                                                                                                                                                     |
+| `0.21.0` | The ingress route gained a per-client-IP rate bound (`INGRESS_IP_LIMIT`, default 1200 per window) alongside its per-instance one; previously the route had no bound a caller could not walk around by varying the path                                                                                                       | Raise `INGRESS_IP_LIMIT` if one provider IP legitimately drives more than 1200 ingress requests per window                                                                                                                                        |
+| `0.20.0` | With `WEBHOOK_SSRF_PROTECT=false`, deliveries no longer follow redirects, and `SSRF_ALLOWED_HOSTS` entries pin to their resolved addresses (must resolve at registration)                                                                                                                                                    | Set `WEBHOOK_SSRF_REDIRECTS=true` for a receiver legitimately behind a 3xx; ensure allowlisted hostnames resolve when the webhook is saved                                                                                                        |
+| `0.20.0` | Plugin installs from a URL require a `#sha256=<64 hex>` pin under `NODE_ENV=production` (the compose default)                                                                                                                                                                                                                | Pin catalog URLs, or set `PLUGIN_INSTALL_REQUIRE_PIN=false` to lift the requirement                                                                                                                                                               |
+| `0.19.0` | Production boot refuses a set `API_MASTER_KEY` shorter than 32 characters                                                                                                                                                                                                                                                    | Strengthen a short key before upgrading; unset stays allowed (first boot generates one)                                                                                                                                                           |
+| `0.19.0` | `POST /sessions/:id/messages/send-catalog` and `PUT /api/settings` are removed (both always answered `501`)                                                                                                                                                                                                                  | Drop calls to either; catalog reads and `GET /api/settings` are unchanged                                                                                                                                                                         |
+| `0.18.0` | `NODE_ENV` outside `production`/`development`/`test` fails boot with a named error                                                                                                                                                                                                                                           | Set a legal value or unset it (unset remains valid)                                                                                                                                                                                               |
+| `0.18.0` | Go SDK: `UpdateWebhookRequest.Secret`/`.Headers` and `UpdateTemplateRequest.Header`/`.Footer` become pointers, plus a `ClearFilters` flag                                                                                                                                                                                    | Take the address of a variable to send a clearing value, or leave nil to keep the stored one                                                                                                                                                      |
+| `0.18.0` | Two enabled instances of one plugin sharing a session scope no longer collapse onto a single config                                                                                                                                                                                                                          | Move shared keys onto each instance when provisioning a second one on the same session                                                                                                                                                            |
+| `0.17.0` | `AUDIT_RETENTION_DAYS` is validated at boot as a plain integer                                                                                                                                                                                                                                                               | Replace `30d`-style values with plain integers (`0`/negatives keep their documented meaning)                                                                                                                                                      |
+| `0.17.0` | Plugins must declare a `storage:use` permission to reach `ctx.storage`                                                                                                                                                                                                                                                       | Upgrade the official plugins to the floors listed in the 0.17.0 changelog BEFORE upgrading the gateway                                                                                                                                            |
+| `0.16.0` | `POST /sessions/:id/groups` answers `501` on the whatsapp-web.js engine (the page code it used no longer exists)                                                                                                                                                                                                             | Create groups through the Baileys engine                                                                                                                                                                                                          |
+| `0.15.0` | Engine calls during a WhatsApp Web page reload answer a retryable `409` naming the reload (previously `500`, or `200 {success:false}` on six chat-write routes); typed 4xx no longer latch the send breaker                                                                                                                  | Retry the named-reload `409` after the session re-emits `ready`                                                                                                                                                                                   |
+| `0.14.6` | `POST /groups` returns the summary shape (`participantsCount`, not the detail type), and three SDK response shapes were retyped (`ParticipantsResult`, `ContactRecord.pushName`/fields, `sendProduct` → `{id}`)                                                                                                              | Adjust typed SDK reads; untyped JSON consumers are unaffected                                                                                                                                                                                     |
+| `0.14.5` | Baileys transport failures (dead socket) propagate as 5xx instead of misclassified `403`/`400`/`404`                                                                                                                                                                                                                         | Treat 5xx as retryable transport failure; keep 4xx handling for genuine refusals                                                                                                                                                                  |
+| `0.14.0` | Eager status backfill on session ready is opt-in (`STATUS_SEED_ON_READY`, default off)                                                                                                                                                                                                                                       | Set the flag only after validating the account; live status events are unaffected                                                                                                                                                                 |
+| `0.14.0` | Link previews are opt-in on the Baileys engine                                                                                                                                                                                                                                                                               | Pass `linkPreview: true` or a `customLinkPreview` where a card is wanted                                                                                                                                                                          |
+| `0.12.0` | `PUT /api/plugins/:id/sessions` is a full replacement of the global activation set and now requires an **unrestricted ADMIN** key; a session-scoped key is rejected with `403` whatever it sends                                                                                                                             | Switch any automation that drives global plugin activation from a scoped key to an unrestricted ADMIN key. The per-session config override route `PUT /api/plugins/:id/config/:sessionId` is unaffected and stays scoped to the addressed session |
+| `0.8.15` | PostgreSQL schemas bootstrapped with `DATABASE_SYNCHRONIZE=true` crash-loop on boot                                                                                                                                                                                                                                          | Self-healing guard migration; see [14.9](#149-troubleshooting-migration-issues) for the large-table window                                                                                                                                        |
+| `0.9.0`  | `GET /api/settings` no longer returns the always-zero `general.sessionTimeout`                                                                                                                                                                                                                                               | Remove reads of that field — there is no replacement                                                                                                                                                                                              |
+| `0.10.3` | Boolean/numeric request fields are parsed strictly (`1`, `yes`, `""` now `400`)                                                                                                                                                                                                                                              | Send canonical JSON values; JSON clients and the SDKs are unaffected                                                                                                                                                                              |
+| `0.10.3` | Status posts pass the `message:sending` plugin gate, with no `chatId` in the input                                                                                                                                                                                                                                           | Branch on `source`/`type` before reading `input.chatId`                                                                                                                                                                                           |
 
 The authoritative list is `CHANGELOG.md`; breaking items are flagged there with ⚠️ **Breaking**.
 
@@ -731,6 +782,9 @@ if [ -z "$BACKUP_DIR" ] || [ -z "$TARGET_VERSION" ]; then
 fi
 
 echo "🔄 Rolling back to v${TARGET_VERSION}..."
+
+# Started with docker-compose.dev.yml (the README Quick Start)? Add `-f docker-compose.dev.yml` to
+# every docker compose command below, and write `openwa` wherever one names the `openwa-api` service.
 
 # 1. Stop current
 docker compose down
