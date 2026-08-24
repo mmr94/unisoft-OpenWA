@@ -453,12 +453,24 @@ export default () => ({
     // (engine/Chromium destroyed to free RAM). The WhatsApp auth data stays on disk, so
     // resuming does not require a new QR scan.
     hibernationEnabled: process.env.SESSION_HIBERNATION_ENABLED === 'true',
-    // Idle window before hibernation (default: 90 min, between the 1-2h range).
-    idleTimeoutMs: parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '5400000', 10),
-    // How often the idle checker runs (default: 5 min).
-    checkIntervalMs: parseInt(process.env.SESSION_IDLE_CHECK_INTERVAL_MS || '300000', 10),
+    // Idle window before hibernation (default: 90 min, between the 1-2h range). Guarded like the
+    // lease knobs above: a malformed value ('90m' → 90, 'abc' → NaN) would make the sweep's
+    // `idleMs <= threshold` test false for every session and hibernate the whole node at once.
+    idleTimeoutMs: (() => {
+      const n = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 5_400_000;
+    })(),
+    // How often the idle checker runs (default: 5 min). A NaN here would reach setInterval, which
+    // clamps it to ~1ms and turns the sweep into a hot loop.
+    checkIntervalMs: (() => {
+      const n = parseInt(process.env.SESSION_IDLE_CHECK_INTERVAL_MS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 300_000;
+    })(),
     // Max time to wait for a session to become READY when waking it transparently.
-    wakeTimeoutMs: parseInt(process.env.SESSION_WAKE_TIMEOUT_MS || '45000', 10),
+    wakeTimeoutMs: (() => {
+      const n = parseInt(process.env.SESSION_WAKE_TIMEOUT_MS ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 45_000;
+    })(),
   },
 
   // Autoreply rules

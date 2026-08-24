@@ -239,7 +239,8 @@
     "disconnected": "연결 끊김",
     "action_required": "조치 필요",
     "failed": "실패",
-    "authenticating": "인증하는 중..."
+    "authenticating": "인증하는 중...",
+    "hibernated": "절전 상태"
   },
   "sessions": {
     "title": "세션",

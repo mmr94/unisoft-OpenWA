@@ -282,11 +282,16 @@ export class SessionController {
     description: "Another node currently holds this session's live engine (multi-node deployments).",
   })
   async wake(@Param('sessionId', ParseUUIDPipe) id: string): Promise<SessionResponseDto> {
+    // Read before the call: wake() is idempotent, and auditing a request that found the engine
+    // already loaded would record a resume that never happened.
+    const alreadyRunning = this.sessionService.isActive(id);
     const session = await this.hibernation.wake(id);
-    await this.auditService.logInfo(AuditAction.SESSION_RESUMED, {
-      sessionId: session.id,
-      sessionName: session.name,
-    });
+    if (!alreadyRunning) {
+      await this.auditService.logInfo(AuditAction.SESSION_RESUMED, {
+        sessionId: session.id,
+        sessionName: session.name,
+      });
+    }
     return this.transformSession(session);
   }
 

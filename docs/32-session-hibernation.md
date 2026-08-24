@@ -59,9 +59,12 @@ from the message-send paths (`MessageService`, `BulkMessageService`).
 
 ### Reconnect guard
 
-Stopping or hibernating a session adds its id to an internal `intentionalStops`
-set so the engine's `disconnected` event does **not** trigger a reconnect or
-overwrite the intentional status.
+Hibernating goes through the lifecycle's own retirement path, so it inherits the
+stop mark (`markStopping()` / `stoppingSessions` in
+`session-engine-lifecycle.service.ts`): the armed reconnect is cancelled, and the
+engine's own `disconnected` transition is neither persisted nor broadcast while
+the mark is set (`session-engine-event-wiring.ts`), so the session reports one
+transition — straight to `HIBERNATED` — instead of flashing `disconnected` first.
 
 ## 32.3 Configuration
 
@@ -103,18 +106,21 @@ and `status` may now be `hibernated`.
 
 ## 32.6 SDK helpers
 
-Both SDKs expose a wake call and an `ensureReady` helper that wakes a hibernated
-session and polls until it is `READY`:
+All five clients expose `wake`, which asks the gateway to reload the engine and
+returns as soon as it is launching. There is no client-side wait-until-ready
+helper: poll the session until it reports `ready`, or simply send — the gateway
+wakes a hibernated session on the way in (§32.2).
 
 ```typescript
 // JavaScript/TypeScript
-await client.ensureReady('session-1');
+await client.sessions.wake('session-1');
+// or skip the wake entirely — the send resumes the session itself:
 await client.messages.sendText('session-1', { chatId, text });
 ```
 
 ```python
 # Python
-client.sessions.ensure_ready("session-1")
+client.sessions.wake("session-1")
 client.messages.send_text("session-1", {"chatId": chat_id, "text": text})
 ```
 
@@ -127,6 +133,6 @@ client.messages.send_text("session-1", {"chatId": chat_id, "text": text})
 | Wake endpoint                   | `src/modules/session/session.controller.ts`                                                    |
 | Transparent wake on send        | `src/modules/message/message-send.service.ts`, `message.service.ts`, `bulk-message.service.ts` |
 | Config                          | `src/config/configuration.ts`, `.env.example`                                                  |
-| Migration (`lastSentAt` column) | `src/database/migrations/1781000000000-AddSessionLastSentAt.ts`                                |
+| Migration (`lastSentAt` column) | `src/database/migrations/1781050000000-AddSessionLastSentAt.ts`                                |
 | Hooks                           | `src/core/hooks/hook.interfaces.ts`                                                            |
 | Final-status hook into `stop()` | `src/modules/session/session-engine-controls.ts`                                               |

@@ -532,9 +532,13 @@ export class MessageService implements PluginMessagePort {
   }
 
   /**
-   * Resolve the engine for an outgoing operation. Transparently resumes a session hibernated by
-   * SessionHibernationService and records the activity, so a session in active use is never swept
-   * mid-conversation. Identical to the plain registry lookup when hibernation is not wired in.
+   * Resolve the engine, transparently resuming a session hibernated by SessionHibernationService.
+   * Identical to the plain registry lookup when hibernation is not wired in.
+   *
+   * Deliberately does NOT record activity, unlike MessageSendService's namesake: this helper also
+   * backs read-only routes (chat history, reactions), and `lastSentAt` means the last OUTGOING
+   * message. Stamping it here let a dashboard polling history hold a session permanently fresh, so
+   * the idle sweep never fired and the feature freed no RAM at all.
    */
   private async getEngine(sessionId: string): Promise<IWhatsAppEngine> {
     if (!this.hibernation) {
@@ -543,9 +547,6 @@ export class MessageService implements PluginMessagePort {
         () => new BadRequestException(`Session '${sessionId}' is not active. Start the session first.`),
       );
     }
-    const engine = await this.hibernation.ensureEngineReady(sessionId);
-    // Best-effort bookkeeping, deliberately not awaited: the send must not wait on it.
-    void this.hibernation.markActivity(sessionId);
-    return engine;
+    return this.hibernation.ensureEngineReady(sessionId);
   }
 }

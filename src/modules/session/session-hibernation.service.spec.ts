@@ -35,7 +35,7 @@ describe('SessionHibernationService', () => {
   let service: SessionHibernationService;
   let repository: { findOne: jest.Mock; update: jest.Mock };
   let engines: EngineRegistry;
-  let lifecycle: { stop: jest.Mock; start: jest.Mock; isEngineActive: jest.Mock };
+  let lifecycle: { stop: jest.Mock; start: jest.Mock; isEngineActive: jest.Mock; markStopping: jest.Mock };
   let hookManager: { execute: jest.Mock };
   let config: Record<string, unknown>;
   let engine: { getStatus: jest.Mock };
@@ -50,6 +50,7 @@ describe('SessionHibernationService', () => {
       stop: jest.fn().mockResolvedValue(makeSession({ status: SessionStatus.HIBERNATED })),
       start: jest.fn().mockResolvedValue(makeSession({ status: SessionStatus.INITIALIZING })),
       isEngineActive: jest.fn().mockReturnValue(false),
+      markStopping: jest.fn(),
     };
     hookManager = { execute: jest.fn().mockResolvedValue({ continue: true, data: {} }) };
     config = {
@@ -76,6 +77,8 @@ describe('SessionHibernationService', () => {
       await service.hibernate('sess-1');
 
       expect(lifecycle.stop).toHaveBeenCalledWith('sess-1', SessionStatus.HIBERNATED);
+      // Set before anything is awaited, so a reconnect timer cannot slip a fresh engine in first.
+      expect(lifecycle.markStopping).toHaveBeenCalledWith('sess-1');
       expect(hookManager.execute).toHaveBeenCalledWith(
         'session:hibernated',
         { sessionId: 'sess-1' },
@@ -103,6 +106,22 @@ describe('SessionHibernationService', () => {
       );
       // The resumed session gets a full idle window before the sweep may consider it again.
       expect(repository.update).toHaveBeenCalledWith('sess-1', { lastSentAt: expect.any(Date) as Date });
+    });
+
+    it('refuses a session that is not hibernated rather than undoing a deliberate stop', async () => {
+      repository.findOne.mockResolvedValue(makeSession({ status: SessionStatus.DISCONNECTED }));
+
+      await expect(service.wake('sess-1')).rejects.toBeInstanceOf(BadRequestException);
+      expect(lifecycle.start).not.toHaveBeenCalled();
+    });
+
+    it('serves concurrent wakes from one resume instead of failing the losers', async () => {
+      repository.findOne.mockResolvedValue(makeSession({ status: SessionStatus.HIBERNATED }));
+
+      await Promise.all([service.wake('sess-1'), service.wake('sess-1'), service.wake('sess-1')]);
+
+      expect(lifecycle.start).toHaveBeenCalledTimes(1);
+      expect(hookManager.execute).toHaveBeenCalledTimes(2); // resuming + resumed, once each
     });
 
     it('is a no-op when the engine is already loaded', async () => {

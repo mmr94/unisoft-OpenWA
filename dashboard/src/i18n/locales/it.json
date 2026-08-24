@@ -239,7 +239,8 @@
     "disconnected": "Disconnesso",
     "action_required": "Azione richiesta",
     "failed": "Non riuscita",
-    "authenticating": "Autenticazione in corso..."
+    "authenticating": "Autenticazione in corso...",
+    "hibernated": "In ibernazione"
   },
   "sessions": {
     "title": "Sessioni",

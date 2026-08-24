@@ -44,7 +44,8 @@ export interface Session {
     | 'ready'
     | 'disconnected'
     | 'action_required'
-    | 'failed';
+    | 'failed'
+    | 'hibernated';
   /**
    * Whether the gateway holds a live engine for this session right now. The precondition the
    * lifecycle routes enforce, and not derivable from `status`: `disconnected` covers both a session

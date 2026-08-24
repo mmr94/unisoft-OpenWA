@@ -239,7 +239,8 @@
     "disconnected": "已断开",
     "action_required": "需要操作",
     "failed": "失败",
-    "authenticating": "正在验证..."
+    "authenticating": "正在验证...",
+    "hibernated": "已休眠"
   },
   "sessions": {
     "title": "会话",

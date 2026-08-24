@@ -292,6 +292,7 @@ export class SessionEngineLifecycle {
     this.wiringHost = {
       isLiveEngine: (id, engine) => this.isLiveEngine(id, engine),
       ownsSession: id => this.ownsSession(id),
+      isStopping: id => this.stoppingSessions.has(id),
       handleEngineReady: (id, engine, phone, pushName) => this.handleEngineReady(id, engine, phone, pushName),
       handleEngineDisconnected: (id, engine, reason) => this.handleEngineDisconnected(id, engine, reason),
       updateStatus: (id, status) => this.updateStatus(id, status),

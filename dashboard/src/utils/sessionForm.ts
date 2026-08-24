@@ -49,7 +49,7 @@ export function isValidPairingPhone(phone: string): boolean {
 const STATUS_GROUPS: Record<string, string[]> = {
   active: ['ready'],
   connecting: ['initializing', 'authenticating', 'qr_ready'],
-  inactive: ['created', 'disconnected', 'action_required', 'failed'],
+  inactive: ['created', 'disconnected', 'action_required', 'failed', 'hibernated'],
 };
 
 export function matchesStatusFilter(status: string, filter: string): boolean {

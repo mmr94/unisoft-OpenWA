@@ -239,7 +239,8 @@
     "disconnected": "Getrennt",
     "action_required": "Handlung erforderlich",
     "failed": "Fehlgeschlagen",
-    "authenticating": "Wird authentifiziert..."
+    "authenticating": "Wird authentifiziert...",
+    "hibernated": "Im Ruhezustand"
   },
   "sessions": {
     "title": "Sitzungen",

@@ -250,7 +250,8 @@
     "disconnected": "غير متصل",
     "action_required": "إجراء مطلوب",
     "failed": "فشل",
-    "authenticating": "جارٍ المصادقة..."
+    "authenticating": "جارٍ المصادقة...",
+    "hibernated": "في وضع السكون"
   },
   "sessions": {
     "title": "الجلسات",

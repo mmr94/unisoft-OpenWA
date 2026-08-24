@@ -239,7 +239,8 @@
     "disconnected": "Disconnected",
     "action_required": "Action required",
     "failed": "Failed",
-    "authenticating": "Authenticating..."
+    "authenticating": "Authenticating...",
+    "hibernated": "Hibernated"
   },
   "sessions": {
     "title": "Sessions",

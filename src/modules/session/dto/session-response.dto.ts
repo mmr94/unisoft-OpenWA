@@ -59,6 +59,9 @@ export class SessionResponseDto {
   @ApiPropertyOptional({
     description: 'Timestamp of the last outgoing message (used for idle hibernation)',
     example: '2025-02-02T10:25:00Z',
+    type: String,
+    format: 'date-time',
+    nullable: true,
   })
   lastSent?: Date | null;
 

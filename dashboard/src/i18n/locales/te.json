@@ -239,7 +239,8 @@
     "disconnected": "డిస్‌కనెక్ట్ అయింది",
     "action_required": "చర్య అవసరం",
     "failed": "విఫలమైంది",
-    "authenticating": "ప్రామాణీకరిస్తోంది..."
+    "authenticating": "ప్రామాణీకరిస్తోంది...",
+    "hibernated": "నిద్రాణ స్థితిలో"
   },
   "sessions": {
     "title": "సెషన్స్",

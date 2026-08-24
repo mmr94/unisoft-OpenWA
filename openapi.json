@@ -10071,9 +10071,11 @@
             "nullable": true
           },
           "lastSent": {
-            "type": "object",
+            "type": "string",
             "description": "Timestamp of the last outgoing message (used for idle hibernation)",
-            "example": "2025-02-02T10:25:00Z"
+            "example": "2025-02-02T10:25:00Z",
+            "format": "date-time",
+            "nullable": true
           },
           "createdAt": {
             "format": "date-time",

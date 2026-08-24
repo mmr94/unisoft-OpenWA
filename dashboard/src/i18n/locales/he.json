@@ -246,7 +246,8 @@
     "disconnected": "מנותק",
     "action_required": "נדרשת פעולה",
     "failed": "נכשל",
-    "authenticating": "מאמת..."
+    "authenticating": "מאמת...",
+    "hibernated": "במצב שינה"
   },
   "sessions": {
     "title": "Sessions",

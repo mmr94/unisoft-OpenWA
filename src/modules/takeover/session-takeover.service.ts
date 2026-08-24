@@ -21,6 +21,9 @@ const TAKEOVER_STATUSES = new Set<SessionStatus>([
   SessionStatus.AUTHENTICATING,
   SessionStatus.ACTION_REQUIRED,
   SessionStatus.DISCONNECTED,
+  // Unisoft: an idle-hibernated session is a down session whose engine was unloaded on purpose;
+  // a lapsed claim on one must still be adoptable, or it stays dark on every replica.
+  SessionStatus.HIBERNATED,
 ]);
 
 /** Pause between successive engine launches, matching the boot auto-start's Chromium stagger. */

@@ -677,6 +677,12 @@
   color: var(--error-text);
 }
 
+/* Hibernated is an intentional unload, not a fault — styled apart from the error pills. */
+.sessions-page .status-pill.hibernated {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--text-secondary);
+}
+
 /* Small Button for QR Placeholder */
 .sessions-page .btn-sm {
   padding: 0.5rem 1rem;

@@ -11,6 +11,7 @@ import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { createLogger } from '../../common/services/logger.service';
+import { ShutdownService } from '../../common/services/shutdown.service';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { EngineStatus, IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
 import { HookManager } from '../../core/hooks';
@@ -31,6 +32,23 @@ const DEFAULT_CHECK_INTERVAL_MS = 300_000;
 const DEFAULT_WAKE_TIMEOUT_MS = 45_000;
 /** Poll step of the wait-for-READY loop behind a transparent wake. */
 const WAKE_POLL_INTERVAL_MS = 250;
+
+/**
+ * Coerce a value out of the opaque `config` column to a positive integer, or undefined when it is
+ * not one. The column is an unvalidated blob (CreateSessionDto accepts any shape), so a string,
+ * zero or a negative must fall back to the global default rather than reach the comparison — a
+ * string threshold makes `idleMs <= threshold` false and hibernates the session on the next sweep,
+ * which is the opposite of the longer window the operator asked for.
+ */
+function positiveIntOrUndefined(value: unknown): number | undefined {
+  const n = typeof value === 'number' ? value : typeof value === 'string' ? Number(value.trim()) : NaN;
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
+/** Same reasoning for the boolean opt-out: loosely-typed clients send the string "true". */
+function isTrue(value: unknown): boolean {
+  return value === true || (typeof value === 'string' && value.trim().toLowerCase() === 'true');
+}
 
 /**
  * Idle-session hibernation (Unisoft).
@@ -56,6 +74,22 @@ export class SessionHibernationService implements OnApplicationBootstrap, OnModu
   /** The periodic idle sweep; null while hibernation is disabled or after shutdown. */
   private idleCheckTimer: NodeJS.Timeout | null = null;
 
+  /**
+   * Re-entrancy latch for the sweep. One tick can outlive its own interval — each hibernate awaits a
+   * teardown bounded at 10s plus a force-destroy escalation — and setInterval does not wait, so
+   * without this a second tick re-reads rows the first is still retiring (their status is only
+   * written at the end of stop()) and calls stop() twice on the same engine.
+   */
+  private sweeping = false;
+
+  /**
+   * Wakes currently in flight, by session id. The guard inside wake() sits before three awaits, so
+   * concurrent sends to one hibernated session would each reach engineLifecycle.start() and all but
+   * the first would get its 400 "already starting" — on a perfectly valid send. Sharing the promise
+   * makes the resume single-flight and gives every caller the same outcome.
+   */
+  private readonly wakesInFlight = new Map<string, Promise<Session>>();
+
   constructor(
     @InjectRepository(Session, 'data')
     private readonly sessionRepository: Repository<Session>,
@@ -69,6 +103,10 @@ export class SessionHibernationService implements OnApplicationBootstrap, OnModu
     // what a single-process deployment is anyway.
     @Optional()
     private readonly ownership?: SessionOwnershipService,
+    // Same guard SessionLivenessWatchdog and SessionTakeoverService take: a tick that fires
+    // during the drain would call stop() concurrently with the lifecycle's own shutdown.
+    @Optional()
+    private readonly shutdownService?: ShutdownService,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -92,6 +130,7 @@ export class SessionHibernationService implements OnApplicationBootstrap, OnModu
 
     const intervalMs = this.configService?.get<number>('session.checkIntervalMs') ?? DEFAULT_CHECK_INTERVAL_MS;
     this.idleCheckTimer = setInterval(() => {
+      if (this.sweeping || this.shutdownService?.isShuttingDown()) return;
       void this.hibernateIdleSessions();
     }, intervalMs);
     // Never keep the event loop alive for the sweep alone.
@@ -112,18 +151,29 @@ export class SessionHibernationService implements OnApplicationBootstrap, OnModu
    * rather than aborting the sweep.
    */
   async hibernateIdleSessions(): Promise<void> {
+    if (this.sweeping) return;
+    this.sweeping = true;
+    try {
+      await this.sweepOnce();
+    } finally {
+      this.sweeping = false;
+    }
+  }
+
+  private async sweepOnce(): Promise<void> {
     const defaultIdleMs = this.configService?.get<number>('session.idleTimeoutMs') ?? DEFAULT_IDLE_TIMEOUT_MS;
     const now = Date.now();
 
     for (const sessionId of Array.from(this.engines.keys())) {
+      if (this.shutdownService?.isShuttingDown()) return;
       try {
         const session = await this.sessionRepository.findOne({ where: { id: sessionId } });
         if (!session || session.status !== SessionStatus.READY) continue;
 
         const config = (session.config as HibernationConfig | null) ?? {};
-        if (config.keepAlive === true) continue;
+        if (isTrue(config.keepAlive)) continue;
 
-        const idleThreshold = config.idleTimeoutMs ?? defaultIdleMs;
+        const idleThreshold = positiveIntOrUndefined(config.idleTimeoutMs) ?? defaultIdleMs;
         // connectedAt as the fallback reference: a session that has never sent anything is idle
         // measured from the moment it came up, not immediately idle on a null lastSentAt.
         const reference = session.lastSentAt ?? session.connectedAt;
@@ -157,6 +207,10 @@ export class SessionHibernationService implements OnApplicationBootstrap, OnModu
    * client watching session.status sees one transition, which is what it is: an intentional unload.
    */
   async hibernate(id: string): Promise<Session> {
+    // Synchronous stop-mark before anything is awaited, exactly as SessionService.stop does:
+    // stop() sets its own mark only after its first await, so an armed reconnect timer firing
+    // in that window would launch a replacement engine this teardown then has to fight.
+    this.engineLifecycle.markStopping(id);
     const session = await this.engineLifecycle.stop(id, SessionStatus.HIBERNATED);
 
     this.logger.log(`Session hibernated: ${session.name}`, {
@@ -187,10 +241,33 @@ export class SessionHibernationService implements OnApplicationBootstrap, OnModu
    * belongs to a peer would already have opened a second connection to the account.
    */
   async wake(id: string): Promise<Session> {
+    const inFlight = this.wakesInFlight.get(id);
+    if (inFlight) return inFlight;
+
+    const run = this.runWake(id);
+    this.wakesInFlight.set(id, run);
+    try {
+      return await run;
+    } finally {
+      this.wakesInFlight.delete(id);
+    }
+  }
+
+  private async runWake(id: string): Promise<Session> {
     const session = await this.findOne(id);
 
     // Already loaded (running) or mid-launch — nothing to do.
     if (this.engines.has(id) || this.engines.initializing.has(id)) return session;
+
+    // Only a hibernated session resumes here. A session an operator stopped, or one that was never
+    // paired, must not be relaunched behind their back — the same rule ensureEngineReady enforces,
+    // which the REST route would otherwise walk straight past. Use POST /start for those.
+    if (session.status !== SessionStatus.HIBERNATED) {
+      throw new BadRequestException(
+        `Session '${id}' is not hibernated (status: ${session.status}). ` +
+          'Use POST /sessions/{sessionId}/start to start a stopped session.',
+      );
+    }
 
     await this.hookManager.execute(
       'session:resuming',

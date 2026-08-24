@@ -200,7 +200,15 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // duplicated work.
     const claimable = this.ownership?.claimableWhere() ?? [{}];
     const sessions = await this.sessionRepository.find({
-      where: claimable.map(clause => ({ ...clause, phone: Not(IsNull()), status: SessionStatus.DISCONNECTED })),
+      // HIBERNATED alongside DISCONNECTED: no engine survives a restart, so a hibernated row is
+      // just a down session with a different label. Without it nothing here — nor the takeover
+      // sweep — ever brings it back, and the session stays deaf to inbound messages until some
+      // outbound call happens to wake it. The idle sweep re-hibernates it one window later.
+      where: claimable.map(clause => ({
+        ...clause,
+        phone: Not(IsNull()),
+        status: In([SessionStatus.DISCONNECTED, SessionStatus.HIBERNATED]),
+      })),
     });
 
     if (sessions.length === 0) return;

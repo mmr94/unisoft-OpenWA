@@ -5,6 +5,8 @@ import {
   NotFoundException,
   Optional,
   OnApplicationBootstrap,
+  ServiceUnavailableException,
+  ConflictException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -376,14 +378,32 @@ export class BulkMessageService implements OnApplicationBootstrap {
   }
 
   private async executeBatch(batch: MessageBatch): Promise<void> {
-    if (!(await this.markBatchProcessing(batch))) return;
-
     // A batch is drained well after it was created, so its session may have hibernated in the
-    // meantime — resume it rather than failing the whole batch for want of an engine.
+    // meantime — resume it rather than failing the whole batch for want of an engine. Resolved
+    // BEFORE the PENDING → PROCESSING flip so a resume that has not finished yet can leave the
+    // batch exactly as it found it, ready for the next drain.
     let engine = this.engines.get(batch.sessionId);
     if (!engine && this.hibernation) {
-      engine = await this.hibernation.ensureEngineReady(batch.sessionId).catch(() => undefined);
+      try {
+        engine = await this.hibernation.ensureEngineReady(batch.sessionId);
+      } catch (error) {
+        // 503 means the wake is still in flight and 409 that a peer owns the session: both are
+        // retryable, and failing here would burn the batch — failBatchWithoutEngine also strips the
+        // media payloads, so it could not even be resubmitted from its own rows. Leave it PENDING.
+        if (error instanceof ServiceUnavailableException || error instanceof ConflictException) {
+          this.logger.warn(`Batch ${batch.batchId}: session not resumable yet, leaving it queued`, {
+            sessionId: batch.sessionId,
+            action: 'batch_wake_deferred',
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return;
+        }
+        engine = undefined;
+      }
     }
+
+    if (!(await this.markBatchProcessing(batch))) return;
+
     if (!engine) {
       await this.failBatchWithoutEngine(batch);
       return;

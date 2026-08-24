@@ -10,9 +10,14 @@ import { MigrationInterface, QueryRunner } from 'typeorm';
  *
  * Uses `TIMESTAMP` on PostgreSQL and `TEXT` on SQLite, matching the existing
  * `lastActiveAt` column convention (see common/utils/column-types.ts).
+ *
+ * Timestamp 1781050000000 rather than 1781000000000: the latter is already taken by
+ * AddBaileysStoredMessages, and two migrations sharing one timestamp are ordered by glob rather
+ * than by chain position. Both up() and down() are guarded by hasColumn, so a database that
+ * already ran this migration under its previous name simply re-records it and does nothing.
  */
-export class AddSessionLastSentAt1781000000000 implements MigrationInterface {
-  name = 'AddSessionLastSentAt1781000000000';
+export class AddSessionLastSentAt1781050000000 implements MigrationInterface {
+  name = 'AddSessionLastSentAt1781050000000';
 
   public async up(queryRunner: QueryRunner): Promise<void> {
     const tableExists = await queryRunner.hasTable('sessions');

@@ -17,8 +17,8 @@ Changements propres à ce fork, absents de l'upstream.
   the QR code again. Resume is client-driven (`POST /sessions/{sessionId}/wake`, then poll status or
   listen to the `session.status` WebSocket event) with a server-side safety net that transparently
   wakes a hibernated session on the next message send. New `HIBERNATED` status, `lastSentAt` column
-  (+ migration), `session:hibernated` / `session:resuming` / `session:resumed` hooks, and SDK
-  `wake` + `ensureReady` helpers (JS & Python). Configurable via `SESSION_HIBERNATION_ENABLED`,
+  (+ migration), `session:hibernated` / `session:resuming` / `session:resumed` hooks, and a `wake`
+  method on all five SDK clients. Configurable via `SESSION_HIBERNATION_ENABLED`,
   `SESSION_IDLE_TIMEOUT_MS`, `SESSION_IDLE_CHECK_INTERVAL_MS`, `SESSION_WAKE_TIMEOUT_MS`, with
   per-session `keepAlive` / `idleTimeoutMs` overrides. See
   [docs/32-session-hibernation.md](./docs/32-session-hibernation.md).

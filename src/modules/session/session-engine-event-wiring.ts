@@ -40,6 +40,13 @@ export interface SessionEngineWiringHost {
    * while this is already false. TRUE when no ownership service is wired (single process).
    */
   ownsSession(id: string): boolean;
+  /**
+   * Stop-mark gate: true between markStopping() and the next start(), i.e. while a retirement
+   * (stop/logout/force-kill/delete/hibernate) is deliberately tearing this engine down. The
+   * control action writes the terminal status itself, so the adapter's own DISCONNECTED
+   * transition on the way out must not be persisted or broadcast on top of it.
+   */
+  isStopping(id: string): boolean;
   handleEngineReady(id: string, engine: IWhatsAppEngine, phone: string, pushName: string): void;
   handleEngineDisconnected(id: string, engine: IWhatsAppEngine, reason: string): Promise<void>;
   updateStatus(id: string, status: SessionStatus): Promise<void>;
@@ -255,9 +262,15 @@ export class SessionEngineEventWiring {
           [EngineStatus.FAILED]: SessionStatus.FAILED,
         };
         const newStatus = statusMap[engineState];
-        if (newStatus) {
-          persistStatus(newStatus);
+        if (!newStatus) return;
+        // A retirement in flight owns the terminal status. engine.disconnect() flips the adapter to
+        // DISCONNECTED synchronously, so without this the row (and every session.status subscriber)
+        // sees `disconnected` a moment before the control action's own write — harmless when that
+        // write is DISCONNECTED too, but a false disconnect alert when it is HIBERNATED.
+        if (newStatus === SessionStatus.DISCONNECTED && host.isStopping(id)) {
+          return;
         }
+        persistStatus(newStatus);
       },
       onActionRequired: (reason: string): void => {
         if (!host.isLiveEngine(id, engine)) return;

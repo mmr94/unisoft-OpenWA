@@ -239,7 +239,8 @@
     "disconnected": "Bağlantı Kesildi",
     "action_required": "İşlem gerekiyor",
     "failed": "Başarısız",
-    "authenticating": "Kimlik doğrulanıyor..."
+    "authenticating": "Kimlik doğrulanıyor...",
+    "hibernated": "Uykuda"
   },
   "sessions": {
     "title": "Oturumlar",

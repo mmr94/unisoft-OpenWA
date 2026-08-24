@@ -18,11 +18,12 @@ describe('engine status writes are fenced by ownership', () => {
   const ENGINE = { destroy: jest.fn() } as unknown as IWhatsAppEngine;
 
   /** A host that is live by every OTHER measure, so the ownership gate is the only variable. */
-  const buildHost = (owns: boolean): { host: SessionEngineWiringHost; updateStatus: jest.Mock } => {
+  const buildHost = (owns: boolean, stopping = false): { host: SessionEngineWiringHost; updateStatus: jest.Mock } => {
     const updateStatus = jest.fn().mockResolvedValue(undefined);
     const host = {
       isLiveEngine: () => true,
       ownsSession: () => owns,
+      isStopping: () => stopping,
       updateStatus,
       handleEngineReady: jest.fn(),
       handleEngineDisconnected: jest.fn().mockResolvedValue(undefined),
@@ -43,8 +44,8 @@ describe('engine status writes are fenced by ownership', () => {
     return { host, updateStatus };
   };
 
-  const callbacks = (owns: boolean) => {
-    const { host, updateStatus } = buildHost(owns);
+  const callbacks = (owns: boolean, stopping = false) => {
+    const { host, updateStatus } = buildHost(owns, stopping);
     const wiring = new SessionEngineEventWiring({ logger: createLogger('test') });
     return { cb: wiring.buildCallbacks('sess-1', ENGINE, 'sess-1-name', host), updateStatus };
   };
@@ -72,6 +73,29 @@ describe('engine status writes are fenced by ownership', () => {
     cb.onError?.('engine blew up');
 
     expect(updateStatus).not.toHaveBeenCalled();
+  });
+
+  /**
+   * A retirement owns the terminal status. engine.disconnect() flips the adapter to DISCONNECTED
+   * synchronously, so without the stop-mark gate the row — and every session.status subscriber —
+   * sees `disconnected` just before the control action's own write. Harmless when that write is
+   * DISCONNECTED too, but hibernation writes HIBERNATED, and the flash reads as a real outage to
+   * anything alerting on disconnects.
+   */
+  it('suppresses the engine DISCONNECTED write while a retirement is in flight', () => {
+    const { cb, updateStatus } = callbacks(true, true);
+
+    cb.onStateChanged?.(EngineStatus.DISCONNECTED);
+
+    expect(updateStatus).not.toHaveBeenCalled();
+  });
+
+  it('still persists the other transitions while a retirement is in flight', () => {
+    const { cb, updateStatus } = callbacks(true, true);
+
+    cb.onStateChanged?.(EngineStatus.READY);
+
+    expect(updateStatus).toHaveBeenCalledWith('sess-1', SessionStatus.READY);
   });
 });
 

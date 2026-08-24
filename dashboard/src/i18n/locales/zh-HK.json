@@ -239,7 +239,8 @@
     "disconnected": "已中斷連線",
     "action_required": "需要操作",
     "failed": "失敗",
-    "authenticating": "正在驗證..."
+    "authenticating": "正在驗證...",
+    "hibernated": "已休眠"
   },
   "sessions": {
     "title": "工作階段",
