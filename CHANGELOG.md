@@ -31,6 +31,33 @@ Changements propres à ce fork, absents de l'upstream.
   terminal-403 / singleton-cleanup / transport-error hardening, the `400` (not `500`) answer for an
   unreachable recipient (upstream `RecipientUnreachableError`), and the `message.ack` dispatch. The
   hibernation feature was rebuilt on the new session architecture as `SessionHibernationService`.
+- Merge upstream `main` post-`0.23.3` (2026-08-31): the `PUPPETEER_PROTOCOL_TIMEOUT_MS` escape hatch
+  for the whatsapp-web.js engine and the inbound-media envelope fix, listed under `[Unreleased]`
+  below. No fork patch was dropped and the hibernation feature is untouched: the only overlaps were
+  the new env key in the config/compose plumbing and a comment in
+  `session-engine-lifecycle.service.ts`.
+
+## [Unreleased]
+
+### Added
+
+- `PUPPETEER_PROTOCOL_TIMEOUT_MS` raises the per-browser-command budget on the whatsapp-web.js
+  engine, for large accounts whose reads fail with `Runtime.callFunctionOn timed out`. Unset keeps
+  Puppeteer's own budget, so nothing changes for a deployment that does not set it. The gateway
+  refuses to boot on `0` or on a value above 2147483647; see docs/12 for when to reach for it.
+
+### Changed
+
+- A whatsapp-web.js protocol timeout is no longer eligible to be classified as a dead page.
+  Behaviour is unchanged on the current Puppeteer; the guard keeps a future bump from reporting a
+  slow command as a transport death.
+
+### Fixed
+
+- Inbound media whose download fails now keeps the `media` envelope with `omitted: true` and the declared
+  size, on both engines, instead of dropping the field and looking like a message that never had media.
+- Webhook filters and automation rules gated on `hasMedia` now match those messages.
+- Baileys logs a failed inbound media download at `warn` instead of `debug`, so it is visible by default.
 
 ## [0.23.3] - 2026-08-24
 

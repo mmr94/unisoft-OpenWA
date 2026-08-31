@@ -3033,7 +3033,11 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     expect(msg.media?.omitted).toBeUndefined();
   });
 
-  it('still emits the echo (without media) when the own-send media download fails', async () => {
+  it('emits the echo with the omitted marker when the own-send media download fails', async () => {
+    // Pinned on: the disabled exit builds an identical marker, so an ambient 'false' would let this
+    // pass without ever attempting a download. The describe's afterEach restores it.
+    process.env[ENV] = 'true';
+
     const adapter = new WhatsAppWebJsAdapter({
       sessionId: 'sess-echo-media-fail',
       sessionDataPath: './data/sessions',
@@ -3071,9 +3075,58 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     expect(onMessageCreate).toHaveBeenCalledTimes(1);
     // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
     const msg = onMessageCreate.mock.calls[0][0] as { media?: unknown };
-    // The failure is contained at the call site: the echo still fires, just without the media field
-    // (the omitted marker is synthesized downstream, in SessionService's persistence).
-    expect(msg.media).toBeUndefined();
+    // The failure is contained in capInboundMediaFor: the echo still fires, carrying the declared-only
+    // marker so a consumer can tell "the image was lost" from "there was no image".
+    expect(msg.media).toEqual({ mimetype: 'image/png', omitted: true, sizeBytes: 3 });
+    expect(mockMsg.downloadMedia).toHaveBeenCalled(); // the disabled exit builds the same marker
+  });
+
+  it('emits the omitted marker when an inbound media download fails', async () => {
+    // The received path guards its assignment with `if (capped)`, so it drops the field on its own if the
+    // adapter ever stops returning an envelope. A webhook consumer filtering on hasMedia sees nothing then.
+    process.env[ENV] = 'true';
+
+    const adapter = new WhatsAppWebJsAdapter({
+      sessionId: 'sess-inbound-media-fail',
+      sessionDataPath: './data/sessions',
+      puppeteer: {},
+    });
+    const client = Object.assign(new EventEmitter(), {
+      info: { wid: { user: '628123' }, pushname: 'Tester' },
+      getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+      pupPage: { evaluate: jest.fn().mockResolvedValue(true) },
+    });
+    (adapter as unknown as { client: unknown }).client = client;
+    const onMessage = jest.fn();
+    (adapter as unknown as { callbacks: unknown }).callbacks = { onMessage };
+    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+
+    const mockMsg = {
+      id: { _serialized: 'IN_MEDIA_FAIL_1' },
+      from: '628111@c.us',
+      to: '628123@c.us',
+      body: '',
+      type: 'image',
+      timestamp: 1700000080,
+      fromMe: false,
+      hasMedia: true,
+      _data: { mimetype: 'image/jpeg', size: 2048 },
+      // The minified page-side throw a WhatsApp Web build surfaces through Puppeteer.
+      downloadMedia: jest.fn().mockRejectedValue(new Error('t: t')),
+      getContact: jest.fn().mockResolvedValue(null),
+      hasQuotedMsg: false,
+    };
+
+    client.emit('message', mockMsg);
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const msg = onMessage.mock.calls[0][0] as { media?: unknown; type?: string };
+    expect(msg.type).toBe('image');
+    expect(msg.media).toEqual({ mimetype: 'image/jpeg', omitted: true, sizeBytes: 2048 });
+    expect(mockMsg.downloadMedia).toHaveBeenCalled(); // the disabled exit builds the same marker
   });
 });
 
@@ -4698,7 +4751,7 @@ describe('WhatsAppWebJsAdapter inbound media concurrency (slot held until the re
     expect(maxInFlight).toBe(1);
   });
 
-  it('propagates a rejecting download to the caller and releases the slot for the next download', async () => {
+  it('returns the omitted marker for a rejecting download and releases the slot for the next one', async () => {
     process.env.INBOUND_MEDIA_CONCURRENCY = '1';
     process.env.MEDIA_DOWNLOAD_TIMEOUT_MS = '10000'; // long: we want the reject, not the timeout
     process.env.MEDIA_DOWNLOAD_MAX_BYTES = String(10 * 1024 * 1024);
@@ -4720,7 +4773,12 @@ describe('WhatsAppWebJsAdapter inbound media concurrency (slot held until the re
     const cap = (m: unknown): Promise<unknown> =>
       (adapter as unknown as { capInboundMediaFor: (msg: unknown) => Promise<unknown> }).capInboundMediaFor(m);
 
-    await expect(cap(makeMsg('bad', 'reject'))).rejects.toThrow('download blew up');
+    // A rejection is the same "no usable media" outcome as the disabled, pre-gate and timeout exits, and
+    // reports it the same way. It used to be the one download outcome with no exit of its own: the caller's
+    // race adopted it and rethrew, so every call site dropped the media field entirely.
+    await expect(cap(makeMsg('bad', 'reject'))).resolves.toEqual(
+      expect.objectContaining({ mimetype: 'image/png', omitted: true, sizeBytes: 100 }),
+    );
     // Slot must have been released despite the rejection — the next download proceeds and resolves.
     const media = (await cap(makeMsg('good', 'resolve'))) as { mimetype: string; data: string };
     expect(media.data).toBe(Buffer.from('ok').toString('base64'));

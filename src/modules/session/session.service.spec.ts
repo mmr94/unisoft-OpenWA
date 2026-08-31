@@ -3437,9 +3437,9 @@ describe('SessionService', () => {
     });
 
     it('synthesizes the omitted media marker for a media echo carrying no media field', async () => {
-      // A wwjs echo whose media download failed carries no media field at all — the sync
-      // buildIncomingMessageBase attaches none and the enrichment around it is best-effort. Without
-      // the marker the dashboard renders an empty bubble and the by-type stats filter would skip the row.
+      // An echo can reach persistence with no media field at all — the sync buildIncomingMessageBase
+      // attaches none and the enrichment around it is best-effort. Without the marker the dashboard
+      // renders an empty bubble and the by-type stats filter would skip the row.
       const callbacks = await startAndCaptureCallbacks();
       (hookManager.execute as jest.Mock).mockImplementation((_e: string, data: unknown) =>
         Promise.resolve({ continue: true, data }),
