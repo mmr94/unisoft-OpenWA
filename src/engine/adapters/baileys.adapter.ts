@@ -113,7 +113,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
   constructor(private readonly config: BaileysAdapterConfig) {
     // Isolate each session's auth state under its own subdirectory of the shared auth dir.
     this.authPath = path.join(config.authDir, config.sessionId);
-    this.sessionStore = new BaileysSessionStore(config.lidMappingStore, config.sessionId);
+    this.sessionStore = new BaileysSessionStore(config.lidMappingStore, config.sessionId, config.chatStateStore);
     // Constructed before messaging: the messaging delegate's own-send echo maps through
     // events.mapMessage (and the lifecycle delegate clears that same live-call cache on teardown).
     // One host literal for every delegate (the wwebjs-host pattern): a new cross-cutting member
@@ -191,6 +191,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
       getOnQRCode: () => this.callbacks.onQRCode,
       getOnReady: () => this.callbacks.onReady,
       getOnDisconnected: () => this.callbacks.onDisconnected,
+      getOnReconnecting: () => this.callbacks.onReconnecting,
       getOnError: () => this.callbacks.onError,
       getOnStateChanged: () => this.callbacks.onStateChanged,
       getOnCredentialTeardownStarted: () => this.callbacks.onCredentialTeardownStarted,

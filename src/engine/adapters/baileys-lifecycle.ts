@@ -13,6 +13,7 @@ import { type createLogger } from '../../common/services/logger.service';
 import { BaileysAdapterConfig } from '../types/baileys.types';
 import { createBaileysLogger } from './baileys-logger';
 import { BaileysVersionResolver } from './baileys-version-resolver';
+import { unappliedPatches, unappliedPatchesMessage } from './engine-patch-status';
 import type { BaileysEvents } from './baileys-events';
 import type { BaileysHistory } from './baileys-history';
 import type { BaileysSessionStore } from './baileys-session-store';
@@ -95,6 +96,8 @@ export interface BaileysLifecycleHost {
   getOnReady(): EngineEventCallbacks['onReady'];
   /** The currently-registered onDisconnected callback, if any (assigned at initialize()). */
   getOnDisconnected(): EngineEventCallbacks['onDisconnected'];
+  /** The currently-registered onReconnecting callback, if any (assigned at initialize()). */
+  getOnReconnecting(): EngineEventCallbacks['onReconnecting'];
   /** The currently-registered onError callback, if any (assigned at initialize()). */
   getOnError(): EngineEventCallbacks['onError'];
   /** The currently-registered onStateChanged callback, if any (assigned at initialize()). */
@@ -154,6 +157,15 @@ export class BaileysLifecycle {
     if (this.intentionalClose) {
       return;
     }
+
+    // An install that skipped a Baileys patch fails later with errors that name no cause: an
+    // app-state resync that never terminates, a newsletter create that cannot parse its reply.
+    // Say so here instead, while the operator is still looking at the startup logs.
+    const unapplied = unappliedPatches('baileys');
+    if (unapplied.length) {
+      this.host.logger.error(unappliedPatchesMessage('baileys', unapplied));
+    }
+
     try {
       await this.connect();
     } catch (err) {
@@ -451,7 +463,11 @@ export class BaileysLifecycle {
       // backoff and NO attempt ceiling — a long network outage must
       // not kill the session. The counter resets on 'open' and via the stability window below.
       // Do NOT fire onDisconnected here; this is a transient drop, not a terminal disconnect.
-      this.host.logger.log('Baileys connection dropped; reconnecting', { statusCode });
+      this.host.logger.log('Baileys connection dropped; reconnecting', {
+        sessionId: this.host.config.sessionId,
+        statusCode,
+        action: 'baileys_connection_dropped',
+      });
 
       // The socket is dead NOW, but the reconnect attempt only runs after the backoff delay below
       // (up to 60 s + jitter; connectInner's own setStatus(INITIALIZING) fires just before the new
@@ -543,6 +559,12 @@ export class BaileysLifecycle {
     }
     this.reconnectAttempts += 1;
     const delay = Math.min(60_000, 1_000 * 2 ** (this.reconnectAttempts - 1)) + Math.floor(Math.random() * 1000);
+    // The consumer is never told about this drop through onDisconnected (deliberately: the session is
+    // still linked), and the status it does see is INITIALIZING for the whole episode. So this is the
+    // only signal that a retry loop is running. Fired here rather than in the close handler because
+    // this is the one place every scheduled attempt passes through, including the reschedule from the
+    // failed-attempt catch below, and it is already past the duplicate-close guard above.
+    this.host.getOnReconnecting()?.(this.reconnectAttempts, delay);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       if (this.intentionalClose) {

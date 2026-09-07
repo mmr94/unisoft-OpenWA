@@ -39,7 +39,10 @@ COPY scripts/postinstall.js ./scripts/
 # variable, so docker-compose.yml's `NODE_ENV=${NODE_ENV:-production}` leaks NODE_ENV=production
 # into this stage and a bare `npm ci` would skip @nestjs/cli → `sh: 1: nest: not found` (exit 127).
 # (docker-compose.dev.yml hardcodes NODE_ENV=development, which is why the dev build never hit this.)
-RUN npm ci --include=dev
+# This stage only builds dist/ and the dashboard SPA and never launches a browser; the production
+# stage downloads Chrome explicitly. Skip the Puppeteer postinstall download so @puppeteer/browsers 3
+# does not try to extract a zip here, where no archiver is installed.
+RUN PUPPETEER_SKIP_DOWNLOAD=true npm ci --include=dev
 
 # Copy source code
 COPY . .
@@ -110,6 +113,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     patch \
     curl \
+    unzip \
     procps \
     sqlite3 \
     ffmpeg \
@@ -174,7 +178,7 @@ COPY package*.json ./
 # scripts/postinstall.js rides along so a bare local `npm ci` keeps working, but the
 # --ignore-scripts install below skips the hook here: the explicit fatal run right
 # after is the sole (and stricter) applier for the image.
-COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch scripts/patch-wwebjs-newsletter-preview.js scripts/patch-wwebjs-status.js scripts/patch-wwebjs-ready-sync.js scripts/patch-wwebjs-participant-arity.js scripts/patch-wwebjs-block.js scripts/patch-baileys-appstate.js scripts/patch-baileys-newsletter-create.js ./scripts/
+COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch scripts/patch-wwebjs-newsletter-preview.js scripts/patch-wwebjs-status.js scripts/patch-wwebjs-ready-sync.js scripts/patch-wwebjs-participant-arity.js scripts/patch-wwebjs-block.js scripts/patch-wwebjs-group-description.js scripts/patch-baileys-appstate.js scripts/patch-baileys-newsletter-create.js ./scripts/
 
 # Install production dependencies only, then apply the backports. The status patcher runs after
 # the two patchers it depends on: its transforms were written against the tree they leave behind.
@@ -197,6 +201,7 @@ RUN npm ci --omit=dev --ignore-scripts \
     && node scripts/patch-wwebjs-ready-sync.js \
     && node scripts/patch-wwebjs-participant-arity.js \
     && node scripts/patch-wwebjs-block.js \
+    && node scripts/patch-wwebjs-group-description.js \
     && node scripts/patch-baileys-appstate.js \
     && node scripts/patch-baileys-newsletter-create.js \
     && npm cache clean --force

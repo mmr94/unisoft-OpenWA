@@ -10,6 +10,7 @@
  */
 
 import { MessageType } from '../../../engine/interfaces/whatsapp-engine.interface';
+import { chatKind, type ChatKind } from '../../../engine/identity/wa-id';
 
 export type FilterOperator = 'is' | 'isNot' | 'contains' | 'equals';
 
@@ -56,11 +57,16 @@ const MESSAGE_TYPE_FLAGS: Record<MessageType, true> = {
   poll: true,
   call: true,
   revoked: true,
+  order: true,
+  product: true,
   masked: true,
   unknown: true,
 };
 
 export const MESSAGE_TYPES: readonly MessageType[] = Object.keys(MESSAGE_TYPE_FLAGS) as MessageType[];
+
+/** Chat kinds a message-family filter can match on. `channel` is a newsletter; see chatKind(). */
+export const CHAT_KINDS: readonly ChatKind[] = ['individual', 'group', 'channel', 'status', 'broadcast', 'unknown'];
 
 // Guard rails. These bound both stored config size and per-event evaluation cost.
 export const MAX_CONDITIONS = 20;
@@ -111,6 +117,22 @@ export const FILTER_FIELDS: Record<string, FieldDefinition[]> = {
       kind: 'boolean',
       operators: BOOLEAN_OPERATORS,
       resolve: data => data.isGroup === true,
+    },
+    {
+      // The chat kind, so a filter can single out or exclude a channel (newsletter) where the
+      // boolean isGroup cannot: individual, group, channel, status, broadcast and unknown all
+      // collapse to isGroup=false. `kind` rides the received payload directly; the edited, reaction
+      // and revoked events in this family carry only chatId, so derive it there.
+      field: 'kind',
+      kind: 'enum',
+      operators: ENUM_OPERATORS,
+      enumValues: CHAT_KINDS,
+      resolve: data => {
+        const k = str(data.kind);
+        if (k) return k;
+        const chatId = str(data.chatId);
+        return chatId ? chatKind(chatId) : undefined;
+      },
     },
     {
       field: 'fromMe',

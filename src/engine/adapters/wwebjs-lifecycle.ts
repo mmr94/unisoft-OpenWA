@@ -1,5 +1,6 @@
 import * as qrcode from 'qrcode';
 import * as path from 'path';
+import { HttpException } from '@nestjs/common';
 import { Client, LocalAuth, WAState } from 'whatsapp-web.js';
 import {
   type AccountRestriction,
@@ -14,6 +15,7 @@ import { resolveAuthTimeoutMs, resolveEngineInitTimeoutMs } from '../engine-init
 import { killOrphanedChromiumProcesses, removeStaleSingletonFiles } from './chromium-profile-hygiene';
 import { isSupportedProxyUrl, buildProxyLaunchConfig } from './wwebjs-proxy';
 import { BACKPORT_MISSING_MESSAGE, isBackportMissing } from './wwebjs-backport-check';
+import { unappliedPatches, unappliedPatchesMessage } from './engine-patch-status';
 import { type WhatsAppWebJsConfig } from './whatsapp-web-js.adapter';
 
 /**
@@ -40,6 +42,24 @@ export function isExecutionContextDestroyedError(reason: string): boolean {
  */
 function isNavigationShapedInitRejection(reason: string): boolean {
   return isExecutionContextDestroyedError(reason) || /window\.require is not a function/i.test(reason);
+}
+
+/**
+ * requestPairingCode retry budget. WhatsApp Web reloads the QR page while UNPAIRED, so a pairing
+ * request can land mid-navigation and either reject fast ("Execution context was destroyed") or hang
+ * until Puppeteer's protocol timeout. Each attempt is bounded, and only the navigation/timeout shapes
+ * are retried; four attempts across ~1 minute cover several reload cycles, the page reboots in 2-3s.
+ */
+export const PAIRING_CODE_MAX_ATTEMPTS = 4;
+export const PAIRING_CODE_ATTEMPT_TIMEOUT_MS = 15_000;
+export const PAIRING_CODE_RETRY_DELAY_MS = 3_000;
+
+/** Sentinel for a per-attempt pairing timeout, so it is retried like a navigation error rather than propagated. */
+class PairingCodeAttemptTimeoutError extends Error {
+  constructor() {
+    super('requestPairingCode attempt timed out');
+    this.name = 'PairingCodeAttemptTimeoutError';
+  }
 }
 
 // A post-READY page navigation (WhatsApp Web's ~5-minute first reload on a fresh pairing, a
@@ -168,6 +188,12 @@ export class WwebjsLifecycle {
     // (#889) — say so here instead, while the operator is still looking at the startup logs.
     if (isBackportMissing()) {
       this.host.logger.error(BACKPORT_MISSING_MESSAGE);
+    }
+
+    // The other seven whatsapp-web.js patchers fail the same way and were equally silent about it.
+    const unapplied = unappliedPatches('wwebjs');
+    if (unapplied.length) {
+      this.host.logger.error(unappliedPatchesMessage('wwebjs', unapplied));
     }
 
     try {
@@ -675,6 +701,23 @@ export class WwebjsLifecycle {
 
   /** Whether the error carries a dead page/transport signature (see PAGE_TRANSPORT_ERROR_PATTERN). */
   isPageTransportError(error: unknown): boolean {
+    // An HttpException is never a dead page. It is an error THIS application constructed, and its
+    // message carries caller-supplied text verbatim: MessageNotFoundError reads
+    // `Message ${messageId} not found in chat ${chatId}`, and GroupNotFoundError, LabelNotFoundError,
+    // ChannelNotFoundError and CallNotFoundError have the same shape. Matching the pattern against
+    // one of those hands the CALLER the classifier. A request naming a messageId of "Target closed"
+    // made its own 404 read as a transport death: the session was torn down and reconnected, and the
+    // caller got a 503. The reactions read needs no role at all, so the lowest-privilege key could
+    // do it at will.
+    //
+    // Excluding the class loses no real signal. Puppeteer and whatsapp-web.js throw plain Errors,
+    // and a page-side throw arrives as one too (puppeteer-core rebuilds it in cdp/utils.js
+    // createEvaluationError). It also settles the nested case: an EngineTransportError arriving from
+    // an inner catch was already reported where it was built, and handlePuppeteerDeath latches on
+    // status, so re-reporting would be a no-op regardless.
+    if (error instanceof HttpException) {
+      return false;
+    }
     const message = error instanceof Error ? error.message : String(error);
     if (WwebjsLifecycle.PROTOCOL_TIMEOUT_PATTERN.test(message)) {
       return false;
@@ -984,6 +1027,51 @@ export class WwebjsLifecycle {
     if (!this.client || this.status !== EngineStatus.QR_READY) {
       throw new EngineNotReadyError('Session is not waiting to be linked. Start it and wait for the QR stage.');
     }
-    return this.client.requestPairingCode(phoneNumber);
+    // WhatsApp Web reloads the QR page while UNPAIRED (roughly every 20s). A requestPairingCode that
+    // lands mid-navigation runs its in-page evaluate against a destroyed context: it either rejects
+    // with "Execution context was destroyed" or hangs until Puppeteer's protocol timeout (minutes),
+    // and the dashboard sits on "Creating pairing code..." with nothing ever returned. The navigation
+    // is transient (the page reboots in a few seconds), so bound each attempt and retry only the
+    // navigation/timeout shapes while the session is still at the QR stage. A real failure (an invalid
+    // number, an already-linked account) is not navigation-shaped and propagates on the first attempt.
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= PAIRING_CODE_MAX_ATTEMPTS; attempt++) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          this.client.requestPairingCode(phoneNumber),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new PairingCodeAttemptTimeoutError()), PAIRING_CODE_ATTEMPT_TIMEOUT_MS);
+            timer.unref?.();
+          }),
+        ]);
+      } catch (error) {
+        lastError = error;
+        const reason = error instanceof Error ? error.message : String(error);
+        const transient =
+          error instanceof PairingCodeAttemptTimeoutError ||
+          isExecutionContextDestroyedError(reason) ||
+          /callfunctionon timed out|timed out\. increase the 'protocoltimeout'/i.test(reason);
+        if (!transient) {
+          throw error;
+        }
+        if (attempt < PAIRING_CODE_MAX_ATTEMPTS) {
+          await new Promise<void>(resolve => {
+            const t = setTimeout(resolve, PAIRING_CODE_RETRY_DELAY_MS);
+            t.unref?.();
+          });
+          // The reboot may have ended the QR window (linked, or torn down). Do not retry a dead session.
+          if (!this.client || this.status !== EngineStatus.QR_READY) {
+            throw new EngineNotReadyError('Session is no longer waiting to be linked.');
+          }
+        }
+      } finally {
+        if (timer) {
+          clearTimeout(timer);
+        }
+      }
+    }
+    // Every attempt hit a transient navigation/timeout: surface the last one rather than a hang.
+    throw lastError;
   }
 }

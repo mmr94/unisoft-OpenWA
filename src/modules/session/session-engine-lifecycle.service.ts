@@ -144,6 +144,25 @@ const TERMINAL_UNLINK_REASONS = new Set(['LOGOUT', 'UNPAIRED', 'UNPAIRED_IDLE', 
  * executeReconnect calls initializeEngine), so they stay in ONE service — splitting them would need
  * forwardRef(), which this codebase deliberately avoids.
  */
+/**
+ * The session-row fields a READY writes.
+ *
+ * An empty `phone` must NOT overwrite the bound number. whatsapp-web.js can momentarily report an
+ * empty phone at ready (client.info unreadable), and the account-binding guard in
+ * SessionEngineEventWiring skips an empty incoming phone rather than rebind-rejecting it, so writing
+ * it here would silently clear the stored number and drop the binding guard until the next non-empty
+ * ready. In that case keep the existing binding and update only the liveness fields.
+ */
+export function readyRowUpdate(phone: string, pushName: string, at: Date) {
+  return {
+    status: SessionStatus.READY,
+    ...(phone ? { phone } : {}),
+    pushName,
+    connectedAt: at,
+    lastActiveAt: at,
+  };
+}
+
 @Injectable()
 export class SessionEngineLifecycle {
   private readonly logger = createLogger('SessionEngineLifecycle');
@@ -293,6 +312,8 @@ export class SessionEngineLifecycle {
       ownsSession: id => this.ownsSession(id),
       isStopping: id => this.stoppingSessions.has(id),
       handleEngineReady: (id, engine, phone, pushName) => this.handleEngineReady(id, engine, phone, pushName),
+      rejectRebind: (id, engine, sessionName, previousPhone, incomingPhone) =>
+        this.rejectRebind(id, engine, sessionName, previousPhone, incomingPhone),
       handleEngineDisconnected: (id, engine, reason) => this.handleEngineDisconnected(id, engine, reason),
       updateStatus: (id, status) => this.updateStatus(id, status),
       cancelReconnect: id => this.cancelReconnect(id),
@@ -600,7 +621,7 @@ export class SessionEngineLifecycle {
     // lifecycle's live methods/state through the wiringHost built in the constructor.
     // `session.name` is handed over as the immutable snapshot onCredentialTeardownStarted keys on.
     const initPromise = engine.initialize(
-      this.eventWiring.buildCallbacks(id, engine, session.name, this.wiringHost, Boolean(session.phone)),
+      this.eventWiring.buildCallbacks(id, engine, session.name, this.wiringHost, session.phone ?? null),
     );
 
     // engine.initialize() launches Chromium and navigates to WhatsApp Web with no internal timeout:
@@ -674,6 +695,67 @@ export class SessionEngineLifecycle {
     }
   }
 
+  /**
+   * Refuse a ready link whose account differs from the one this session is bound to. Reached only via
+   * the account-binding guard in SessionEngineEventWiring, i.e. the session already carries a phone and
+   * a DIFFERENT number scanned its QR. The incoming account is never persisted: log the reason, tear
+   * the wrong account's engine down (logout wipes its on-disk credentials and unlinks the device), land
+   * the session in FAILED, and audit it. The original `phone` binding is deliberately left in place so
+   * a subsequent stranger scan is rejected the same way, and the operator can see which number it is
+   * bound to. A caller-initiated logout latches its own teardown flags on both engines, so the
+   * disconnected handler (which would null the stored phone) never fires here.
+   */
+  private async rejectRebind(
+    id: string,
+    engine: IWhatsAppEngine,
+    sessionName: string,
+    previousPhone: string,
+    incomingPhone: string,
+  ): Promise<void> {
+    if (!this.isLiveEngine(id, engine)) return;
+    const reason =
+      `Link rejected: this session is bound to ${previousPhone}, but a different WhatsApp number ` +
+      `(${incomingPhone}) scanned its QR. Re-pair the original number, or delete the session to bind a new one.`;
+    this.logger.warn('Rejected a QR link from a different WhatsApp account', {
+      sessionId: id,
+      previousPhone,
+      incomingPhone,
+      action: 'rebind_rejected',
+    });
+    // Terminal, not a flap: suppress the reconnect/re-init auto-recovery and stop the watchdog. FAILED
+    // (persisted) already excludes the session from boot auto-start and the takeover sweep; a manual
+    // start() clears stoppingSessions. cancelReconnect is defensive: a caller-initiated logout does not
+    // schedule a reconnect, but a stray timer from before the ready must not fire against a dead engine.
+    this.stoppingSessions.add(id);
+    this.cancelReconnect(id);
+    this.watchdog.clear(id);
+    this.sessionErrors.set(id, reason);
+    // Record the rejection before the teardown, so it lands even if a concurrent start() replaces the
+    // engine while logout runs and the re-fence below returns early.
+    void this.auditService?.logWarn(AuditAction.SESSION_REBIND_REJECTED, {
+      sessionId: id,
+      metadata: { previousPhone, incomingPhone },
+      errorMessage: reason,
+    });
+    // logout() wipes the wrong account's credentials and removes this device from that account.
+    await this.teardownEngineSafely(id, engine, e => e.logout(), 'logout', sessionName);
+    // Re-fence after the await, as handleEngineDisconnected does: a concurrent start() may have
+    // replaced the engine while logout ran. If this handler is now stale it must not delete the new
+    // engine or write FAILED over a fresh start.
+    if (!this.isLiveEngine(id, engine)) return;
+    this.engines.deleteIfLive(id, engine);
+    // Fenced on ownership like every engine-driven terminal write: a lapsed lease must not park a
+    // peer's session unrecoverably in FAILED. Defensively caught like handleEngineReady's row write.
+    if (this.ownsSession(id)) {
+      await this.updateStatus(id, SessionStatus.FAILED).catch(err =>
+        this.logger.warn('Failed to persist the rebind-rejected FAILED state', {
+          sessionId: id,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
+  }
+
   /** Engine callback body, lifted out of initializeEngine so the wiring table stays readable. */
   private handleEngineReady(id: string, engine: IWhatsAppEngine, phone: string, pushName: string): void {
     if (!this.isLiveEngine(id, engine)) return;
@@ -715,20 +797,12 @@ export class SessionEngineLifecycle {
     // one-shot recovery budget is re-armed for a future episode.
     this.stuckAuthRecoveryUsed.delete(id);
 
-    void this.sessionRepository
-      .update(id, {
-        status: SessionStatus.READY,
-        phone,
-        pushName,
-        connectedAt: new Date(),
-        lastActiveAt: new Date(),
-      })
-      .catch(err =>
-        this.logger.warn('Failed to persist session ready state', {
-          sessionId: id,
-          error: err instanceof Error ? err.message : String(err),
-        }),
-      );
+    void this.sessionRepository.update(id, readyRowUpdate(phone, pushName, new Date())).catch(err =>
+      this.logger.warn('Failed to persist session ready state', {
+        sessionId: id,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
 
     // Best-effort snapshot of the account's own contacts' currently-active statuses. Live status
     // posts arrive through onMessage below; this just backfills what was already up before we
@@ -1100,5 +1174,10 @@ export class SessionEngineLifecycle {
   // inline method had — an async wrapper would add adoption hops the retirement-race specs catch.
   updateStatus(id: string, status: SessionStatus): Promise<void> {
     return this.broadcaster.updateStatus(id, status);
+  }
+
+  /** Public delegate: the fan-out half only, for a caller that wrote the row under its own predicate. */
+  announceStatus(id: string, status: SessionStatus): void {
+    this.broadcaster.announce(id, status);
   }
 }

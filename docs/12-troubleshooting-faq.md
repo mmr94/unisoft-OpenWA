@@ -665,6 +665,45 @@ rm -rf node_modules/whatsapp-web.js && npm ci
 > Pinning `WWEBJS_WEB_VERSION` does **not** work around this — the rename is present in every
 > current WhatsApp Web build, so no pin avoids it.
 
+### Issue: Startup logs say install-time patches are missing
+
+**Symptoms:**
+
+- Startup logs contain `The installed whatsapp-web.js is missing N of OpenWA's install-time patches: …`,
+  or the same line naming `@whiskeysockets/baileys`
+- One capability fails while everything around it works: an unnamed `500` from a single route,
+  block/unblock refusing every id, a status media send that never arrives, a group description that
+  cannot be set, an app-state resync that never settles
+
+**Cause:** OpenWA applies nine exact source transforms to its engine libraries at install time
+(docs/29 §29.3). The Docker image runs them without `--best-effort`, so a source shape a patcher
+cannot recognise fails the image build. A source install runs them through `scripts/postinstall.js`
+with `--best-effort`, where a patcher that cannot apply prints one line into a long `npm install`
+transcript and the install still succeeds. The usual causes are `npm install --ignore-scripts` and
+an upstream release whose shape a patcher no longer recognises. Each engine now checks its own
+patches as it starts and names the ones that did not land, so the report arrives on the machine that
+is actually affected rather than in an install log nobody kept.
+
+**Solution:**
+
+```bash
+# Which patches are missing? Works on every platform, including Windows without grep.
+node -e "const fs=require('fs'),p=require('path');for(const f of fs.readdirSync('scripts').filter(n=>n.startsWith('patch-')&&n.endsWith('.js')&&!n.endsWith('.spec.js')).sort()){const m=require('./scripts/'+f);if(typeof m.isApplied!=='function')continue;const k=f.startsWith('patch-wwebjs-')?'whatsapp-web.js':'@whiskeysockets/baileys';try{console.log((m.isApplied(p.dirname(require.resolve(k+'/package.json')))?'APPLIED    ':'NOT APPLIED')+' '+f)}catch{}}"
+
+# Apply each one it named, then restart
+node scripts/patch-wwebjs-group-description.js
+```
+
+If a patcher answers with an unsupported-shape error instead of applying, the installed library has
+moved and the transform needs re-evaluating against it. Reinstalling will not help; open an issue
+quoting the message it printed.
+
+> `patch-wwebjs-201832.js` is not in that list. It carries its own startup check and its own entry
+> above, because a partially applied backport needs different advice than one that never ran.
+
+> A patch that never applied is not fatal on its own: only the capability it repairs is affected and
+> the rest of the gateway runs normally, which is why this is easy to misread as a bug in one route.
+
 ### Issue: Reads on a large account fail with `Runtime.callFunctionOn timed out`
 
 > **Engine:** This issue applies to the `whatsapp-web.js` engine only (Chromium/Puppeteer-based). It does not affect `ENGINE_TYPE=baileys`.

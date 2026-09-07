@@ -169,6 +169,12 @@ type ListMessagesQuery struct {
 	From   *string
 	Limit  *int
 	Offset *int
+	// After is a keyset cursor: the id of the last message of the previous page. Takes
+	// precedence over Offset.
+	After *string
+	// InlineMedia set to false omits inline media payloads. The budget is per response, so a
+	// walk repays it on every page.
+	InlineMedia *bool
 }
 
 func (q *ListMessagesQuery) values() url.Values {
@@ -177,6 +183,8 @@ func (q *ListMessagesQuery) values() url.Values {
 	setStr(v, "from", q.From)
 	setInt(v, "limit", q.Limit)
 	setInt(v, "offset", q.Offset)
+	setStr(v, "after", q.After)
+	setBool(v, "inlineMedia", q.InlineMedia)
 	return v
 }
 
@@ -285,6 +293,24 @@ type ChatHistoryMessage struct {
 	Media         *ChatHistoryMedia `json:"media,omitempty"`
 	QuotedMessage *QuotedMessage    `json:"quotedMessage,omitempty"`
 	Location      *MessageLocation  `json:"location,omitempty"`
+	Order         *MessageOrder     `json:"order,omitempty"`
+	Product       *MessageProduct   `json:"product,omitempty"`
+}
+
+// MessageOrder is the order block on a live history message, present on order messages only: the
+// cart the customer placed from the business catalog, plus the single-order token for its items.
+type MessageOrder struct {
+	OrderID string `json:"orderId"`
+	Token   string `json:"token,omitempty"`
+}
+
+// MessageProduct is the product block on a live history message, present on product messages only:
+// the catalog product shared into the chat.
+type MessageProduct struct {
+	ProductID        string `json:"productId"`
+	Title            string `json:"title,omitempty"`
+	Description      string `json:"description,omitempty"`
+	BusinessOwnerJID string `json:"businessOwnerJid,omitempty"`
 }
 
 // MessageCall is the call block on a live history message, present on call messages only.
@@ -430,6 +456,8 @@ const (
 	MsgPoll     MessageType = "poll"
 	MsgCall     MessageType = "call"
 	MsgRevoked  MessageType = "revoked"
+	MsgOrder    MessageType = "order"
+	MsgProduct  MessageType = "product"
 	MsgMasked   MessageType = "masked"
 	MsgUnknown  MessageType = "unknown"
 )

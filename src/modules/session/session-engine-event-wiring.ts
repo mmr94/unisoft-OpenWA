@@ -1,4 +1,9 @@
 import { SessionStatus } from './entities/session.entity';
+import { RECONNECT_LOOP_ALERT_INTERVAL_ATTEMPTS } from './reconnect-policy';
+import {
+  incrementSessionReconnectAttempts,
+  incrementSessionReconnectLoopAlerts,
+} from '../../common/metrics/session-reconnect-metrics';
 import { MessageProjector } from './message-projector.service';
 import { SessionErrorStore } from './session-error-store.service';
 import { SessionRestrictionStore } from './session-restriction-store.service';
@@ -18,6 +23,7 @@ import {
   CallOutcomeEvent,
 } from '../../engine/interfaces/whatsapp-engine.interface';
 import { type createLogger } from '../../common/services/logger.service';
+import { userPart } from '../../engine/identity/wa-id';
 import { SessionEngineLeafEvents } from './session-engine-leaf-events';
 
 /**
@@ -48,6 +54,18 @@ export interface SessionEngineWiringHost {
    */
   isStopping(id: string): boolean;
   handleEngineReady(id: string, engine: IWhatsAppEngine, phone: string, pushName: string): void;
+  /**
+   * Refuse a ready link whose account differs from the one this session is bound to: tear the wrong
+   * account's engine down (logout wipes its credentials), land the session in FAILED, and record why.
+   * Never persists the incoming account, and deliberately keeps the original binding.
+   */
+  rejectRebind(
+    id: string,
+    engine: IWhatsAppEngine,
+    sessionName: string,
+    previousPhone: string,
+    incomingPhone: string,
+  ): Promise<void>;
   handleEngineDisconnected(id: string, engine: IWhatsAppEngine, reason: string): Promise<void>;
   updateStatus(id: string, status: SessionStatus): Promise<void>;
   cancelReconnect(id: string): void;
@@ -93,8 +111,10 @@ export class SessionEngineEventWiring {
   }
 
   /**
-   * `previouslyLinked` is whether the session row carried a phone when this engine started, i.e.
-   * it had completed a link before. A QR from such an engine means the stored credentials are gone
+   * `previousPhone` is the phone the session row carried when this engine started (null on a fresh
+   * session), i.e. it had completed a link before. Its presence drives the relink warning below; its
+   * value gates the onReady account-binding check that refuses a different number's rescan.
+   * A QR from a previously-linked engine means the stored credentials are gone
    * or no longer accepted, and when that happened while the engine was down nothing else in the
    * log says so, hence the warning below. One-shot per engine start: a lifecycle reconnect builds a
    * new table from the row, which still carries the phone, and warns again.
@@ -104,9 +124,17 @@ export class SessionEngineEventWiring {
     engine: IWhatsAppEngine,
     sessionName: string,
     host: SessionEngineWiringHost,
-    previouslyLinked = false,
+    previousPhone: string | null = null,
   ): EngineEventCallbacks {
+    // The phone this session was bound to when this engine started (null on a fresh session). Its
+    // presence is the relink signal used below; its value gates onReady's account-binding check.
+    const previouslyLinked = Boolean(previousPhone);
     let relinkWarned = false;
+    // Start of the current engine-internal reconnect episode (epoch ms), stamped on attempt 1.
+    // Closure state rather than a Map: it is scoped to this engine instance, which is exactly the
+    // lifetime of an episode. A service-level reconnect builds a new engine and a new callback table,
+    // so nothing has to be cleaned up and a previous episode's clock can never be inherited.
+    let reconnectingSince = 0;
     /**
      * Persist an engine-driven status, but only while this node still owns the session.
      *
@@ -170,7 +198,17 @@ export class SessionEngineEventWiring {
 
         persistStatus(SessionStatus.QR_READY);
       },
-      onReady: (phone, pushName): void => host.handleEngineReady(id, engine, phone, pushName),
+      onReady: (phone, pushName): void => {
+        // Account-binding guard: a ready link whose number differs from the one this session is
+        // already bound to is a different account scanning its QR (a takeover), not a re-link. Refuse
+        // it rather than silently overwrite the binding. An empty incoming phone (wwjs can report one)
+        // is not identifiable, so it is never treated as a mismatch.
+        if (previousPhone && phone && userPart(phone) !== userPart(previousPhone)) {
+          void host.rejectRebind(id, engine, sessionName, previousPhone, phone);
+          return;
+        }
+        host.handleEngineReady(id, engine, phone, pushName);
+      },
       onMessage: (message): void => host.messages.handleInboundMessage(id, engine, message),
       onHistoryMessages: (messages): void => {
         if (!host.isLiveEngine(id, engine)) return;
@@ -240,6 +278,45 @@ export class SessionEngineEventWiring {
         void host.webhookService.dispatch(id, 'call.received', payload);
         // Opt-in auto-reject runs AFTER the dispatch so a reject failure can never eat the event.
         void host.leafEvents.maybeAutoRejectCall(id, engine, event.callId);
+      },
+      onReconnecting: (attempt: number, nextDelayMs: number): void => {
+        if (!host.isLiveEngine(id, engine)) return;
+        // Count it whichever layer scheduled it: the counter's published meaning is "reconnect
+        // attempts scheduled across all sessions", and an engine that retries internally was simply
+        // never counted, so the series read 0 on Baileys however long a session looped.
+        incrementSessionReconnectAttempts();
+        if (attempt === 1) reconnectingSince = Date.now();
+
+        // Below the loop threshold this is a blip, not an episode: the 515 restart WhatsApp asks for
+        // right after a successful pairing is one attempt, and so is any drop that comes straight
+        // back. Reporting those would put "reconnecting" on a session that is linking normally.
+        if (attempt % RECONNECT_LOOP_ALERT_INTERVAL_ATTEMPTS !== 0) return;
+
+        const downForSeconds = Math.round((Date.now() - reconnectingSince) / 1000);
+        const downFor = downForSeconds >= 120 ? `${Math.round(downForSeconds / 60)}m` : `${downForSeconds}s`;
+        // The engine holds the session at INITIALIZING for the whole episode, which is the same thing
+        // it reports for a session waiting to be paired. Record why, so `lastError` says so on
+        // GET /sessions/:id, the only durable operator surface this path reaches.
+        host.sessionErrors.set(
+          id,
+          `Reconnecting after a dropped connection (attempt ${attempt}, down for ${downFor}).`,
+        );
+        // Same cadence, same log shape and the same already-documented webhook the service-level
+        // reconnect path emits, so an operator watching for a stuck session does not have to know
+        // which layer happens to be doing the retrying.
+        this.logger.warn(`Session is reconnect-looping: attempt ${attempt} scheduled`, {
+          sessionId: id,
+          attempts: attempt,
+          nextDelayMs,
+          downForSeconds,
+          action: 'reconnect_loop',
+        });
+        incrementSessionReconnectLoopAlerts();
+        void host.webhookService.dispatch(id, 'session.reconnect_loop', {
+          sessionId: id,
+          attempts: attempt,
+          nextDelayMs,
+        });
       },
       onDisconnected: (reason: string): void => {
         if (!host.isLiveEngine(id, engine)) return;
