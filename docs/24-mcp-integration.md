@@ -116,17 +116,21 @@ down on response close — any request can hit any instance.
 
 The surface is an **allowlist by construction** — a capability is exposed only if a
 `ToolDescriptor` is written for it. There is no automatic route reflection. Each tool
-declares a `tier` (`read` | `write`) and, for writes, a required role.
+declares a `tier` (`read` | `write`) and a `requiredRole` when the call warrants one: every
+write carries its privilege level, and a read carries the role its REST twin requires. The
+reads at OPERATOR are `WebhooksList`, `WebhookFindBySession` and `WebhookFindOne`,
+`AutomationRuleFindAll` and `AutomationRuleFindOne`, and `GroupGetInviteCode` (the invite
+code is a transferable join capability, so it sits at OPERATOR like the QR endpoint).
 
 | Domain         | Read tools                                              | Write tools                                                                                   |
 | -------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | **Session**    | list, get, chats, stats, presence                       | mark read/unread, typing, subscribe presence                                                  |
 | **Message**    | list, history, reactions                                | send text/image/video/audio/document/location/contact/sticker/template, reply, forward, react |
 | **Contact**    | list, get, check-number, resolve-phone, profile-picture | block, unblock                                                                                |
-| **Group**      | list, get, invite-code                                  | create, add participants, set subject, set description                                        |
-| **Webhook**    | list, get (read-only)                                   | —                                                                                             |
+| **Group**      | list, get, invite-code (OPERATOR)                       | create, add participants, set subject, set description                                        |
+| **Webhook**    | list, get (OPERATOR)                                    | —                                                                                             |
 | **Label**      | list, get, chats for a label, labels on a chat          | upsert, delete, add to chat, remove from chat                                                 |
-| **Automation** | rules list, get                                         | —                                                                                             |
+| **Automation** | rules list, get (OPERATOR)                              | —                                                                                             |
 
 > **Labels split across the engines**, and each tool's description says which way. Every label
 > _read_ needs whatsapp-web.js — Baileys exposes no label query at all. Editing a label (upsert,
@@ -232,7 +236,9 @@ Guidelines:
 - **Reuse the response DTO** the matching REST controller uses (e.g.
   `WebhookResponseDto.fromEntity`, `SessionResponseDto.fromEntity`). Returning a raw entity
   can leak fields the REST API deliberately strips.
-- Mark writes with `tier: 'write'` and the appropriate `requiredRole`.
+- Mark writes with `tier: 'write'` and the appropriate `requiredRole`. Give a read the same
+  `requiredRole` as the REST route it mirrors: the webhook and automation-rule reads and
+  `GroupGetInviteCode` sit at OPERATOR because their REST routes do.
 - Use `sessionScoped: true` and a non-empty `sessionId` field for any per-session tool so
   the scope check applies.
 - A snapshot test (`tool-registry.spec.ts`) locks the public tool-name set; update it

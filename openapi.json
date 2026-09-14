@@ -9630,7 +9630,7 @@
   "info": {
     "title": "OpenWA API",
     "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API\n\n**Gateway-wide responses.** Two statuses are returned by middleware before routing, so any operation can emit them:\n\n- `415 Unsupported Media Type` — the request body carries a `Content-Encoding` other than `identity`. The aggregate in-flight body cap counts wire bytes, so a compressed body would be admitted on its compressed size and then inflated past the memory it is meant to bound. Send the body uncompressed.\n- `503 Service Unavailable` with `Retry-After` — the gateway already has too much request body data in flight. The body is not read; retry after the given delay.",
-    "version": "0.23.4",
+    "version": "0.23.5",
     "contact": {
       "name": "OpenWA",
       "url": "https://github.com/rmyndharis/OpenWA",
@@ -10250,7 +10250,7 @@
           },
           "lastError": {
             "type": "string",
-            "description": "Human-readable reason carried while the status is FAILED (a terminal engine failure), ACTION_REQUIRED (the engine is running but something needs a human), or INITIALIZING while the engine is retrying a dropped connection on its own. Cleared on any other status.",
+            "description": "Human-readable reason carried while the status is FAILED (a terminal engine failure), ACTION_REQUIRED (the engine is running but something needs a human), or INITIALIZING from the fifth consecutive reconnect attempt of a session whose engine retries a dropped connection on its own, until the session is ready or a QR arrives. A QR window that runs out unscanned is not an attempt. Held in memory by the process running the session. Cleared on any other status.",
             "example": "Failed to launch the browser process: spawn /usr/bin/chromium ENOENT",
             "nullable": true
           },
