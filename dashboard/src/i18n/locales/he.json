@@ -115,6 +115,7 @@
     "groupSubtitle": "קבוצה",
     "privateContactSubtitle": "איש קשר פרטי",
     "deleteConfirm": "למחוק הודעה זו עבור כולם?",
+    "promptButtons": "אפשרויות ההודעה",
     "messageDeleted": "🚫 הודעה זו נמחקה",
     "messageMasked": "🔒 הוסתר על ידי וואטסאפ במכשירים המקושרים — בדוק בטלפון הראשי שלך",
     "kind": {
@@ -169,6 +170,7 @@
       "send": "שליחת ההודעה נכשלה",
       "react": "התגובה להודעה נכשלה",
       "delete": "מחיקת ההודעה נכשלה",
+      "clickButton": "לחיצה על הכפתור נכשלה",
       "fileTooLarge": "הקובץ גדול מדי (מקסימום 18 MB)"
     },
     "loadMessagesError": "לא ניתן לטעון את ההודעות. בדקו את יומני השרת.",
@@ -313,7 +315,7 @@
       "created": "נוצר בתאריך",
       "lastActive": "פעילות אחרונה",
       "autoRejectCalls": "דחיית שיחות אוטומטית",
-      "autoRejectCallsHint": "שיחות נכנסות נדחות ברגע שהן מצלצלות. ה-webhook call.received עדיין נשלח לפני כן. חל מהשיחה הבאה — ללא צורך בהפעלה מחדש."
+      "autoRejectCallsHint": "שיחות נכנסות נדחות ברגע שהן מצלצלות. ה-webhook call.received עדיין נשלח לפני כן. חל מהשיחה הבאה, ללא צורך בהפעלה מחדש. במנוע Baileys בלבד: whatsapp-web.js לא יכול לדחות שיחות."
     },
     "proxy": {
       "title": "Proxy Configuration",
@@ -387,6 +389,7 @@
       "phoneLabel": "מספר טלפון",
       "phonePlaceholder": "לדוגמה: 919876543210",
       "phoneHint": "ספרות בלבד (ללא +, רווחים או מקפים) בפורמט בין-לאומי (קידומת מדינה + מספר).",
+      "relinkWarning": "במנוע whatsapp-web.js, בקשת קוד עבור מספר שכבר יש לו סשן מקושר עלולה לגרום לוואטסאפ לנתק את המכשיר הזה. השתמשו בלשונית ה-QR אם הסשן הזה חייב להישאר פעיל.",
       "invalidPhone": "יש להזין מספר טלפון תקין: 6–15 ספרות, קידומת המדינה תחילה, ללא סימנים.",
       "generateButton": "יצירת קוד קישור",
       "generating": "יוצר קוד קישור...",
@@ -401,7 +404,8 @@
     },
     "start": {
       "teardownPendingTitle": "הפעלת סשן",
-      "teardownPending": "פירוק אישורים לסשן זה עדיין מתבצע. המתן רגע ונסה שוב."
+      "teardownPending": "פירוק אישורים לסשן זה עדיין מתבצע. המתן רגע ונסה שוב.",
+      "errorTitle": "ההפעלה נכשלה"
     },
     "restriction": {
       "reachout_timelock": "צ׳אטים חדשים חסומים",
@@ -441,6 +445,7 @@
       "fields": {
         "sender": "שולח",
         "recipient": "נמען",
+        "chatId": "מזהה שיחה",
         "body": "גוף ההודעה",
         "type": "סוג הודעה",
         "isGroup": "צ'אט קבוצתי",
@@ -528,7 +533,10 @@
       "title": "אין תבניות שמורות",
       "description": "צרו תבנית לשימוש חוזר כדי לזרז תשובות והתראות נפוצות.",
       "noSessionsTitle": "אין סשנים זמינים",
-      "noSessionsDesc": "צרו סשן WhatsApp לפני הוספת תבניות."
+      "noSessionsDesc": "צרו סשן WhatsApp לפני הוספת תבניות.",
+      "loadErrorTitle": "לא ניתן לטעון את התבניות",
+      "forbiddenTitle": "אין גישה לתבניות",
+      "forbiddenDesc": "תבניות דורשות מפתח API עם תפקיד מפעיל או מנהל."
     },
     "toasts": {
       "created": "התבנית נוצרה בהצלחה",

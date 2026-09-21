@@ -11,7 +11,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
-import { Repository, In, Not, IsNull, LessThan, DataSource, FindManyOptions } from 'typeorm';
+import { Repository, In, Not, IsNull, LessThan, DataSource, FindManyOptions, FindOptionsWhere } from 'typeorm';
 import { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { setTimeout } from 'node:timers/promises';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
@@ -79,6 +79,11 @@ function isTransientLaunchFailure(error: unknown): boolean {
 /** Pause between sequential auto-start launches so a burst of Chromium boots does not spike the host. */
 export const AUTOSTART_THROTTLE_MS = 2_000;
 
+/** List window for {@link SessionService.findAll}, plus an optional exact session-name filter. */
+export interface SessionListOptions extends ListOptions {
+  name?: string;
+}
+
 /**
  * Statuses that assert an engine is running somewhere. The boot reset clears them for every row this
  * node may claim; markLapsedDisconnected clears them for a row whose holder never came back, a
@@ -116,6 +121,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   private autoStartRun: Promise<void> = Promise.resolve();
   /** Set at the top of onModuleDestroy so the detached run stops launching further sessions. */
   private shuttingDown = false;
+  /**
+   * stop()/delete() requests per session, counted so the transient start retry can tell a stop issued
+   * after it began from a mark left over by an earlier stop, which start() clears by design.
+   */
+  private readonly stopRequests = new Map<string, number>();
 
   constructor(
     @InjectRepository(Session, 'data')
@@ -325,7 +335,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     return saved;
   }
 
-  async findAll(allowedSessions?: string[] | null, opts: ListOptions = {}): Promise<Session[]> {
+  async findAll(allowedSessions?: string[] | null, opts: SessionListOptions = {}): Promise<Session[]> {
     // A session-restricted key only lists its own sessions; an unrestricted key (null/empty
     // allowlist) lists all — mirroring the ApiKeyGuard allowedSessions model so a scoped key
     // cannot enumerate every session through this aggregate route.
@@ -336,8 +346,17 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       take: limit,
       skip: offset,
     };
+    const where: FindOptionsWhere<Session> = {};
     if (allowedSessions && allowedSessions.length > 0) {
-      options.where = { id: In(allowedSessions) };
+      where.id = In(allowedSessions);
+    }
+    // Exact, case-sensitive match. Only a non-empty string reaches TypeORM: anything else (an
+    // array from a repeated query key, an empty value) is not a name and must not become one.
+    if (typeof opts.name === 'string' && opts.name.length > 0) {
+      where.name = opts.name;
+    }
+    if (Object.keys(where).length > 0) {
+      options.where = where;
     }
     const sessions = await this.sessionRepository.find(options);
     return sessions.map(session => this.attachRuntimeState(session));
@@ -448,11 +467,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // post-INITIALIZING check by the time that write settles; awaiting anything first — the fence's
     // COUNT, or delete()'s own requireSession — would let the mark land after that window. A mark
     // left behind when the fence refuses (409) is harmless and is cleared by the next start().
-    this.engineLifecycle.markStopping(id);
+    this.markStopping(id);
     try {
       if (this.ownership) await this.assertNotHeldElsewhere(id);
       await this.engineLifecycle.delete(id);
       await this.ownership?.release(id);
+      this.stopRequests.delete(id);
     } catch (error) {
       this.discardStopMarkForMissingSession(id, error);
       throw error;
@@ -468,9 +488,15 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * their own requireSession, so for an id that never had one the entry is unreachable by every
    * reclamation path and survives for the life of the process. A 404 also means there is no engine
    * and no in-flight start() for the mark to guard, so dropping it is safe as well as necessary.
+   *
+   * The request count set on the same tick is dropped with it, and for the same reason: its only
+   * reader is the transient start retry, which cannot be guarding a session that has no row, so
+   * an id that never had one would otherwise keep a counter entry for the life of the process.
    */
   private discardStopMarkForMissingSession(id: string, error: unknown): void {
-    if (error instanceof NotFoundException) this.engineLifecycle.clearStopping(id);
+    if (!(error instanceof NotFoundException)) return;
+    this.engineLifecycle.clearStopping(id);
+    this.stopRequests.delete(id);
   }
 
   /**
@@ -484,7 +510,19 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * holder may be gone, and taking over is exactly what the claim rule allows.
    */
   private async assertNotHeldElsewhere(id: string): Promise<void> {
-    if (await this.ownership?.isHeldByOtherNode(id)) {
+    // Both callers count the request and set the stop mark before this query. The MARK survives a
+    // 409 (harmless, cleared by the next start()) but not a failed query: that decided nothing, and
+    // a mark left on a session running here would stop its next disconnect from reconnecting.
+    // Neither refusal keeps its COUNT. Nothing was taken down, and the count exists only so an
+    // in-flight start()'s transient retry can tell a stop that happened from one that did not;
+    // counting a refusal cancels that retry and leaves the session down with nothing to restart it.
+    const heldElsewhere = await this.ownership?.isHeldByOtherNode(id).catch((error: unknown) => {
+      this.engineLifecycle.clearStopping(id);
+      this.uncountStopRequest(id);
+      throw error;
+    });
+    if (heldElsewhere) {
+      this.uncountStopRequest(id);
       throw new ConflictException(`Session ${id} is running on another node`);
     }
   }
@@ -498,8 +536,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       await this.findOne(id);
       throw new ConflictException(`Session ${id} is running on another node`);
     }
+    let session: Session;
     try {
-      return await this.startWithTransientRetry(id);
+      session = await this.startWithTransientRetry(id);
     } catch (error) {
       // A failed or refused start must not leave the claim pinned here — the heartbeat would renew
       // it and the session could never be started anywhere else. Released only when nothing is
@@ -508,6 +547,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       await this.releaseUnlessEngineActive(id);
       throw error;
     }
+    // A start retired by a concurrent stop() resolves normally but leaves no engine, and that stop
+    // skipped its release while this start still held the session. Hand the claim back here, or the
+    // row keeps naming this node until the lease lapses and a peer adopts the stopped session.
+    await this.releaseUnlessEngineActive(id);
+    return session;
   }
 
   /**
@@ -523,6 +567,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * not-ready, 4xx) are NOT transient - they propagate immediately.
    */
   private async startWithTransientRetry(id: string): Promise<Session> {
+    const stopRequestsBefore = this.stopRequests.get(id);
     try {
       return await this.engineLifecycle.start(id);
     } catch (error) {
@@ -533,6 +578,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         error: error instanceof Error ? error.message : String(error),
       });
       await setTimeout(SESSION_START_RETRY_DELAY_MS);
+      // Retrying would bring back a session that a stop() issued since this start began just took
+      // down. A mark alone does not prove that: an earlier stop's mark survives until start() clears
+      // it, and a first attempt failing before that point would otherwise lose its retry.
+      if (this.stopRequests.get(id) !== stopRequestsBefore) throw error;
       // The lease may have lapsed while the first attempt ran; the retry must keep holding the
       // claim, never 409 on the session it already owns.
       if (this.ownership && !(await this.ownership.claim(id))) {
@@ -545,7 +594,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
   async stop(id: string): Promise<Session> {
     // Synchronous stop-mark before the awaited fence — see delete() for why.
-    this.engineLifecycle.markStopping(id);
+    this.markStopping(id);
     let session: Session;
     try {
       if (this.ownership) await this.assertNotHeldElsewhere(id);
@@ -576,9 +625,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       await this.releaseUnlessEngineActive(id);
       return session;
     } catch (error) {
-      // The 502-incomplete path tears the engine down too, and a "not started" refusal never had
-      // one — either way a claim that no longer covers an engine must not survive the call.
-      await this.releaseUnlessEngineActive(id);
+      // The 502-incomplete path tears the engine down, so its claim must not survive the call. A 400
+      // "not started" refusal changed nothing and keeps whatever claim there is: release() also
+      // clears a LAPSED foreign claim, which would take a crashed node's session out of takeover.
+      if (!(error instanceof BadRequestException)) await this.releaseUnlessEngineActive(id);
       throw error;
     }
   }
@@ -589,9 +639,27 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       await this.releaseUnlessEngineActive(id);
       return session;
     } catch (error) {
-      await this.releaseUnlessEngineActive(id);
+      // Same 400 rule as logout().
+      if (!(error instanceof BadRequestException)) await this.releaseUnlessEngineActive(id);
       throw error;
     }
+  }
+
+  private markStopping(id: string): void {
+    this.stopRequests.set(id, (this.stopRequests.get(id) ?? 0) + 1);
+    this.engineLifecycle.markStopping(id);
+  }
+
+  /**
+   * Undo markStopping()'s count for a request that took nothing down, and drop the entry once the
+   * count is back to zero so ids that are only ever refused cannot accumulate. Decrementing rather
+   * than deleting keeps a concurrent stop that DID take effect counted: it leaves the value one
+   * above what an in-flight start captured either way, so the retry it must cancel stays cancelled.
+   */
+  private uncountStopRequest(id: string): void {
+    const remaining = (this.stopRequests.get(id) ?? 0) - 1;
+    if (remaining > 0) this.stopRequests.set(id, remaining);
+    else this.stopRequests.delete(id);
   }
 
   /** Hand the claim back unless something still runs here (engine, in-flight start, pending reconnect). */
@@ -715,6 +783,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    */
   async getPresence(id: string, chatId: string): Promise<ChatPresence | null> {
     await this.findOne(id);
+    // Presence belongs to a connection: with no engine registered (stopped, logged out, killed or
+    // failed) whatever was last reported is no longer current.
+    if (!this.engines.has(id)) return null;
     return this.presence.get(id, chatId);
   }
 

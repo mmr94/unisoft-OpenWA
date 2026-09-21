@@ -1,5 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsString, IsOptional, MaxLength, MinLength, Matches, IsIn, IsUrl } from 'class-validator';
+import { IsIn, IsOptional, IsString, IsUrl, Matches, MaxLength, MinLength, Validate } from 'class-validator';
+import { HasDecodableProxyCredentialsConstraint } from './has-decodable-proxy-credentials.validator';
 
 export class CreateSessionDto {
   @ApiProperty({
@@ -18,14 +19,16 @@ export class CreateSessionDto {
 
   @ApiPropertyOptional({
     description:
-      'Session configuration. Five keys are read: autoRejectCalls (boolean, default false) ' +
-      'rejects incoming calls as soon as they ring — the call.received event is still emitted ' +
-      'first; maxReconnectAttempts (0-20, default unlimited) caps consecutive reconnects; ' +
-      'reconnectBaseDelay (1000-300000 ms, default 5000) sets the backoff base; and, on this ' +
-      'Unisoft build, keepAlive (boolean — exclude this session from idle hibernation) and ' +
-      'idleTimeoutMs (number — per-session override of the global idle window before ' +
-      'hibernation). Anything else is stored but ignored. The first three can be changed later ' +
-      'with PATCH /api/sessions/{sessionId}/config, without restarting the session.',
+      'Session configuration. Five keys are read: autoRejectCalls (boolean, default false, ' +
+      'Baileys engine only) rejects incoming calls as soon as they ring, and the call.received event is still emitted ' +
+      'first; maxReconnectAttempts (0-20, default unlimited) caps consecutive reconnects and ' +
+      'reconnectBaseDelay (1000-300000 ms, default 5000) sets the backoff base, both for the ' +
+      "gateway's own reconnect only (on Baileys the engine retries a transient drop itself, with a " +
+      'fixed backoff and no cap); and, on this Unisoft build, keepAlive (boolean — exclude this ' +
+      'session from idle hibernation) and idleTimeoutMs (number — per-session override of the ' +
+      'global idle window before hibernation). Anything else is ' +
+      'stored but ignored. The first three can be changed later with PATCH /api/sessions/{sessionId}/config, ' +
+      'without restarting the session.',
     example: {
       autoRejectCalls: false,
       maxReconnectAttempts: 5,
@@ -62,6 +65,7 @@ export class CreateSessionDto {
     },
     { message: 'proxyUrl must be a valid http(s)/socks4/socks5 URL' },
   )
+  @Validate(HasDecodableProxyCredentialsConstraint)
   proxyUrl?: string;
 
   @ApiPropertyOptional({

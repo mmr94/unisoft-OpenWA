@@ -38,6 +38,8 @@ import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/secu
 import { renderTemplate } from '../../common/utils/template-render';
 import { IWhatsAppEngine, MessageResult } from '../../engine/interfaces/whatsapp-engine.interface';
 import { resolveNonNegativeIntEnv } from '../../config/configuration';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { isUniqueViolation } from '../../common/utils/db-errors';
 
 // Type definitions for bulk message content
 interface BulkMessageContent {
@@ -224,8 +226,9 @@ export class BulkMessageService implements OnApplicationBootstrap {
     // its base64 payloads) is persisted into the batch row. Mirrors the single-send cap in
     // MessageService.buildMediaInput. The same check runs again per item after variables and the
     // message:sending gate are applied (see executeBatch).
-    for (const { content } of messages) {
+    for (const { type, content } of messages) {
       this.assertContentMediaWithinCap(content);
+      this.assertItemContent(type, content);
     }
 
     const batchId = dto.batchId || `batch_${randomUUID().split('-')[0]}`;
@@ -276,6 +279,11 @@ export class BulkMessageService implements OnApplicationBootstrap {
       await this.batchRepository.save(batch);
     } catch (error) {
       this.inFlightBatches--;
+      // Two concurrent creates with the same caller-supplied batchId both pass the read above; the
+      // unique index decides, and the loser gets the same 400 as the sequential case.
+      if (isUniqueViolation(error)) {
+        throw new BadRequestException(`Batch ID '${batchId}' already exists`);
+      }
       throw error;
     }
     this.logger.log(
@@ -382,10 +390,9 @@ export class BulkMessageService implements OnApplicationBootstrap {
     // meantime — resume it rather than failing the whole batch for want of an engine. Resolved
     // BEFORE the PENDING → PROCESSING flip so a resume that has not finished yet can leave the
     // batch exactly as it found it, ready for the next drain.
-    let engine = this.engines.get(batch.sessionId);
-    if (!engine && this.hibernation) {
+    if (!this.engines.get(batch.sessionId) && this.hibernation) {
       try {
-        engine = await this.hibernation.ensureEngineReady(batch.sessionId);
+        await this.hibernation.ensureEngineReady(batch.sessionId);
       } catch (error) {
         // 503 means the wake is still in flight and 409 that a peer owns the session: both are
         // retryable, and failing here would burn the batch — failBatchWithoutEngine also strips the
@@ -398,20 +405,23 @@ export class BulkMessageService implements OnApplicationBootstrap {
           });
           return;
         }
-        engine = undefined;
+        // Any other wake failure is terminal for this batch: fall through to the live-engine guard
+        // below, which fails it the same way a never-hibernated session with no engine would.
       }
     }
 
     if (!(await this.markBatchProcessing(batch))) return;
 
-    if (!engine) {
+    // Read the map here, not before the wake: markBatchProcessing awaited, and the per-message send
+    // resolves the live engine too, so the guard must reflect the same instant as the sends do.
+    if (!this.engines.get(batch.sessionId)) {
       await this.failBatchWithoutEngine(batch);
       return;
     }
 
     const results: BatchMessageResult[] = batch.results || [];
     const state: BatchExecutionState = { results, stoppedOnError: false, cancelledByDb: false };
-    await this.processBatchMessages(batch, engine, state);
+    await this.processBatchMessages(batch, state);
     await this.finalizeBatch(batch, state);
   }
 
@@ -444,13 +454,9 @@ export class BulkMessageService implements OnApplicationBootstrap {
     } as QueryDeepPartialEntity<MessageBatch>);
   }
 
-  private async processBatchMessages(
-    batch: MessageBatch,
-    engine: IWhatsAppEngine,
-    state: BatchExecutionState,
-  ): Promise<void> {
+  private async processBatchMessages(batch: MessageBatch, state: BatchExecutionState): Promise<void> {
     for (let i = batch.currentIndex; i < batch.messages.length; i++) {
-      if (!(await this.processBatchMessage(batch, engine, i, state))) break;
+      if (!(await this.processBatchMessage(batch, i, state))) break;
     }
   }
 
@@ -458,12 +464,7 @@ export class BulkMessageService implements OnApplicationBootstrap {
    * Send one batch message through the moderation gate, record the outcome, and persist progress.
    * Returns false when the batch loop must stop (cancellation or stopOnError).
    */
-  private async processBatchMessage(
-    batch: MessageBatch,
-    engine: IWhatsAppEngine,
-    i: number,
-    state: BatchExecutionState,
-  ): Promise<boolean> {
+  private async processBatchMessage(batch: MessageBatch, i: number, state: BatchExecutionState): Promise<boolean> {
     const { results } = state;
     // Check for cancellation
     if (!this.processingBatches.get(batch.id)) {
@@ -530,6 +531,12 @@ export class BulkMessageService implements OnApplicationBootstrap {
       // gate rewrite can grow base64 media past the limit createBatch verified on the raw input.
       // A violation fails just this item (honouring stopOnError) instead of sending it.
       this.assertContentMediaWithinCap(content);
+      this.assertItemContent(msg.type, content);
+
+      // Resolved per item, not once per batch: a session restart or reconnect registers a fresh
+      // adapter, and a batch still holding the retired one would fail every remaining item.
+      const engine = this.engines.get(batch.sessionId);
+      if (!engine) throw new EngineNotReadyError();
 
       // Send message based on type. The engine call is bracketed on its own so the pacing breaker
       // hears exactly what the single-send path feeds it (message.service failSend/persistSentState):
@@ -672,6 +679,24 @@ export class BulkMessageService implements OnApplicationBootstrap {
     }
 
     this.logger.log(`Batch ${batch.batchId} completed: ${batch.progress.sent} sent, ${batch.progress.failed} failed`);
+  }
+
+  /**
+   * Require the field the item's type sends: a non-empty text for a text item, a url or base64 under
+   * the matching media key otherwise. The DTO cannot express this per type, so it runs at batch
+   * creation (a 400) and again per item after variables and the message:sending gate.
+   */
+  private assertItemContent(type: string, content: BulkMessageContent): void {
+    if (type === 'text') {
+      if (typeof content?.text !== 'string' || !content.text) {
+        throw new BadRequestException('A text item requires a non-empty content.text');
+      }
+      return;
+    }
+    const media = content?.[type as 'image' | 'video' | 'audio' | 'document'];
+    if (!stripBase64DataUri(media?.base64) && !media?.url) {
+      throw new BadRequestException(`A ${type} item requires content.${type}.url or content.${type}.base64`);
+    }
   }
 
   /**

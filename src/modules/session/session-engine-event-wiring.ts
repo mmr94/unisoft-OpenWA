@@ -27,7 +27,7 @@ import { userPart } from '../../engine/identity/wa-id';
 import { SessionEngineLeafEvents } from './session-engine-leaf-events';
 
 /** The lastError an engine-internal reconnect episode records; onQRCode clears only this one. */
-const RECONNECT_LOOP_REASON = 'Reconnecting after a dropped connection';
+export const RECONNECT_LOOP_REASON = 'Reconnecting after a dropped connection';
 
 /**
  * The call-ins SessionEngineEventWiring needs from the lifecycle core. Built ONCE in the
@@ -43,6 +43,12 @@ const RECONNECT_LOOP_REASON = 'Reconnecting after a dropped connection';
 export interface SessionEngineWiringHost {
   /** Liveness gate: true only while `engine` is still the live engine registered for `id`. */
   isLiveEngine(id: string, engine: IWhatsAppEngine): boolean;
+  /**
+   * True while an operator-initiated teardown (stop/logout/forceKill) is retiring exactly this
+   * engine instance. Its DISCONNECTED is that teardown's own, reported before the eviction; the verb
+   * announces the settled one once the engine is gone.
+   */
+  isOperatorTeardown(id: string, engine: IWhatsAppEngine): boolean;
   /**
    * Ownership gate: true while this node may still speak for `id`. Orthogonal to isLiveEngine —
    * between a lapsed lease and the teardown the heartbeat schedules, isLiveEngine is still true
@@ -72,6 +78,12 @@ export interface SessionEngineWiringHost {
   handleEngineDisconnected(id: string, engine: IWhatsAppEngine, reason: string): Promise<void>;
   updateStatus(id: string, status: SessionStatus): Promise<void>;
   cancelReconnect(id: string): void;
+  /**
+   * Park an engine failure reported while a service-level reconnect awaits its re-init, instead of
+   * applying it: `run` is the failure's side effects, and `reason` is set for an onError report.
+   * Returns false (nothing parked, the caller applies it now) outside that window.
+   */
+  parkReconnectInitFailure(id: string, run: () => void, reason?: string): boolean;
   evictAndForceDestroy(id: string, engine: IWhatsAppEngine): void;
   trackPendingCredentialTeardown(sessionName: string, raw: Promise<void>): void;
   /** Announce a restriction that has ended; shared with the lifecycle's own READY path. */
@@ -348,14 +360,23 @@ export class SessionEngineEventWiring {
         };
         const newStatus = statusMap[engineState];
         if (!newStatus) return;
-        // A retirement in flight owns the terminal status. engine.disconnect() flips the adapter to
-        // DISCONNECTED synchronously, so without this the row (and every session.status subscriber)
-        // sees `disconnected` a moment before the control action's own write — harmless when that
-        // write is DISCONNECTED too, but a false disconnect alert when it is HIBERNATED.
-        if (newStatus === SessionStatus.DISCONNECTED && host.isStopping(id)) {
-          return;
-        }
-        persistStatus(newStatus);
+        // An operator-initiated teardown reports DISCONNECTED on entry, before the engine is
+        // evicted: whatsapp-web.js sets the status and only then awaits browser.close(). Announced
+        // here it would tell every consumer the session is down while GET /sessions still reports
+        // the engine as loaded, and the verb's own write after the eviction is dropped as a
+        // duplicate, so the settled view would never be announced at all. Skipped for the exact
+        // instance being torn down; stop/logout/forceKill each write DISCONNECTED afterwards.
+        if (newStatus === SessionStatus.DISCONNECTED && host.isOperatorTeardown(id, engine)) return;
+        // Same reasoning, one window wider: the stop mark is set before stop() reaches the
+        // operator-teardown mark (SessionHibernationService sets it before the call), so a
+        // DISCONNECTED raised in that gap would still escape the identity-checked gate above —
+        // harmless when the retirement writes DISCONNECTED too, but a false disconnect alert when
+        // it writes HIBERNATED.
+        if (newStatus === SessionStatus.DISCONNECTED && host.isStopping(id)) return;
+        // A FAILED reported inside a service-level reconnect's init window is parked with onError.
+        const persist = (): void => persistStatus(newStatus);
+        if (newStatus === SessionStatus.FAILED && host.parkReconnectInitFailure(id, persist)) return;
+        persist();
       },
       onActionRequired: (reason: string): void => {
         if (!host.isLiveEngine(id, engine)) return;
@@ -460,35 +481,41 @@ export class SessionEngineEventWiring {
         // scheduled (unlike onDisconnected), since re-scanning is required.
         host.sessionErrors.set(id, reason);
 
-        // A prior onDisconnected may have scheduled a reconnect. This failure is terminal
-        // (re-scan required), so cancel it — otherwise the pending timer would resurrect a
-        // session the operator must manually restart.
-        host.cancelReconnect(id);
+        const fail = (): void => {
+          // A prior onDisconnected may have scheduled a reconnect. This failure is terminal
+          // (re-scan required), so cancel it — otherwise the pending timer would resurrect a
+          // session the operator must manually restart.
+          host.cancelReconnect(id);
 
-        void host.hookManager.execute(
-          'session:error',
-          { reason },
-          {
-            sessionId: id,
-            source: 'Engine',
-          },
-        );
+          void host.hookManager.execute(
+            'session:error',
+            { reason },
+            {
+              sessionId: id,
+              source: 'Engine',
+            },
+          );
 
-        persistStatus(SessionStatus.FAILED);
+          persistStatus(SessionStatus.FAILED);
 
-        // onError is terminal (no reconnect is scheduled — re-scan is required). Evict the dead engine
-        // and SIGKILL its process: leaving it in the map would hold a concurrency slot indefinitely and
-        // make the next start() reject the session as "already started" instead of re-initializing it.
-        host.evictAndForceDestroy(id, engine);
+          // onError is terminal (no reconnect is scheduled — re-scan is required). Evict the dead engine
+          // and SIGKILL its process: leaving it in the map would hold a concurrency slot indefinitely and
+          // make the next start() reject the session as "already started" instead of re-initializing it.
+          host.evictAndForceDestroy(id, engine);
+        };
+
+        // During a service-level reconnect's init the lifecycle parks this instead: once init settles it
+        // either applies it or, for a retryable failure, evicts the engine and re-arms the backoff.
+        if (!host.parkReconnectInitFailure(id, fail, reason)) fail();
       },
       onCredentialTeardownStarted: (operation: Promise<void>): void => {
         // The adapter fired the moment it began the call that ends in an fs.rm of this session's
-        // on-disk auth dir. Track it under the captured session NAME (the auth-dir key) — NOT the
-        // UUID, and NOT guarded on this engine still being live: a logout that captured this engine
-        // must register its destructive promise even as a concurrent stop()/delete() evicts it,
-        // because the rm targets the session name's dir and would otherwise race a (re)created
-        // session under that same name. `session.name` is the immutable snapshot captured at
-        // initializeEngine entry, so a row delete/recreate under the same name cannot poison the key.
+        // on-disk auth dir. Track it under the captured session NAME (the fence key — see
+        // awaitPendingTeardown), and NOT guarded on this engine still being live: a logout that
+        // captured this engine must register its destructive promise even as a concurrent
+        // stop()/delete() evicts it, or the rm would race a start this fence should have held back.
+        // `session.name` is the immutable snapshot captured at initializeEngine entry, so a row
+        // delete/recreate under the same name cannot poison the key.
         host.trackPendingCredentialTeardown(sessionName, operation);
       },
       claimStuckAuthRecovery: (): boolean => host.claimStuckAuthRecovery(id, engine),

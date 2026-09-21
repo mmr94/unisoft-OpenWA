@@ -23,11 +23,15 @@ describe('engine status writes are fenced by ownership', () => {
     const host = {
       isLiveEngine: () => true,
       ownsSession: () => owns,
+      // Upstream's own DISCONNECTED gate, held off deliberately: these cases exercise the wider
+      // stop-mark gate, which must suppress the flash on its own.
+      isOperatorTeardown: () => false,
       isStopping: () => stopping,
       updateStatus,
       handleEngineReady: jest.fn(),
       handleEngineDisconnected: jest.fn().mockResolvedValue(undefined),
       cancelReconnect: jest.fn(),
+      parkReconnectInitFailure: () => false,
       evictAndForceDestroy: jest.fn(),
       trackPendingCredentialTeardown: jest.fn(),
       reportRestrictionLifted: jest.fn(),

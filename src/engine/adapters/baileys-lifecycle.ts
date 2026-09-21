@@ -2,19 +2,27 @@ import * as path from 'path';
 import * as fs from 'fs';
 import type { ClientRequest, IncomingMessage } from 'http';
 import type { Agent } from 'https';
+import type { Socket } from 'net';
 import * as qrcode from 'qrcode';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
+import { type Dispatcher } from 'undici';
 import type * as BaileysLib from '@whiskeysockets/baileys';
 import type { WASocket } from '@whiskeysockets/baileys';
 import type { ILogger } from '@whiskeysockets/baileys/lib/Utils/logger.js';
 import { EngineEventCallbacks, EngineStatus } from '../interfaces/whatsapp-engine.interface';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { createProxyDispatcher, hasUnauthenticatableSocks4Credentials } from '../../common/security/proxy-dispatcher';
 import { type createLogger } from '../../common/services/logger.service';
 import { BaileysAdapterConfig } from '../types/baileys.types';
 import { createBaileysLogger } from './baileys-logger';
 import { BaileysVersionResolver } from './baileys-version-resolver';
 import { unappliedPatches, unappliedPatchesMessage } from './engine-patch-status';
+import {
+  ACCOUNT_REJECTED_REASON,
+  CONNECTION_REPLACED_REASON,
+  LOGOUT_CLEANUP_FAILED_REASON,
+} from '../terminal-engine-failure';
 import type { BaileysEvents } from './baileys-events';
 import type { BaileysHistory } from './baileys-history';
 import type { BaileysSessionStore } from './baileys-session-store';
@@ -44,17 +52,57 @@ const BAILEYS_LOGOUT_ACK_TIMEOUT_MS = 8_000;
  */
 const BAILEYS_WS_CONNECTING_DEADLINE_MS = 60_000;
 
+/** Bound on an HTTP(S) proxy's CONNECT reply, matching Baileys' default connectTimeoutMs. */
+const PROXY_CONNECT_TIMEOUT_MS = 20_000;
+
 /**
- * Build the Node-layer agent for a session egress proxy (#859). Both the WhatsApp WebSocket
- * (`agent`) and media up/downloads (`fetchAgent`) ride it; credentials stay in the URL and are
+ * HttpsProxyAgent whose proxy socket cannot outlive the request that asked for it. The library awaits
+ * the CONNECT reply with no abort hook or timeout, so a proxy that accepts TCP and never answers kept
+ * its socket open after ws abandoned the handshake: one more open connection per reconnect attempt.
+ * The socket is destroyed when the request is aborted (what ws does) or when the reply is overdue (a
+ * request destroyed before it has a socket emits nothing). The signal has to be in connectOpts while
+ * super.connect() runs synchronously, which is where the socket is opened; it is restored right after
+ * so concurrent requests on the agent keep their own.
+ */
+class AbortableHttpsProxyAgent extends HttpsProxyAgent<string> {
+  constructor(
+    proxyUrl: string,
+    private readonly connectTimeoutMs: number,
+  ) {
+    super(proxyUrl);
+  }
+
+  override async connect(req: ClientRequest, opts: Parameters<HttpsProxyAgent<string>['connect']>[1]): Promise<Socket> {
+    const controller = new AbortController();
+    const abort = (): void => controller.abort();
+    req.once('abort', abort);
+    const timer = setTimeout(abort, this.connectTimeoutMs);
+    timer.unref();
+    const connectOpts = this.connectOpts;
+    this.connectOpts = { ...connectOpts, signal: controller.signal };
+    const pending = super.connect(req, opts);
+    this.connectOpts = connectOpts;
+    try {
+      return await pending;
+    } finally {
+      clearTimeout(timer);
+      req.off('abort', abort);
+    }
+  }
+}
+
+/**
+ * Build the Node-layer agent for a session egress proxy (#859). The WhatsApp WebSocket (`agent`) and
+ * media uploads (`fetchAgent`) ride it; downloads and the version lookup go through global fetch,
+ * which needs {@link createProxyDispatcher} instead. Credentials stay in the URL and are
  * authenticated on the socket itself, so none of the Chromium CDP auth timing the wwjs engine is
  * exposed to applies here. The scheme set matches the create-session DTO validator; anything else
  * (a pre-validation DB row) throws, failing the session closed rather than silently going direct.
  */
-export function createProxyAgent(proxyUrl: string): Agent {
+export function createProxyAgent(proxyUrl: string, connectTimeoutMs = PROXY_CONNECT_TIMEOUT_MS): Agent {
   const { protocol } = new URL(proxyUrl);
   if (protocol === 'http:' || protocol === 'https:') {
-    return new HttpsProxyAgent(proxyUrl);
+    return new AbortableHttpsProxyAgent(proxyUrl, connectTimeoutMs);
   }
   if (protocol === 'socks4:' || protocol === 'socks5:') {
     return new SocksProxyAgent(proxyUrl);
@@ -68,7 +116,7 @@ export function createProxyAgent(proxyUrl: string): Agent {
  * behind them (sock, status, reconnect counters, the lazily-loaded library). The adapter keeps the
  * public IWhatsAppEngine members as thin forwarders and injects this narrow host surface via
  * closures, so the delegate never touches adapter state directly; the two state fields the rest of
- * the adapter reads live (`sock`, `connectedAt`) are public here and aliased by adapter accessors.
+ * the adapter reads live (`sock`) are public here and aliased by adapter accessors.
  */
 export interface BaileysLifecycleHost {
   readonly logger: ReturnType<typeof createLogger>;
@@ -93,6 +141,7 @@ export interface BaileysLifecycleHost {
   logContactEvent: BaileysEvents['logContactEvent'];
   handleGroupParticipantsUpdate: BaileysEvents['handleGroupParticipantsUpdate'];
   handleGroupsUpdate: BaileysEvents['handleGroupsUpdate'];
+  handleGroupsUpsert: BaileysEvents['handleGroupsUpsert'];
   handleGroupJoinRequest: BaileysEvents['handleGroupJoinRequest'];
   handleCallEvents: BaileysEvents['handleCallEvents'];
   handlePresenceUpdate: BaileysEvents['handlePresenceUpdate'];
@@ -125,10 +174,6 @@ export class BaileysLifecycle {
   /** Live Baileys socket, null when disconnected. Public so the adapter's `sock` accessor can alias
    *  it (an unmodified spec pokes `adapter.sock` through a cast; delegate hosts read it live). */
   sock: WASocket | null = null;
-  /** Unix-seconds timestamp of the last 'open' connection.update, used to distinguish a genuinely
-   *  live message misfiled as 'append' (see BaileysEvents.handleMessagesUpsert) from real history backfill.
-   *  Public so the adapter can alias it for the events delegate's live read. */
-  connectedAt = 0;
   private status: EngineStatus = EngineStatus.DISCONNECTED;
   private qrCode: string | null = null;
   private phoneNumber: string | null = null;
@@ -144,6 +189,8 @@ export class BaileysLifecycle {
   private lastConnectionCloseAt = 0;
   /** Lazily loaded @whiskeysockets/baileys module (ESM-only; loaded on first connect, not at boot). */
   private lib?: typeof BaileysLib;
+  /** The session proxy's fetch dispatcher, built once: the proxy URL is fixed for the adapter's life. */
+  private dispatcher?: Dispatcher;
 
   constructor(private readonly host: BaileysLifecycleHost) {
     this.versionResolver = new BaileysVersionResolver({
@@ -156,6 +203,15 @@ export class BaileysLifecycle {
   /** Lazily loaded @whiskeysockets/baileys module (ESM-only; loaded on first connect, not at boot). */
   async loadLib(): Promise<typeof BaileysLib> {
     return (this.lib ??= await import('@whiskeysockets/baileys'));
+  }
+
+  /** Dispatcher for Baileys' global-fetch calls: undefined without a proxy (direct). */
+  fetchDispatcher(): Dispatcher | undefined {
+    const { proxyUrl } = this.host.config;
+    if (!proxyUrl) {
+      return undefined;
+    }
+    return (this.dispatcher ??= createProxyDispatcher(proxyUrl));
   }
 
   async initialize(): Promise<void> {
@@ -209,10 +265,17 @@ export class BaileysLifecycle {
       const { protocol, host } = new URL(this.host.config.proxyUrl);
       // Credential-stripped, matching the wwjs adapter's log line (#628).
       this.host.logger.log(`Using proxy: ${protocol}//${host}`, { sessionId: this.host.config.sessionId });
+      if (hasUnauthenticatableSocks4Credentials(this.host.config.proxyUrl)) {
+        this.host.logger.warn(
+          `Proxy for session ${this.host.config.sessionId} has credentials on a SOCKS4 proxy, which has no ` +
+            `authentication step: the user name is sent as the connect request's user id and the password is ` +
+            `dropped. Use a socks5, http or https proxy, or an IP-authorized one.`,
+        );
+      }
     }
     const b = await this.loadLib();
     const { state, saveCreds } = await b.useMultiFileAuthState(this.host.authPath);
-    const version = await this.versionResolver.resolve(b, { dispatcher: proxyAgent });
+    const version = await this.versionResolver.resolve(b, { dispatcher: this.fetchDispatcher() });
     // BaileysLogger matches ILogger exactly; cast needed because the module resolves the type
     // through a deep import path that TypeScript does not auto-unify here. Shared by the key
     // store wrapper below and the socket itself, rather than constructing two instances.
@@ -236,7 +299,7 @@ export class BaileysLifecycle {
     }
 
     // An internal reconnect (transient drop) overwrites this.sock WITHOUT going through
-    // disconnect/logout/destroy, so the previous socket's WebSocket and the 15 ev listeners we
+    // disconnect/logout/destroy, so the previous socket's WebSocket and the 16 ev listeners we
     // register below would leak on every reconnect. Tear the prior socket down first. Detach OUR
     // connection.update listener BEFORE end(): Baileys' own end() synchronously emits a synthetic
     // connection.update {connection:'close'}, which — if still wired — would re-enter
@@ -256,6 +319,7 @@ export class BaileysLifecycle {
         previous.ev.removeAllListeners('lid-mapping.update');
         previous.ev.removeAllListeners('group-participants.update');
         previous.ev.removeAllListeners('groups.update');
+        previous.ev.removeAllListeners('groups.upsert');
         previous.ev.removeAllListeners('group.join-request');
         previous.ev.removeAllListeners('call');
         previous.ev.removeAllListeners('presence.update');
@@ -265,14 +329,21 @@ export class BaileysLifecycle {
       }
     }
 
+    const fetchDispatcher = this.fetchDispatcher();
     const sock = b.default({
       auth: state,
       version,
       browser: BAILEYS_BROWSER,
       printQRInTerminal: false,
-      // Session egress proxy (#859): the WS and media transfers share one agent; undefined = direct.
+      // Session egress proxy (#859): the WS and media uploads share one agent; undefined = direct.
+      // Media downloads use fetchDispatcher() instead, since Baileys fetches them with global fetch.
       agent: proxyAgent,
       fetchAgent: proxyAgent,
+      // The same dispatcher for the fetches Baileys runs off this config itself: the history-sync
+      // payload, the app-state external blobs, and a URL handed to a send (a product card image).
+      // Without it they leave direct from the host IP even on a proxied session. `{}` is Baileys' own
+      // default for the key, and is what an unproxied session gets.
+      options: (fetchDispatcher ? { dispatcher: fetchDispatcher } : {}) as RequestInit,
       // Enable the initial sync. Baileys defaults `shouldSyncHistoryMessage` to `() => !!syncFullHistory`,
       // so leaving both unset disables ALL history + app-state sync - no contacts, chats, recent history,
       // or lid->phone mappings ever arrive (the address-book app-state sync only runs once history sync is
@@ -359,9 +430,20 @@ export class BaileysLifecycle {
     });
     sock.ev.on('group-participants.update', event => this.host.handleGroupParticipantsUpdate(event));
     sock.ev.on('groups.update', updates => this.host.handleGroupsUpdate(updates));
+    sock.ev.on('groups.upsert', groups => this.host.handleGroupsUpsert(groups));
     sock.ev.on('group.join-request', event => this.host.handleGroupJoinRequest(event));
     sock.ev.on('messaging-history.set', history => {
-      this.host.upsertContacts(history.contacts);
+      // History sync copies conversation.displayName into `name`, which is a chat title, not the
+      // address-book saved name (that arrives via contacts.upsert from app-state contactAction).
+      // Fold the title into notify so chat-name fallback still works, and leave `name` unset so
+      // GET /contacts stays the agenda rather than every 1:1 the account has ever opened.
+      this.host.upsertContacts(
+        (history.contacts ?? []).map(c => ({
+          ...c,
+          notify: c.notify ?? c.name,
+          name: undefined,
+        })),
+      );
       this.host.upsertChats(history.chats);
       this.host.addLidMappings(history.lidPnMappings ?? []);
       void this.host.captureHistoryMessages(history.messages ?? []);
@@ -432,10 +514,6 @@ export class BaileysLifecycle {
       this.pushName = this.sock?.user?.name ?? null;
       // I4: reset the reconnect counter on a successful connection.
       this.reconnectAttempts = 0;
-      // Small backward buffer for clock skew between this host and WhatsApp's server (messageTimestamp
-      // is WA's clock, Date.now() is ours) — without it, a message sent right at reconnect time could
-      // land a couple seconds "before" connectedAt and be misjudged as history.
-      this.connectedAt = Math.floor(Date.now() / 1000) - 10;
       this.setStatus(EngineStatus.READY);
       this.host.getOnReady()?.(this.phoneNumber ?? '', this.pushName ?? '');
       // WhatsApp only PUSHES a timelock when it changes, so a gateway that starts (or reconnects)
@@ -471,7 +549,7 @@ export class BaileysLifecycle {
         this.setStatus(EngineStatus.FAILED);
         this.host.liveCalls.clear(); // terminal close: dead call handles, like the loggedOut branch above
         this.host.getOnError()?.(
-          'Connection replaced by another instance (440) — stop the other instance, then start this session again',
+          `${CONNECTION_REPLACED_REASON} — stop the other instance, then start this session again`,
         );
         return;
       }
@@ -485,7 +563,7 @@ export class BaileysLifecycle {
         this.setStatus(EngineStatus.FAILED);
         this.host.liveCalls.clear(); // terminal close: dead call handles, like the loggedOut branch above
         this.host.getOnError()?.(
-          'Account rejected by WhatsApp (403) — the number is likely banned or blocked; reconnecting will not help',
+          `${ACCOUNT_REJECTED_REASON} — the number is likely banned or blocked; reconnecting will not help`,
         );
         return;
       }
@@ -782,9 +860,7 @@ export class BaileysLifecycle {
         // clean disconnect (the credentials did not actually get wiped).
         this.setStatus(EngineStatus.FAILED);
         this.host.getOnError()?.(
-          `Logged out by WhatsApp, but the local credential cleanup failed: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
+          `${LOGOUT_CLEANUP_FAILED_REASON}: ${err instanceof Error ? err.message : String(err)}`,
         );
         return;
       }
