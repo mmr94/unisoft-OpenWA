@@ -288,6 +288,18 @@ describe('PluginLoaderService capability facade — ctx.engine', () => {
     expect(engine.getChatHistory).toHaveBeenNthCalledWith(2, 'c@c.us', 1, false);
   });
 
+  // A sandboxed caller's args cross structured clone unvalidated; NaN would reach the engine as "no limit".
+  it.each([['x'], [NaN], [{}], [Infinity]])(
+    'engine.getChatHistory defaults a non-finite limit (%p) to 50',
+    async limit => {
+      const engine = { getChatHistory: jest.fn().mockResolvedValue([]) };
+      build(engine);
+      const ctx = contextFor(makePlugin(['*'], ['engine:read']));
+      await ctx.engine.getChatHistory('sess-1', 'c@c.us', limit as number);
+      expect(engine.getChatHistory).toHaveBeenCalledWith('c@c.us', 50, false);
+    },
+  );
+
   it('denies engine.getChatHistory without the engine:read permission', async () => {
     const { sessionService } = build({ getChatHistory: jest.fn() });
     const ctx = contextFor(makePlugin(['*'], ['messages:send']));
@@ -337,11 +349,11 @@ describe('PluginLoaderService capability facade — ctx.net', () => {
 
 describe('PluginLoaderService capability facade — ctx.conversations', () => {
   let loader: PluginLoaderService;
-  let mappingService: { getByProvider: jest.Mock };
+  let mappingService: { getByProvider: jest.Mock; get: jest.Mock; setHandover: jest.Mock };
   let messageService: { sendText: jest.Mock; reply: jest.Mock };
 
   beforeEach(() => {
-    mappingService = { getByProvider: jest.fn() };
+    mappingService = { getByProvider: jest.fn(), get: jest.fn(), setHandover: jest.fn() };
     messageService = {
       sendText: jest.fn().mockResolvedValue({ messageId: 'wamid', timestamp: 1 }),
       reply: jest.fn().mockResolvedValue({ messageId: 'wamid', timestamp: 1 }),
@@ -407,6 +419,22 @@ describe('PluginLoaderService capability facade — ctx.conversations', () => {
     );
     expect(messageService.sendText).not.toHaveBeenCalled();
     expect(messageService.reply).not.toHaveBeenCalled();
+  });
+
+  it('rejects a handover state outside bot/human/closed before any mapping lookup', async () => {
+    mappingService.get.mockResolvedValue(mapping('sess-1'));
+    mappingService.setHandover.mockResolvedValue(undefined);
+    const ctx = contextFor(makePlugin(['*'], ['conversation:send']));
+    const key = { sessionId: 'sess-1', chatId: '628@c.us', instanceId: 'inst-1' };
+
+    await expect(ctx.handover.set(key, 'Human' as never)).rejects.toThrow(
+      "Plugin test-ext: handover state must be 'bot', 'human' or 'closed'",
+    );
+    expect(mappingService.get).not.toHaveBeenCalled();
+    expect(mappingService.setHandover).not.toHaveBeenCalled();
+
+    await ctx.handover.set(key, 'human');
+    expect(mappingService.setHandover).toHaveBeenCalledWith('m-1', 'human');
   });
 
   it('sends with an explicit chatId without consulting the mapping service', async () => {

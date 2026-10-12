@@ -1,10 +1,78 @@
 import { BadRequestException } from '@nestjs/common';
-import { MessageTypes, type Client } from 'whatsapp-web.js';
+import * as wwebjs from 'whatsapp-web.js';
+import { MessageTypes, type Chat, type Client } from 'whatsapp-web.js';
 import { ChatSummary, ChatState } from '../interfaces/whatsapp-engine.interface';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { chatKind, isChannelJid } from '../identity/wa-id';
 import { WwebjsMessaging } from './wwebjs-messaging';
 import { type WwebjsEngineHost } from './wwebjs-host';
+import { isProtocolTimeout } from './wwebjs-lifecycle';
+import { mapWwebjsMessageType } from './message-mapper';
+
+/**
+ * Build the chat list IN-PAGE with the same `window.WWebJS.getChatModel` whatsapp-web.js's own
+ * `client.getChats()` maps, yielding to the page event loop every 256 chats so the liveness probe's
+ * queued `getState()` evaluate can interleave. The library starts every getChatModel in one `map`,
+ * and a personal chat reaches no await at all (serialize() plus its last message), so on a large chat
+ * list that map is one uninterrupted synchronous stretch that starves the probe and lets the watchdog
+ * tear a healthy session down mid-read: the #1501 shape readLeanContacts fixed for contacts.
+ *
+ * The models and their order are unchanged, the group metadata updates still overlap, and one chat
+ * whose model rejects still rejects the whole read, as upstream does.
+ */
+export async function readChatModels(): Promise<unknown[]> {
+  const w = window as unknown as {
+    require: (m: string) => { Chat: { getModelsArray: () => unknown[] } };
+    WWebJS: { getChatModel: (chat: unknown) => Promise<unknown> };
+  };
+  // A copy: getModelsArray() is the collection's live array, which re-sorts on a new message and
+  // grows on a new chat, so indexing it across the yields below would read one chat twice and skip
+  // another. Upstream's single synchronous map never let it change underneath.
+  const chats = w.require('WAWebCollections').Chat.getModelsArray().slice();
+  const pending: Promise<unknown>[] = [];
+  for (let i = 0; i < chats.length; i++) {
+    const model = w.WWebJS.getChatModel(chats[i]);
+    // Handled here so a rejection that lands during a yield is not reported as unhandled; the
+    // Promise.all below still rejects with it.
+    model.catch(() => undefined);
+    pending.push(model);
+    if ((i & 0xff) === 0xff) await new Promise(resolve => setTimeout(resolve));
+  }
+  return Promise.all(pending);
+}
+
+/** The chat structures are classes at runtime; index.d.ts declares them as interfaces only. */
+type ChatConstructor = new (client: Client, data: unknown) => Chat;
+const { GroupChat, PrivateChat } = wwebjs as unknown as { GroupChat: ChatConstructor; PrivateChat: ChatConstructor };
+
+/**
+ * The whole chat list through {@link readChatModels}, rehydrated the way whatsapp-web.js's
+ * ChatFactory does for these entries, so every mapped field reads exactly as `client.getChats()`
+ * gave it. Shared by the chat and group lists. A dead page answers 503 with the death signal, a read
+ * that outran the protocol budget answers 503 without one, and anything else is rethrown.
+ */
+export async function listChats(host: WwebjsEngineHost, context: string): Promise<Chat[]> {
+  const client = host.getClient();
+  const page = (client as unknown as { pupPage: { evaluate: <T>(fn: () => Promise<T>) => Promise<T> } }).pupPage;
+  let models: unknown[];
+  try {
+    models = await page.evaluate(readChatModels);
+  } catch (error) {
+    // Same split every sibling read makes (see getChatsByLabel): a dead page is a 503 and an
+    // early death signal, not an opaque 500 under a status that still says READY (#1081).
+    if (host.isPageTransportError(error)) {
+      host.reportIfPageTransportError(error, context);
+      throw new EngineTransportError('Transport died while listing chats');
+    }
+    if (isProtocolTimeout(error)) {
+      throw new EngineTransportError('WhatsApp Web did not answer the chat list read in time');
+    }
+    throw error;
+  }
+  return models.map(data =>
+    (data as { isGroup?: boolean }).isGroup ? new GroupChat(client, data) : new PrivateChat(client, data),
+  );
+}
 
 /**
  * Chat-list operations extracted from WhatsAppWebJsAdapter. The adapter keeps the public methods as
@@ -25,18 +93,7 @@ export class WwebjsChats {
 
   async getChats(): Promise<ChatSummary[]> {
     this.host.ensureReady();
-    let chats: Awaited<ReturnType<Client['getChats']>>;
-    try {
-      chats = await this.client().getChats();
-    } catch (error) {
-      // Same split every sibling read makes (see getChatsByLabel): a dead page is a 503 and an
-      // early death signal, not an opaque 500 under a status that still says READY (#1081).
-      if (this.host.isPageTransportError(error)) {
-        this.host.reportIfPageTransportError(error, 'getChats');
-        throw new EngineTransportError('Transport died while listing chats');
-      }
-      throw error;
-    }
+    const chats = await listChats(this.host, 'getChats');
     const summaries: ChatSummary[] = [];
     let skipped = 0;
 
@@ -60,6 +117,7 @@ export class WwebjsChats {
         timestamp: chat.timestamp || 0,
         // A location message's body is the base64 map thumbnail; don't surface it as the chat preview.
         lastMessage: chat.lastMessage?.type === MessageTypes.LOCATION ? '📍' : chat.lastMessage?.body || undefined,
+        lastMessageType: chat.lastMessage ? mapWwebjsMessageType(chat.lastMessage.type) : undefined,
         archived: Boolean(chat.archived),
         pinned: Boolean(chat.pinned),
         // Chat.isMuted is the current verdict; muteExpiration is wwjs epoch SECONDS with -1 = forever.
@@ -93,6 +151,9 @@ export class WwebjsChats {
         this.host.reportIfPageTransportError(error, 'sendSeen');
         throw new EngineTransportError('Transport died while marking a chat as read');
       }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while marking a chat as read');
+      }
       this.host.logger.error(`Error marking chat ${chatId} as read`, String(error));
       return false;
     }
@@ -113,6 +174,9 @@ export class WwebjsChats {
       if (this.host.isPageTransportError(error)) {
         this.host.reportIfPageTransportError(error, 'clearChatMessages');
         throw new EngineTransportError('Transport died while clearing a chat');
+      }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while clearing a chat');
       }
       this.host.logger.error(`Error clearing messages in chat ${chatId}`, String(error));
       return false;
@@ -146,6 +210,9 @@ export class WwebjsChats {
         this.host.reportIfPageTransportError(error, 'archiveChat');
         throw new EngineTransportError('Transport died while archiving a chat');
       }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while archiving a chat');
+      }
       this.host.logger.error(`Error ${archive ? 'archiving' : 'unarchiving'} chat ${chatId}`, String(error));
       return false;
     }
@@ -176,21 +243,45 @@ export class WwebjsChats {
         this.host.reportIfPageTransportError(error, 'requireResolvableChat');
         throw new EngineTransportError('Transport died while resolving a chat');
       }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while resolving a chat');
+      }
       chat = undefined; // an unknown chat rejects too — that is the 400 below
     }
     if (!chat) throw new BadRequestException(`Chat ${chatId} does not exist on this session`);
+  }
+
+  /**
+   * The write leg of mute, pin and the account's own presence. A dead page or an expired protocol
+   * timeout is a 503 (mute, unmute, pin, unpin and a presence change all converge when repeated) and
+   * a dead page is reported as the early death signal. Any other rejection is rethrown untouched,
+   * for the reason above.
+   */
+  private async chatWrite<T>(context: string, op: () => Promise<T>): Promise<T> {
+    try {
+      return await op();
+    } catch (error) {
+      if (this.host.isPageTransportError(error)) {
+        this.host.reportIfPageTransportError(error, context);
+        throw new EngineTransportError(`Transport died during ${context}`);
+      }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError(`WhatsApp Web did not answer in time during ${context}`);
+      }
+      throw error;
+    }
   }
 
   async muteChat(chatId: string, muteUntil: number | null): Promise<void> {
     this.host.ensureReady();
     await this.requireResolvableChat(chatId);
     if (muteUntil === null) {
-      await this.client().unmuteChat(chatId);
+      await this.chatWrite('muteChat', () => this.client().unmuteChat(chatId));
       return;
     }
     // muteUntil is epoch milliseconds, which is what Date wants; Client.muteChat floors it to the
     // seconds its page-side call expects. The Baileys side takes the same milliseconds unmodified.
-    await this.client().muteChat(chatId, new Date(muteUntil));
+    await this.chatWrite('muteChat', () => this.client().muteChat(chatId, new Date(muteUntil)));
   }
 
   async pinChat(chatId: string, pin: boolean): Promise<boolean> {
@@ -204,13 +295,13 @@ export class WwebjsChats {
       // both on its early-out for an already-unpinned chat and after actually unpinning
       // (Client.js:2073-2084). Forwarding it would report every success as a refusal, the same trap
       // archiveChat documents. Discard it: an unpin that did not throw succeeded.
-      await this.client().unpinChat(chatId);
+      await this.chatWrite('pinChat', () => this.client().unpinChat(chatId));
       return true;
     }
     // In this direction the return value IS information. WhatsApp caps pinned chats at three
     // (MAX_PIN_COUNT, Client.js:2054-2063) and the page returns false without pinning once that is
     // met, so a false here is a real refusal the caller needs to see.
-    return await this.client().pinChat(chatId);
+    return await this.chatWrite('pinChat', () => this.client().pinChat(chatId));
   }
 
   async markUnread(chatId: string): Promise<boolean> {
@@ -232,6 +323,9 @@ export class WwebjsChats {
       if (this.host.isPageTransportError(error)) {
         this.host.reportIfPageTransportError(error, 'markUnread');
         throw new EngineTransportError('Transport died while marking a chat as unread');
+      }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while marking a chat as unread');
       }
       this.host.logger.error(`Error marking chat ${chatId} as unread`, String(error));
       return false;
@@ -256,6 +350,9 @@ export class WwebjsChats {
         this.host.reportIfPageTransportError(error, 'deleteChat');
         throw new EngineTransportError('Transport died while deleting a chat');
       }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while deleting a chat');
+      }
       this.host.logger.error(`Error deleting chat ${chatId}`, String(error));
       return false;
     }
@@ -269,11 +366,9 @@ export class WwebjsChats {
    */
   async setOnlinePresence(available: boolean): Promise<void> {
     this.host.ensureReady();
-    if (available) {
-      await this.client().sendPresenceAvailable();
-    } else {
-      await this.client().sendPresenceUnavailable();
-    }
+    await this.chatWrite('setOnlinePresence', () =>
+      available ? this.client().sendPresenceAvailable() : this.client().sendPresenceUnavailable(),
+    );
   }
 
   async sendChatState(chatId: string, state: ChatState): Promise<void> {

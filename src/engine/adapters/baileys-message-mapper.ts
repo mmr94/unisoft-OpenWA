@@ -1,5 +1,23 @@
+import type { proto } from '@whiskeysockets/baileys';
 import { DeliveryStatus, IncomingMessage, MessageType } from '../interfaces/whatsapp-engine.interface';
 import { chatKind } from '../identity/wa-id';
+
+/**
+ * Content types that change or annotate another message and carry nothing of their own: a poll vote,
+ * an in-chat pin, a keep-in-chat toggle, an album header (its photos arrive as their own messages), an
+ * encrypted reaction, an event RSVP, an encrypted edit (an event edit) and an encrypted comment. Mapped,
+ * they would surface as a bodyless `unknown` message, so the live and history paths drop them instead.
+ */
+export const BAILEYS_NON_CONTENT_TYPES: ReadonlySet<string> = new Set([
+  'pollUpdateMessage',
+  'pinInChatMessage',
+  'keepInChatMessage',
+  'albumMessage',
+  'encReactionMessage',
+  'encEventResponseMessage',
+  'secretEncryptedMessage',
+  'encCommentMessage',
+]);
 
 /**
  * Map a Baileys message content-type token (from `getContentType`) to the engine-neutral
@@ -23,6 +41,8 @@ export function mapBaileysMessageType(
     case 'imageMessage':
       return 'image';
     case 'videoMessage':
+    case 'ptvMessage':
+      // A round video note is a VideoMessage under its own content key.
       return 'video';
     case 'audioMessage':
       return isPtt ? 'voice' : 'audio';
@@ -163,6 +183,38 @@ export function extractBaileysBody(content: BaileysBodyContent): string {
     content.productMessage?.catalog?.title ??
     ''
   );
+}
+
+/**
+ * Write edited text into the slot a message carries its text in, which is where
+ * {@link extractBaileysBody} reads it back: the text itself, or the caption of a photo, video or
+ * document. Everything else the content holds (media keys, thumbnail, link preview) is kept, as
+ * WhatsApp Web keeps it (an edit changes the message's body or caption in place), so the edited
+ * message is still a valid message of its original type when it is quoted or forwarded. Returns
+ * false, changing nothing, when the content has no such slot.
+ * Pass the NORMALIZED content: it is a reference into the message, so the write lands there.
+ */
+export function setBaileysText(
+  content: Pick<
+    BaileysBodyContent,
+    'conversation' | 'extendedTextMessage' | 'imageMessage' | 'videoMessage' | 'documentMessage'
+  >,
+  text: string,
+): boolean {
+  if (typeof content.conversation === 'string') {
+    content.conversation = text;
+    return true;
+  }
+  if (content.extendedTextMessage) {
+    content.extendedTextMessage.text = text;
+    return true;
+  }
+  const media = content.imageMessage ?? content.videoMessage ?? content.documentMessage;
+  if (media) {
+    media.caption = text;
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -759,6 +811,7 @@ export interface BaileysContextContent {
   extendedTextMessage?: (BaileysContextCarrier & { backgroundArgb?: number | null; font?: number | null }) | null;
   imageMessage?: BaileysContextCarrier | null;
   videoMessage?: BaileysContextCarrier | null;
+  ptvMessage?: BaileysContextCarrier | null;
   audioMessage?: BaileysContextCarrier | null;
   documentMessage?: BaileysContextCarrier | null;
   stickerMessage?: BaileysContextCarrier | null;
@@ -797,6 +850,7 @@ export function extractBaileysContext(content: BaileysContextContent): BaileysMe
     content.extendedTextMessage ??
     content.imageMessage ??
     content.videoMessage ??
+    content.ptvMessage ??
     content.audioMessage ??
     content.documentMessage ??
     content.stickerMessage ??
@@ -809,9 +863,16 @@ export function extractBaileysContext(content: BaileysContextContent): BaileysMe
   // surface it so the store/viewer can render the story the way it was posted.
   const extText = content.extendedTextMessage;
   const contextInfo = subForContext?.contextInfo;
+  // WhatsApp stamps the timer on every message in a disappearing chat, a product, poll, contact card, live
+  // location, order or event included, so any content node answers when the carriers above have none.
+  const expiration =
+    contextInfo?.expiration ??
+    Object.values(content)
+      .map(node => (node as BaileysContextCarrier | null | undefined)?.contextInfo?.expiration)
+      .find((e): e is number => typeof e === 'number' && e > 0);
 
   const context: BaileysMessageContext = {
-    ephemeralDuration: contextInfo?.expiration ?? undefined,
+    ephemeralDuration: expiration ?? undefined,
     mentionedJids: contextInfo?.mentionedJid ?? undefined,
     backgroundArgb: typeof extText?.backgroundArgb === 'number' ? extText.backgroundArgb : undefined,
     font: typeof extText?.font === 'number' ? extText.font : undefined,
@@ -852,6 +913,17 @@ export function mapBaileysStatus(status: number | null | undefined): DeliverySta
   }
 }
 
+/** Extract native poll versions from content already normalized by Baileys. */
+export function extractBaileysPoll(content: proto.IMessage): IncomingMessage['poll'] {
+  const poll = content.pollCreationMessage ?? content.pollCreationMessageV2 ?? content.pollCreationMessageV3;
+  if (!poll) return undefined;
+  const options = (poll.options ?? [])
+    .map(option => option.optionName)
+    .filter((option): option is string => typeof option === 'string');
+  if (!options.length) return undefined;
+  return { name: poll.name ?? '', options, allowMultipleAnswers: poll.selectableOptionsCount !== 1 };
+}
+
 /**
  * The subset of a Baileys `WAMessage` the adapter reads (after proto extraction) to build the
  * base of an {@link IncomingMessage}. Declared explicitly so the neutral-shape logic is
@@ -859,10 +931,10 @@ export function mapBaileysStatus(status: number | null | undefined): DeliverySta
  */
 export interface BaileysIncomingFields {
   id: string;
-  /** The chat JID (`key.remoteJid`): a contact, a `@g.us` group, or `status@broadcast`. */
+  /** The chat JID (`key.remoteJid`): a contact, a `@g.us` group, `status@broadcast`, or a broadcast list. */
   remoteJid: string;
   fromMe: boolean;
-  /** Group sender (`key.participant`); `remoteJid` is the group JID for group messages. */
+  /** Sender in a group, status or broadcast list (`key.participant`); `remoteJid` names the chat. */
   participant?: string;
   body: string;
   /** Result of `getContentType(msg.message)`. */
@@ -882,6 +954,7 @@ export interface BaileysIncomingFields {
   /** Pre-extracted commerce ids. Populated by the adapter for `orderMessage` / `productMessage`. */
   order?: IncomingMessage['order'];
   product?: IncomingMessage['product'];
+  poll?: IncomingMessage['poll'];
   /** Pre-extracted button/list reply. Populated by the adapter when the user tapped a control. */
   button?: IncomingMessage['button'];
   /** Pre-extracted prompt choices. Populated by the adapter for business button/list prompts. */
@@ -899,10 +972,37 @@ export interface BaileysIncomingFields {
 }
 
 /**
- * Build a neutral {@link IncomingMessage} from extracted Baileys fields. The chat is always
- * `remoteJid` (Baileys reports the conversation directly); `fromMe` only flips from/to. The group
- * sender — and likewise the poster of a status broadcast — lives in `participant` (exposed as
- * `author`), matching the wwjs convention where `from` is the group JID / broadcast channel.
+ * The chat a message belongs to, from its raw key: `remoteJid`, except for a broadcast-list message
+ * the account received, which belongs to the 1:1 chat with its sender (`participant`). Mirrors
+ * Baileys' own `getChatId` (Utils/process-message.js), which files the chat list the same way, but
+ * falls back to the list instead of throwing when the key names no participant.
+ */
+export function baileysChatJid(remoteJid: string, participant: string | null | undefined, fromMe: boolean): string {
+  const isList = remoteJid.endsWith('@broadcast') && remoteJid !== 'status@broadcast';
+  return isList && !fromMe && participant ? participant : remoteJid;
+}
+
+/**
+ * Whether a stored key belongs to the chat `chatId` names: the chat the message is reported under
+ * ({@link baileysChatJid}), or the raw `remoteJid`, which a client may still hold for a list message.
+ * Both sides go through `neutral`, so the dialects of one chat compare equal.
+ */
+export function storedKeyInChat(
+  key: { remoteJid?: string | null; participant?: string | null; fromMe?: boolean | null },
+  chatId: string,
+  neutral: (jid: string) => string,
+): boolean {
+  const raw = key.remoteJid ?? '';
+  const want = neutral(chatId);
+  return neutral(raw) === want || neutral(baileysChatJid(raw, key.participant, key.fromMe === true)) === want;
+}
+
+/**
+ * Build a neutral {@link IncomingMessage} from extracted Baileys fields. The chat is `remoteJid`
+ * (Baileys reports the conversation directly), except that a received broadcast-list message is filed
+ * under its sender's chat (see {@link baileysChatJid}); `fromMe` only flips from/to. The group sender,
+ * the poster of a status broadcast and the sender of a broadcast-list message all live in
+ * `participant` (exposed as `author`).
  */
 export function buildIncomingMessageFromBaileys(
   fields: BaileysIncomingFields,
@@ -914,7 +1014,7 @@ export function buildIncomingMessageFromBaileys(
   const rawChatId = fields.remoteJid;
   const isGroup = rawChatId.endsWith('@g.us');
   const isStatusBroadcast = rawChatId === 'status@broadcast';
-  const chatId = normalizeJid(rawChatId);
+  const chatId = normalizeJid(baileysChatJid(rawChatId, fields.participant, fields.fromMe));
   const self = normalizeJid(fields.selfJid ?? '');
 
   const incoming: IncomingMessage = {
@@ -933,11 +1033,12 @@ export function buildIncomingMessageFromBaileys(
     isStatusBroadcast,
   };
 
-  // The sender behind a group message — or the poster behind a status broadcast — lives in
-  // `participant` (exposed as `author`), matching the wwjs convention where `from` is the group JID
-  // (or the shared status@broadcast channel). Without the status arm, buildIncomingStatus can only
-  // resolve the poster to the pseudo-JID itself and drops every Baileys status.
-  if ((isGroup || isStatusBroadcast) && fields.participant) {
+  // The sender behind a group message, the poster behind a status broadcast and the sender behind a
+  // broadcast-list message all live in `participant` (exposed as `author`). Without the status arm,
+  // buildIncomingStatus can only resolve the poster to the pseudo-JID itself and drops every Baileys
+  // status; the list arm keeps `author` on a list message too, where it repeats the chat's sender
+  // (or names the account, for a list message it sent).
+  if ((isGroup || rawChatId.endsWith('@broadcast')) && fields.participant) {
     incoming.author = normalizeJid(fields.participant);
   }
 
@@ -962,6 +1063,8 @@ export function buildIncomingMessageFromBaileys(
   if (fields.media) {
     incoming.media = fields.media;
   }
+
+  if (fields.poll) incoming.poll = fields.poll;
 
   if (fields.location) {
     incoming.location = fields.location;

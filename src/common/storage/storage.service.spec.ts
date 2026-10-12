@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as tar from 'tar-stream';
 import { createGzip } from 'zlib';
-import { Readable } from 'stream';
+import { PassThrough, Readable } from 'stream';
 import { ConfigService } from '@nestjs/config';
 
 // `archiver` v8 ships as ESM only, which ts-jest cannot parse when StorageService
@@ -12,6 +12,7 @@ import { ConfigService } from '@nestjs/config';
 jest.mock('archiver', () => ({ default: jest.fn() }));
 
 import { StorageService } from './storage.service';
+import * as transfer from './storage-transfer';
 
 /** Build an in-memory gzipped tar archive from the given entries. */
 function makeTarGz(entries: { name: string; data: string }[]): Promise<Buffer> {
@@ -97,11 +98,11 @@ describe('StorageService (local) path traversal protection', () => {
       { name: '../evil.txt', data: 'bad' },
     ]);
 
-    const count = await service.importFromStream(Readable.from(gz));
+    const result = await service.importFromStream(Readable.from(gz));
 
     expect(fs.readFileSync(path.join(localPath, 'safe.txt'), 'utf8')).toBe('good');
     expect(fs.existsSync(path.join(baseDir, 'evil.txt'))).toBe(false);
-    expect(count).toBe(1);
+    expect(result).toEqual({ imported: 1, failed: 1 });
   });
 });
 
@@ -218,7 +219,9 @@ describe('StorageService import resource caps (decompression-bomb defense)', () 
     process.env.STORAGE_IMPORT_MAX_BYTES = '8';
     const gz = await makeTarGz([{ name: 'bomb.bin', data: 'far-more-than-eight-bytes' }]);
 
-    await expect(service.importFromStream(Readable.from(gz))).rejects.toThrow(/byte|cap|exceed|large/i);
+    await expect(service.importFromStream(Readable.from(gz))).rejects.toThrow(
+      /8-byte per-entry cap \(STORAGE_IMPORT_MAX_BYTES\)/,
+    );
     expect(fs.existsSync(path.join(localPath, 'bomb.bin'))).toBe(false);
   });
 
@@ -244,8 +247,8 @@ describe('StorageService import resource caps (decompression-bomb defense)', () 
 
   it('imports normally within the (generous default) caps', async () => {
     const gz = await makeTarGz([{ name: 'ok.txt', data: 'fine' }]);
-    const count = await service.importFromStream(Readable.from(gz));
-    expect(count).toBe(1);
+    const result = await service.importFromStream(Readable.from(gz));
+    expect(result).toEqual({ imported: 1, failed: 0 });
   });
 });
 
@@ -330,8 +333,19 @@ describe('StorageService local traversal (async + bounded)', () => {
  * not a completeness contract" and tells callers needing the whole store to iterate instead.
  */
 describe('StorageService.createExportStream enumerates the whole store', () => {
+  const baseDirs: string[] = [];
+  const makeService = (): ReturnType<typeof makeLocalService> => {
+    const made = makeLocalService();
+    baseDirs.push(made.baseDir);
+    return made;
+  };
+
+  afterEach(() => {
+    for (const dir of baseDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('walks the uncapped iterator rather than the capped listing', async () => {
-    const { service } = makeLocalService();
+    const { service } = makeService();
     const listFiles = jest.spyOn(service, 'listFiles');
     const iterateFiles = jest.spyOn(service, 'iterateFiles').mockImplementation(async function* () {
       yield await Promise.resolve('media/a.bin');
@@ -345,6 +359,23 @@ describe('StorageService.createExportStream enumerates the whole store', () => {
     expect(listFiles).not.toHaveBeenCalled();
   });
 
+  // The export fails on any open error other than a missing object, so a listed key openFile always
+  // refuses (an S3 object at the bare key root, or one with a `..` segment) must not reach it.
+  it('leaves out a listed key that openFile would refuse', async () => {
+    const { service } = makeService();
+    jest.spyOn(service, 'iterateFiles').mockImplementation(async function* () {
+      yield await Promise.resolve('media/a.bin');
+      yield '';
+      yield 'media/../x.bin';
+    });
+    const create = jest.spyOn(transfer, 'createExportStream').mockResolvedValue(new PassThrough());
+
+    await service.createExportStream();
+
+    expect(await create.mock.calls[0][0]()).toEqual(['media/a.bin']);
+    create.mockRestore();
+  });
+
   /**
    * The count is the OTHER half of the same fix and had no test of its own — reverting it to the
    * capped listing left the suite green. It is the pre-check an operator runs before that migration,
@@ -352,7 +383,7 @@ describe('StorageService.createExportStream enumerates the whole store', () => {
    * while agreeing with itself.
    */
   it('counts with the uncapped iterator too, so the pre-check cannot hide the gap', async () => {
-    const { service } = makeLocalService();
+    const { service } = makeService();
     const listFiles = jest.spyOn(service, 'listFiles');
     const iterateFiles = jest.spyOn(service, 'iterateFiles').mockImplementation(async function* () {
       yield await Promise.resolve('media/a.bin');
@@ -378,7 +409,7 @@ describe('StorageService.createExportStream enumerates the whole store', () => {
    * once each stat yields.
    */
   it('does not hold the event loop for the whole walk', async () => {
-    const { service, localPath } = makeLocalService();
+    const { service, localPath } = makeService();
     fs.mkdirSync(localPath, { recursive: true });
     const FILES = 2000;
     for (let i = 0; i < FILES; i++) {

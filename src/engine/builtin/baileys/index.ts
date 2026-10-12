@@ -1,6 +1,6 @@
 /**
  * Baileys Engine Plugin
- * Built-in engine plugin that wraps the @whiskeysockets/baileys library (minimal slice).
+ * Built-in engine plugin that wraps the @whiskeysockets/baileys library.
  */
 
 import { PluginContext, PluginType, IEnginePlugin } from '../../../core/plugins';
@@ -47,10 +47,11 @@ export class BaileysPlugin implements IEnginePlugin {
     const proxyType = config.proxyType as 'http' | 'https' | 'socks4' | 'socks5' | undefined;
 
     // Baileys' own config namespace, read from the opaque per-engine blob the factory supplies via
-    // context.config (the `engine` sub-tree in configuration.ts). Per-call config carries only
-    // engine-neutral fields (sessionId, proxy).
+    // context.config (the `engine` sub-tree in configuration.ts). Per-call config carries
+    // engine-neutral fields (sessionId, proxy) plus authDir, the base the factory hardens and purges,
+    // which wins over context.config.
     const engineConfig = (this.context?.config ?? this.registeredConfig ?? {}) as { baileys?: { authDir?: string } };
-    const authDir = engineConfig.baileys?.authDir ?? './data/baileys';
+    const authDir = (config.authDir as string | undefined) ?? engineConfig.baileys?.authDir ?? './data/baileys';
 
     return new BaileysAdapter({
       sessionId,
@@ -77,6 +78,11 @@ export class BaileysPlugin implements IEnginePlugin {
       'message-deletion',
       'group-management',
       'read-receipts',
+      'channels',
+      'status-updates',
+      'catalog',
+      // No 'labels': Baileys can create, delete and attach labels but has no query for them, so the
+      // label and chat-label reads 501 and a client could not read back what it wrote.
     ];
   }
 

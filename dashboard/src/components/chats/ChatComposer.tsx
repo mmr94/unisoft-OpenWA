@@ -4,7 +4,6 @@ import { useTranslation } from 'react-i18next';
 import { Loader2, Paperclip, Send, Smile, X } from 'lucide-react';
 import { messageApi, type Chat, type MessageType } from '../../services/api';
 import { type ChatMessageView } from '../../utils/chatMessages';
-import { promoteChatWithSnippet } from '../../utils/chatList';
 import { buildMediaSendPayload, buildOptimisticMetadata, quotedIdOf } from '../../utils/composerSend';
 import { messagesQueryKey, useChatMessagesActions, upsertCachedMessage } from '../../hooks/useChatMessages';
 import { useRole } from '../../hooks/useRole';
@@ -23,7 +22,7 @@ const messageTypeFromMime = (mimetype: string): MessageType => {
 // Client pre-check before base64-encoding an upload, same cap as the message tester: base64
 // inflates ~1.33x, so ~18 MiB raw stays under the backend's default 25 MiB body limit and the
 // pick fails here with a toast instead of OOMing the tab on the FileReader.
-const MEDIA_UPLOAD_MAX_BYTES = 18 * 1024 * 1024;
+export const MEDIA_UPLOAD_MAX_BYTES = 18 * 1024 * 1024;
 
 /** A picked-but-unsent file, staged until send, removal, or a move to another chat. */
 export interface StagedAttachment {
@@ -39,7 +38,8 @@ interface ChatComposerProps {
   replyingTo: ChatMessageView | null;
   setReplyingTo: Dispatch<SetStateAction<ChatMessageView | null>>;
   onMessageAppended: (direction: ScrollDirection) => void;
-  setChats: Dispatch<SetStateAction<Chat[]>>;
+  /** Moves the chat to the top of the sidebar, if `sessionId` is still the session on screen. */
+  onSent: (sessionId: string, chatId: string, snippet: string, sentAt: number) => void;
   messageInput: string;
   setMessageInput: Dispatch<SetStateAction<string>>;
   attachment: StagedAttachment | null;
@@ -58,7 +58,7 @@ function ChatComposer({
   replyingTo,
   setReplyingTo,
   onMessageAppended,
-  setChats,
+  onSent,
   messageInput,
   setMessageInput,
   attachment,
@@ -73,6 +73,12 @@ function ChatComposer({
   const queryClient = useQueryClient();
 
   const [sending, setSending] = useState<boolean>(false);
+  // "[Image]" for a non-text message; an unexpected type still reads as itself rather than a raw key.
+  // An `unknown` one quotes as "[Message]" on purpose: here it is a message, not a type category
+  // (the chart and the webhook filter name it through messageTypeLabelKey instead).
+  const typeLabel = (type: string) => `[${t(`chats.messageType.${type}`, { defaultValue: type })}]`;
+  // Audio carries no caption on either engine, so text typed next to it is never sent with it.
+  const attachmentIsAudio = attachment?.mimetype.startsWith('audio/') ?? false;
 
   const [showEmojiPicker, setShowEmojiPicker] = useState<boolean>(false);
   // Monotonic token invalidating an in-flight attachment FileReader: picking a second file (or
@@ -152,6 +158,9 @@ function ChatComposer({
       return;
     }
 
+    // The pick replaces any staged file now, so a send while it is read cannot send the one it replaced.
+    // Not handleRemoveAttachment: bumping the read sequence would discard this read too.
+    setAttachment(null);
     if (file.type.startsWith('image/')) {
       setPreviewUrl(URL.createObjectURL(file));
     } else {
@@ -165,7 +174,14 @@ function ChatComposer({
       if (attachmentReadSeq.current !== myRead) return;
       const dataUrl = event.target?.result as string;
       const base64Data = dataUrl.split(',')[1];
-      setAttachment({ file, base64: base64Data, mimetype: file.type, filename: file.name });
+      // A file the browser has no MIME mapping for has type '', which the gateway refuses for base64;
+      // the generic type sends it as a document, the gateway's own default.
+      setAttachment({
+        file,
+        base64: base64Data,
+        mimetype: file.type || 'application/octet-stream',
+        filename: file.name,
+      });
     };
     reader.readAsDataURL(file);
   };
@@ -194,27 +210,31 @@ function ChatComposer({
     const textToSend = messageInput.trim();
     if (!textToSend && !attachment) return;
 
-    setMessageInput('');
+    // Text that cannot travel with an audio file stays in the input to be sent as its own message.
+    if (!attachmentIsAudio) setMessageInput('');
     setSending(true);
 
     const tempId = `temp_${Date.now()}`;
+    // Mirrors the body the gateway stores: image and video keep only the caption, and a document its caption
+    // or else its filename. Audio stores none; its filename stands in here because the thread hides a body
+    // equal to it.
     const tempMessage: ChatMessageView = {
       id: tempId,
       chatId: activeChat.id,
       from: 'me',
       to: activeChat.id,
-      body: attachment
-        ? attachment.mimetype.startsWith('image/') ||
-          attachment.mimetype.startsWith('video/') ||
-          attachment.mimetype.startsWith('audio/')
+      body: !attachment
+        ? textToSend
+        : attachment.mimetype.startsWith('image/') || attachment.mimetype.startsWith('video/')
           ? textToSend
-          : attachment.filename
-        : textToSend,
+          : attachment.mimetype.startsWith('audio/')
+            ? attachment.filename
+            : textToSend || attachment.filename,
       type: attachment ? messageTypeFromMime(attachment.mimetype) : 'text',
       direction: 'outgoing',
       status: 'pending',
       createdAt: new Date().toISOString(),
-      metadata: buildOptimisticMetadata(attachment, replyingTo),
+      metadata: buildOptimisticMetadata(attachment, replyingTo, typeLabel),
     };
 
     appendMessage(selectedSessionId, activeChat.id, tempMessage);
@@ -222,7 +242,9 @@ function ChatComposer({
 
     const currentAttachment = attachment;
     const currentReplyingTo = replyingTo;
-    handleRemoveAttachment();
+    // Clear only a file that is being sent: a pick still being read stages once it lands, so it is not
+    // silently dropped by text sent in the meantime.
+    if (currentAttachment) handleRemoveAttachment();
     setReplyingTo(null);
 
     try {
@@ -259,19 +281,24 @@ function ChatComposer({
       // echo's row via mergeOrAppend instead of just dropping it — the echo may carry no media
       // payload (a Baileys API send echoes only a marker), so dropping the placeholder would erase
       // the attachment's base64 and leave a bare "📎 Media" bubble until the next refetch.
+      //
+      // An engine that cannot read the sent id back answers '', which as a key would fold every such
+      // send into one bubble. The row keeps a unique local id instead, without the temp_ prefix: the
+      // gateway did store it, so it counts toward the next page's offset like any other DB row.
       const sendKey = messagesQueryKey(selectedSessionId, activeChat.id);
       const reconciled: ChatMessageView = {
         ...tempMessage,
-        id: result.messageId,
-        waMessageId: result.messageId,
+        id: result.messageId || tempId.replace(/^temp_/, 'sent_'),
+        waMessageId: result.messageId || undefined,
         status: 'sent',
       };
       upsertCachedMessage(queryClient, sendKey, reconciled, { dropId: tempId });
 
       // Update sidebar chat list (move active chat to the top with the new snippet)
-      const snippet = currentAttachment ? `[${currentAttachment.mimetype.split('/')[0]}]` : textToSend;
+      // Named by the type the bubble uses, not the MIME major type: a PDF is a document, not "application".
+      const snippet = currentAttachment ? typeLabel(messageTypeFromMime(currentAttachment.mimetype)) : textToSend;
       const sentAt = Math.floor(Date.now() / 1000);
-      setChats(prevChats => promoteChatWithSnippet(prevChats, activeChat.id, snippet, sentAt));
+      onSent(selectedSessionId, activeChat.id, snippet, sentAt);
     } catch (err) {
       showErrorToast(t('chats.errors.send'), err instanceof Error ? err.message : undefined);
       updateMessage(selectedSessionId, activeChat.id, tempId, { status: 'failed' });
@@ -327,7 +354,7 @@ function ChatComposer({
               })}
             </div>
             <div className="replying-to-body">
-              {replyingTo.type !== 'text' ? `[${replyingTo.type}]` : replyingTo.body}
+              {replyingTo.type !== 'text' ? typeLabel(replyingTo.type) : replyingTo.body}
             </div>
           </div>
           <button className="btn-close-reply" onClick={() => setReplyingTo(null)}>
@@ -365,7 +392,7 @@ function ChatComposer({
             type="text"
             placeholder={
               canWrite
-                ? attachment
+                ? attachment && !attachmentIsAudio
                   ? t('chats.captionPlaceholder')
                   : t('chats.messagePlaceholder')
                 : t('chats.noPermission')

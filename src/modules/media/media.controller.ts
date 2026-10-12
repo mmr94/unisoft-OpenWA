@@ -5,6 +5,7 @@ import { MediaConversionService } from './media-conversion.service';
 import { ConvertMediaDto } from './dto/convert-media.dto';
 import { RequireRole } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
+import { MEDIA_URL_PROXY_503 } from '../../common/openapi/engine-status-responses';
 
 /**
  * Server-side transcoding, scoped to a session.
@@ -50,12 +51,18 @@ export class MediaController {
       'mic bubble for Ogg/Opus; other formats arrive as an audio file that will not play.',
     type: ConvertedMediaResponseDto,
   })
-  @ApiResponse({ status: 400, description: 'Neither url nor base64 given, or ffmpeg refused the input.' })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Neither url nor base64 given, the url answers non-2xx, times out or cannot be reached, or ffmpeg ' +
+      'refused the input.',
+  })
   @ApiResponse({ status: 413, description: 'The supplied media is above the media size cap.' })
   @ApiResponse({
     status: 503,
     description:
-      'Conversion is disabled, the ffmpeg binary is not runnable, or the conversion queue is saturated — retry shortly.',
+      'Conversion is disabled, the ffmpeg binary is not runnable, or the conversion queue is saturated — retry shortly. ' +
+      MEDIA_URL_PROXY_503,
   })
   async convertVoice(@Param('sessionId') sessionId: string, @Body() dto: ConvertMediaDto) {
     return this.mediaConversion.convertToVoice(sessionId, dto);
@@ -68,16 +75,22 @@ export class MediaController {
   @ApiResponse({
     status: 200,
     description:
-      'Converted bytes: baseline H.264 with AAC audio, long edge bounded at 1280, index moved to the ' +
-      'front so the recipient can start playing before the whole file arrives.',
+      'Converted bytes: baseline H.264 with AAC audio, fitted inside 1280x720 (720x1280 portrait), index ' +
+      'moved to the front so the recipient can start playing before the whole file arrives.',
     type: ConvertedMediaResponseDto,
   })
-  @ApiResponse({ status: 400, description: 'Neither url nor base64 given, or ffmpeg refused the input.' })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Neither url nor base64 given, the url answers non-2xx, times out or cannot be reached, or ffmpeg ' +
+      'refused the input.',
+  })
   @ApiResponse({ status: 413, description: 'The supplied media is above the media size cap.' })
   @ApiResponse({
     status: 503,
     description:
-      'Conversion is disabled, the ffmpeg binary is not runnable, or the conversion queue is saturated — retry shortly.',
+      'Conversion is disabled, the ffmpeg binary is not runnable, or the conversion queue is saturated — retry shortly. ' +
+      MEDIA_URL_PROXY_503,
   })
   async convertVideo(@Param('sessionId') sessionId: string, @Body() dto: ConvertMediaDto) {
     return this.mediaConversion.convertToVideo(sessionId, dto);

@@ -25,5 +25,7 @@ public enum SessionStatus {
     FAILED,
     /** Engine unloaded after inactivity to free RAM; resuming needs no QR scan (Unisoft fork). */
     @SerializedName("hibernated")
-    HIBERNATED
+    HIBERNATED,
+    /** Decoded when the gateway sends a value newer than this SDK; not a wire value itself. */
+    UNKNOWN
 }

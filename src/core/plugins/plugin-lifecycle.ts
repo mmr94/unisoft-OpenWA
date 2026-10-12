@@ -25,6 +25,8 @@ import { resolvePluginMainPath } from './plugin-paths';
 export class PluginLifecycle {
   /** Plugin ids whose enable() is in flight — a synchronous lock so concurrent enables can't double-run. */
   private readonly enabling = new Set<string>();
+  /** In-flight disables by plugin id, so a concurrent disable joins the running teardown. */
+  private readonly disabling = new Map<string, Promise<void>>();
 
   constructor(
     // The LOADER's logger, deliberately — lifecycle lines carry the PluginLoaderService tag, and
@@ -136,6 +138,20 @@ export class PluginLifecycle {
       return; // Not enabled
     }
 
+    // Status flips to DISABLED only after the teardown awaits, so a second disable arriving meanwhile
+    // (shutdown overlapping a REST disable, an uninstall or an update unload) would pass the check
+    // above and run onDisable again. Join the teardown already in flight instead. An unload that joins a plain
+    // disable of a sandboxed plugin gets no onUnload, the same as unloading one already disabled.
+    const inFlight = this.disabling.get(pluginId);
+    if (inFlight) {
+      return inFlight;
+    }
+    const disabling = this.teardown(pluginId, plugin, opts).finally(() => this.disabling.delete(pluginId));
+    this.disabling.set(pluginId, disabling);
+    return disabling;
+  }
+
+  private async teardown(pluginId: string, plugin: PluginInstance, opts?: { unload?: boolean }): Promise<void> {
     try {
       const host = this.sandboxHosts.get(pluginId);
       if (host) {
@@ -206,8 +222,13 @@ export class PluginLifecycle {
 
     plugin.config = { ...plugin.config, ...config };
 
-    // Persist config
-    this.pluginStorage.setPluginConfig(pluginId, plugin.config);
+    // Persist only the operator's keys on top of what was persisted before, not the effective merge:
+    // a built-in's effective config carries its env-derived defaults, and storing those would freeze
+    // them over later .env changes (see registerBuiltInPlugin).
+    this.pluginStorage.setPluginConfig(pluginId, {
+      ...(this.pluginStorage.getPluginConfig(pluginId) ?? {}),
+      ...config,
+    });
 
     // Notify the running plugin of the config change (fire and forget). A sandboxed plugin's
     // onConfigChange lives in the worker (plugin.instance is null), so route it through the live worker
@@ -255,9 +276,10 @@ export class PluginLifecycle {
 
   /**
    * Set (or clear) a plugin's per-session config override for `sessionId`. Hooks for that session then
-   * see the override shallow-merged over the base via ctx.config — applied on the next event
-   * (resolution reads plugin.sessionConfig live) and persisted across restart. An empty override
-   * removes it (the session falls back to the base). Global plugins have no per-session config.
+   * see the override deep-merged over the base via ctx.config (nested objects merge key by key; arrays
+   * and scalars replace), applied on the next event (resolution reads plugin.sessionConfig live) and
+   * persisted across restart. An empty override removes it (the session falls back to the base).
+   * Global plugins have no per-session config.
    */
   setPluginSessionConfig(pluginId: string, sessionId: string, config: Record<string, unknown>): PluginInstance {
     const plugin = this.plugins.get(pluginId);
@@ -314,8 +336,9 @@ export class PluginLifecycle {
 
   registerBuiltInPlugin(manifest: PluginManifest, instance: IPlugin, config: Record<string, unknown> = {}): void {
     // Merge: env-derived defaults stay live each boot (so a changed .env wins), while an operator's
-    // persisted overrides win for the keys they actually set. Engine config is wholly env-derived
-    // (no persisted overrides), so it is never frozen to a first-boot snapshot.
+    // persisted overrides win for the keys they actually set. Engine plugin config can carry such an
+    // override too (PUT /api/plugins/:id/config), except the auth-dir bases, which EngineFactory
+    // passes to every createEngine call from the env config.
     const effectiveConfig = { ...config, ...(this.pluginStorage.getPluginConfig(manifest.id) ?? {}) };
 
     const pluginInstance: PluginInstance = {

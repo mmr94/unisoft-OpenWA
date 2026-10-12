@@ -1,9 +1,17 @@
-import { useCallback, useEffect, useState, type RefObject } from 'react';
+import { useCallback, useEffect, useMemo, useState, type RefObject } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertCircle, ChevronDown, CornerUpLeft, Loader2, MessageSquare, Smile, Trash2 } from 'lucide-react';
+import { useRole } from '../../hooks/useRole';
 import { sessionApi, type Chat } from '../../services/api';
-import { getMediaSrc, senderKey, type ChatMessageView } from '../../utils/chatMessages';
+import {
+  buildMentionNameMap,
+  getMediaSrc,
+  resolveMentions,
+  senderKey,
+  type ChatMessageView,
+} from '../../utils/chatMessages';
 import { shouldFetchOlderMessages } from '../../utils/scrollDecision';
+import ArchivedMediaPreview, { type ArchivedMediaKind } from './ArchivedMediaPreview';
 import MessageBody from './MessageBody';
 
 // Stable per-sender colour for group message labels, like WhatsApp gives each participant a colour.
@@ -62,6 +70,14 @@ function ChatThread({
   onClickButton,
 }: ChatThreadProps) {
   const { t } = useTranslation();
+  // Reply, react, delete and prompt taps all need an operator key, like the composer; a viewer
+  // would only reach a 403.
+  const { canWrite } = useRole();
+
+  // "@<digits>" in a message body only ever means something once resolved against a participant
+  // this thread has already seen post (see buildMentionNameMap) — recomputed only when the message
+  // list itself changes, not per-render.
+  const mentionNames = useMemo(() => buildMentionNameMap(messages), [messages]);
 
   // Media the message list did not inline. The route serves the bytes as an attachment
   // (Content-Disposition), and the list only carries payloads up to
@@ -266,6 +282,7 @@ function ChatThread({
 
           const isMediaMessage = msg.type !== 'text';
           const mediaInfo = msg.metadata?.media;
+          const displayBody = msg.body || (msg.type === 'poll' ? msg.metadata?.poll?.name : undefined);
 
           const renderMedia = () => {
             if (msg.type === 'revoked') return null;
@@ -303,7 +320,7 @@ function ChatThread({
               // Not a plain label: the bytes exist behind the per-message media route, so this is the
               // only handle the viewer has on them.
               const fetchState = msg.waMessageId ? mediaFetch[msg.waMessageId] : undefined;
-              return (
+              const downloadButton = (
                 <button
                   type="button"
                   className="message-media-omitted"
@@ -317,6 +334,33 @@ function ChatThread({
                   )}
                 </button>
               );
+              // `archived` marks a copy MESSAGE_INLINE_MEDIA=archive moved off the row once the archive
+              // store held it: the bubble rendered inline before, so it previews inline still, fetched
+              // lazily from the same route. Documents keep the button (there is nothing to preview),
+              // and so does a plain over-budget marker, see ArchivedMediaPreview for why.
+              const previewKind: ArchivedMediaKind | null =
+                msg.type === 'image' || msg.type === 'sticker'
+                  ? 'image'
+                  : msg.type === 'video'
+                    ? 'video'
+                    : msg.type === 'audio' || msg.type === 'voice'
+                      ? 'audio'
+                      : null;
+              const waMessageId = msg.waMessageId;
+              if (mediaInfo.archived && previewKind && sessionId && waMessageId) {
+                return (
+                  <ArchivedMediaPreview
+                    key={`${sessionId}:${activeChat.id}:${waMessageId}`}
+                    kind={previewKind}
+                    load={signal => sessionApi.getMessageMediaBlob(sessionId, activeChat.id, waMessageId, signal)}
+                    alt={mediaInfo.filename || t('chats.media.image')}
+                    fallback={downloadButton}
+                    measureMedia={measureMedia}
+                    onMediaLoad={onMediaLoad}
+                  />
+                );
+              }
+              return downloadButton;
             }
             const mediaSrc = getMediaSrc(mediaInfo);
             if (!mediaSrc) return null;
@@ -359,7 +403,14 @@ function ChatThread({
               default:
                 return (
                   <div className="message-media-document">
-                    <a href={mediaSrc} download={mediaInfo.filename || 'document'} className="chat-document-media">
+                    {/* A document sent by URL links off-site, where browsers ignore `download`, so a plain
+                        click would navigate the dashboard away; open it in a new tab instead. */}
+                    <a
+                      href={mediaSrc}
+                      download={mediaInfo.filename || 'document'}
+                      className="chat-document-media"
+                      {...(/^https?:\/\//i.test(mediaSrc) ? { target: '_blank', rel: 'noopener noreferrer' } : {})}
+                    >
                       📎 {mediaInfo.filename || t('chats.downloadDocument')}
                     </a>
                   </div>
@@ -397,7 +448,10 @@ function ChatThread({
                   {/* Quoted message display */}
                   {msg.metadata?.quotedMessage && (
                     <div className="message-quote-box">
-                      <MessageBody text={msg.metadata.quotedMessage.body} className="quote-body" />
+                      <MessageBody
+                        text={resolveMentions(msg.metadata.quotedMessage.body, mentionNames)}
+                        className="quote-body"
+                      />
                     </div>
                   )}
 
@@ -408,10 +462,22 @@ function ChatThread({
                   ) : isMasked ? (
                     <div className="message-text message-masked">{t('chats.messageMasked')}</div>
                   ) : (
-                    msg.body &&
-                    (!mediaInfo || msg.body !== mediaInfo.filename) &&
+                    displayBody &&
+                    (!mediaInfo || displayBody !== mediaInfo.filename) &&
                     msg.type !== 'location' &&
-                    msg.type !== 'call' && <MessageBody text={msg.body} className="message-text" />
+                    msg.type !== 'call' && (
+                      <MessageBody text={resolveMentions(displayBody, mentionNames)} className="message-text" />
+                    )
+                  )}
+
+                  {!isRevoked && msg.type === 'poll' && (msg.metadata?.poll?.options?.length ?? 0) > 0 && (
+                    <ul className="message-text" aria-label={t('messageTester.pollOptions')}>
+                      {msg.metadata!.poll!.options.map((option, index) => (
+                        <li key={index}>
+                          <bdi>{option}</bdi>
+                        </li>
+                      ))}
+                    </ul>
                   )}
 
                   {/* Inbound business prompt choices; a tap calls POST .../messages/click-button. */}
@@ -427,7 +493,7 @@ function ChatThread({
                             key={`${idx}:${btn.id}`}
                             type="button"
                             className={`message-prompt-button${state?.selectedId === btn.id ? ' selected' : ''}${state?.done ? ' answered' : ''}`}
-                            disabled={disabled}
+                            disabled={disabled || !canWrite}
                             onClick={() => void handleClickButton(msg, btn)}
                           >
                             {loading ? <Loader2 size={14} className="animate-spin" /> : btn.text}
@@ -475,8 +541,10 @@ function ChatThread({
                   )}
                 </div>
 
-                {/* Message actions menu (hover) */}
-                {!isRevoked && (
+                {/* Message actions menu (hover). Every action addresses the message by its WhatsApp
+                    id, so an optimistic bubble still on its local temp_ id (pending, or failed for
+                    good) offers none: the gateway could never resolve it. */}
+                {canWrite && !isRevoked && Boolean(msg.waMessageId) && (
                   <div className="message-actions-menu">
                     <button
                       type="button"

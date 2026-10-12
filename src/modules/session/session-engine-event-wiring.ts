@@ -78,6 +78,8 @@ export interface SessionEngineWiringHost {
   handleEngineDisconnected(id: string, engine: IWhatsAppEngine, reason: string): Promise<void>;
   updateStatus(id: string, status: SessionStatus): Promise<void>;
   cancelReconnect(id: string): void;
+  /** The live engine reported a non-READY state: record when its READY stretch ended. */
+  endReadyStretch(id: string): void;
   /**
    * Park an engine failure reported while a service-level reconnect awaits its re-init, instead of
    * applying it: `run` is the failure's side effects, and `reason` is set for an onError report.
@@ -145,10 +147,12 @@ export class SessionEngineEventWiring {
     // presence is the relink signal used below; its value gates onReady's account-binding check.
     const previouslyLinked = Boolean(previousPhone);
     let relinkWarned = false;
-    // Start of the current engine-internal reconnect episode (epoch ms), stamped on attempt 1.
-    // Closure state rather than a Map: it is scoped to this engine instance, which is exactly the
-    // lifetime of an episode. A service-level reconnect builds a new engine and a new callback table,
-    // so nothing has to be cleaned up and a previous episode's clock can never be inherited.
+    // When the current engine-internal reconnect streak started (epoch ms): stamped at attempt 1, or
+    // at the first reconnect attempt after a READY, and cleared by onReady. An engine can carry its
+    // attempt counter across a short-lived READY (Baileys does, so a link that drops right after
+    // opening keeps backing off), and time spent READY is not downtime.
+    // Closure state rather than a Map: it is scoped to this engine instance. A service-level
+    // reconnect builds a new engine and a new callback table, so nothing has to be cleaned up.
     let reconnectingSince = 0;
     /**
      * Persist an engine-driven status, but only while this node still owns the session.
@@ -168,7 +172,13 @@ export class SessionEngineEventWiring {
         });
         return;
       }
-      void host.updateStatus(id, status);
+      void host.updateStatus(id, status).catch(err =>
+        this.logger.warn('Failed to persist an engine status', {
+          sessionId: id,
+          status,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
     };
 
     return {
@@ -219,6 +229,7 @@ export class SessionEngineEventWiring {
         persistStatus(SessionStatus.QR_READY);
       },
       onReady: (phone, pushName): void => {
+        reconnectingSince = 0;
         // Account-binding guard: a ready link whose number differs from the one this session is
         // already bound to is a different account scanning its QR (a takeover), not a re-link. Refuse
         // it rather than silently overwrite the binding. An empty incoming phone (wwjs can report one)
@@ -229,16 +240,21 @@ export class SessionEngineEventWiring {
         }
         host.handleEngineReady(id, engine, phone, pushName);
       },
-      onMessage: (message): void => host.messages.handleInboundMessage(id, engine, message),
-      onHistoryMessages: (messages): void => {
+      // PostgreSQL only: holds each inbound message from arrival until its row is written.
+      ...(host.messages.holdsInbound
+        ? { admitInbound: arrival => host.messages.admitInbound(id, engine, arrival) }
+        : {}),
+      onMessage: (message, ticket): void => host.messages.handleInboundMessage(id, engine, message, ticket),
+      onHistoryMessages: messages => {
         if (!host.isLiveEngine(id, engine)) return;
         // Persist for the chat view only; no dispatch (these predate the live session).
-        void host.messages
-          .persistHistoryMessages(id, messages)
+        return host.messages
+          .persistHistoryMessages(id, engine, messages)
           .catch(err => this.logger.error(`Failed to persist history messages for ${id}`, String(err)));
       },
-      onMessageCreate: (message): void => host.messages.handleOwnSendEcho(id, engine, message),
-      onMessageAck: (messageId, status): void => host.messages.handleMessageAck(id, engine, messageId, status),
+      onMessageCreate: (message, ticket): void => host.messages.handleOwnSendEcho(id, engine, message, ticket),
+      onMessageAck: (messageId, status, chatId): void =>
+        host.messages.handleMessageAck(id, engine, messageId, status, chatId),
       onMessageRevoked: (message): void => host.messages.handleMessageRevoked(id, engine, message),
       onMessageReaction: (event): void => {
         if (!host.isLiveEngine(id, engine)) return;
@@ -286,7 +302,7 @@ export class SessionEngineEventWiring {
       },
       onCall: (event: IncomingCallEvent): void => {
         if (!host.isLiveEngine(id, engine)) return;
-        this.logger.log(`Incoming call from ${event.from}`, {
+        this.logger.log('Incoming call', {
           sessionId: id,
           callId: event.callId,
           isVideo: event.isVideo,
@@ -305,7 +321,7 @@ export class SessionEngineEventWiring {
         // attempts scheduled across all sessions", and an engine that retries internally was simply
         // never counted, so the series read 0 on Baileys however long a session looped.
         incrementSessionReconnectAttempts();
-        if (attempt === 1) reconnectingSince = Date.now();
+        if (attempt === 1 || reconnectingSince === 0) reconnectingSince = Date.now();
 
         // Below the loop threshold this is a blip, not an episode: the 515 restart WhatsApp asks for
         // right after a successful pairing is one attempt, and so is any drop that comes straight
@@ -349,6 +365,7 @@ export class SessionEngineEventWiring {
       },
       onStateChanged: (engineState: EngineStatus): void => {
         if (!host.isLiveEngine(id, engine)) return;
+        if (engineState !== EngineStatus.READY) host.endReadyStretch(id);
         const statusMap: Record<EngineStatus, SessionStatus> = {
           [EngineStatus.DISCONNECTED]: SessionStatus.DISCONNECTED,
           [EngineStatus.INITIALIZING]: SessionStatus.INITIALIZING,

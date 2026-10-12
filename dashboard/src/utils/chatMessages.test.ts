@@ -1,12 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildMentionNameMap,
+  resolveMentions,
+  stripMentionDelimiters,
   mapEngineHistoryMessage,
   mergeChatMessages,
   mergeReactionSnapshot,
   liveMessageMetadata,
   type EngineHistoryMessage,
 } from './chatMessages.ts';
+import { MENTION_CLOSE, MENTION_OPEN } from './messageFormatter.ts';
 import type { ChatMessage } from '../services/api';
 
 const hist = (over: Partial<EngineHistoryMessage> = {}): EngineHistoryMessage => ({
@@ -214,6 +218,75 @@ test('mergeOrAppend: DB-persisted prompt buttons survive a button-less echo', ()
   assert.deepEqual(after[0].metadata?.buttons, buttons);
 });
 
+test('mergeOrAppend preserves poll choices across duplicate and partial echoes', () => {
+  const poll = { name: 'Lunch?', options: ['Rice', 'Soup'], allowMultipleAnswers: false };
+  const before = msg({ type: 'poll', metadata: { poll } });
+  for (const metadata of [{ poll }, { media: undefined }]) {
+    const after = mergeOrAppend([before], msg({ type: 'poll', metadata }));
+    assert.deepEqual(after[0].metadata?.poll, poll);
+    assert.deepEqual(before.metadata, { poll });
+  }
+  const updated = { ...poll, options: ['Rice', 'Soup', 'Salad'] };
+  assert.deepEqual(
+    mergeOrAppend([before], msg({ type: 'poll', metadata: { poll: updated } }))[0].metadata?.poll,
+    updated,
+  );
+});
+
+test('mergeOrAppend keeps revocation terminal and removes content metadata', () => {
+  const original = msg({
+    type: 'poll',
+    metadata: {
+      poll: { name: 'Lunch?', options: ['Rice', 'Soup'], allowMultipleAnswers: false },
+      media: { mimetype: 'image/png', data: 'BASE64', archived: true },
+      quotedMessage: { id: 'q', body: 'quote' },
+      reactions: { me: 'yes' },
+    },
+  });
+  const revoked = msg({ type: 'revoked', body: '', metadata: undefined });
+  for (const [existing, incoming] of [
+    [original, revoked],
+    [revoked, original],
+  ]) {
+    const [result] = mergeOrAppend([existing], incoming);
+    assert.equal(result.type, 'revoked');
+    assert.equal(result.body, '');
+    assert.equal(result.metadata, undefined);
+  }
+  const [newRevoked] = mergeOrAppend([], { ...original, type: 'revoked' });
+  assert.equal(newRevoked.body, '');
+  assert.equal(newRevoked.metadata, undefined);
+  assert.equal(original.body, 'hello');
+  assert.ok(original.metadata?.poll);
+});
+
+test('mergeChatMessages keeps every revoked copy terminal regardless of source or duplicate order', () => {
+  const original = msg({
+    type: 'poll',
+    metadata: { poll: { name: 'Q', options: ['A'], allowMultipleAnswers: false } },
+  });
+  const revoked = { ...original, type: 'revoked' as const, body: '' };
+  for (const [rows, history] of [
+    [[original], [revoked]],
+    [[revoked], [original]],
+    [[revoked, original], []],
+    [[original, revoked], []],
+    [[], [revoked, original]],
+    [[], [original, revoked]],
+  ]) {
+    const [result] = mergeChatMessages(rows, history);
+    assert.equal(result.type, 'revoked');
+    assert.equal(result.body, '');
+    assert.equal(result.metadata, undefined);
+  }
+  assert.ok(original.metadata?.poll);
+});
+
+test('applyMessageEdit ignores a delayed edit for a revoked message', () => {
+  const before = [msg({ type: 'revoked', body: '' })];
+  assert.equal(applyMessageEdit(before, { messageId: before[0].waMessageId!, body: 'late' }), before);
+});
+
 test('mergeOrAppend dedupes a live WS message against its DB copy (id != id but same waMessageId)', () => {
   // DB-persisted copy: id = UUID, waMessageId = WA serialized id.
   const dbCopy = msg({ id: 'uuid-1', waMessageId: 'true_g@g.us_WA1', body: 'persisted' });
@@ -354,15 +427,24 @@ import { capMediaPayloads, MEDIA_PAYLOAD_CACHE_LIMIT } from './chatMessages.ts';
 const mediaMsg = (id: string, data?: string): ChatMessageView =>
   msg({ id, type: 'image', metadata: { media: { mimetype: 'image/jpeg', filename: `${id}.jpg`, data } } });
 
+test('capMediaPayloads bounds archived previews together with inline media', () => {
+  const archive = mediaMsg('old-archive');
+  archive.metadata!.media = { mimetype: 'image/jpeg', omitted: true, archived: true };
+  const list = [archive, ...Array.from({ length: MEDIA_PAYLOAD_CACHE_LIMIT }, (_, i) => mediaMsg(`m-${i}`, 'X'))];
+  const capped = capMediaPayloads(list);
+  assert.equal(capped[0].metadata?.media?.archived, undefined);
+  assert.equal(capped[0].metadata?.media?.omitted, true);
+  assert.equal(list[0].metadata?.media?.archived, true, 'the source marker remains unchanged');
+});
+
 test('capMediaPayloads: under the limit the list is returned untouched (stable reference)', () => {
   const list = [mediaMsg('m-1', 'AAA'), mediaMsg('m-2', 'BBB'), msg({ id: 'm-3' })];
   assert.equal(capMediaPayloads(list), list);
 });
 
-test('the media cap covers the whole fetch window (no dead-end placeholder inside it)', () => {
-  // useChatMessages fetches a 100-message slice WITH media and caches it at staleTime: Infinity.
-  // A cap below the window strips payloads the user can scroll to, with no refetch path — the
-  // stripped rows render the 📎 placeholder forever even though the payload was fetched.
+test('the media cap is at least one fetched page (MESSAGE_PAGE_SIZE 100)', () => {
+  // A cap below one page would strip payloads from the first page a chat opens with; past one page the
+  // cap bounds the rendered set (see the MEDIA_PAYLOAD_CACHE_LIMIT doc).
   assert.ok(MEDIA_PAYLOAD_CACHE_LIMIT >= 100);
 });
 
@@ -438,4 +520,225 @@ test('mergeReactionSnapshot treats an EMPTY snapshot as an answer, not as absenc
 
 test('mergeReactionSnapshot stays undefined when neither side knows anything', () => {
   assert.equal(mergeReactionSnapshot(undefined, undefined), undefined);
+});
+
+test("buildMentionNameMap keys on the author JID's local part, stripped of a :device suffix", () => {
+  const map = buildMentionNameMap([
+    msg({ author: '166868170059932@lid', chatName: 'Sneha Desai' }),
+    msg({ author: '628111:7@s.whatsapp.net', chatName: 'Group Admin' }),
+  ]);
+  assert.equal(map.get('166868170059932'), 'Sneha Desai');
+  assert.equal(map.get('628111'), 'Group Admin');
+});
+
+test('buildMentionNameMap skips a row with no author or no resolved name', () => {
+  const map = buildMentionNameMap([
+    msg({ author: undefined, chatName: 'Sneha Desai' }),
+    msg({ author: '628@c.us', chatName: undefined }),
+  ]);
+  assert.equal(map.size, 0);
+});
+
+// resolveMentions wraps a resolved name in the same PUA sentinels messageFormatter.ts's
+// parseMessageBody splits into a `mention` node (rendered as a real <bdi>, outside Linkify's
+// walk — see MessageBody.tsx). Tests assert against that wrapped form, not a plain "@Name" splice.
+const wrap = (s: string) => `${MENTION_OPEN}${s}${MENTION_CLOSE}`;
+
+test('resolveMentions replaces a matched @<digits> token with a mention-wrapped @<FirstName>', () => {
+  const names = buildMentionNameMap([msg({ author: '166868170059932@lid', chatName: 'Sneha Desai' })]);
+  assert.equal(resolveMentions('Hi @166868170059932, any update?', names), `Hi ${wrap('@Sneha')}, any update?`);
+});
+
+test('resolveMentions leaves an unmatched @<digits> token exactly as WhatsApp sent it', () => {
+  const names = buildMentionNameMap([msg({ author: '166868170059932@lid', chatName: 'Sneha Desai' })]);
+  assert.equal(resolveMentions('Hi @999999999, who is this?', names), 'Hi @999999999, who is this?');
+});
+
+test('resolveMentions does not touch a short @-token that is not a real mention (below the digit floor)', () => {
+  const names = buildMentionNameMap([msg({ author: '166868170059932@lid', chatName: 'Sneha Desai' })]);
+  assert.equal(resolveMentions('see item @42', names), 'see item @42');
+});
+
+test('resolveMentions is a no-op with an empty name map (skips the regex pass entirely)', () => {
+  assert.equal(resolveMentions('Hi @166868170059932', new Map()), 'Hi @166868170059932');
+});
+
+test('buildMentionNameMap only keys a device-suffixed author when the :device part is stripped', () => {
+  // Without .split(':')[0] the local part is '628111:7', fails /^\d+$/ and the entry is dropped.
+  assert.equal(
+    buildMentionNameMap([msg({ author: '628111:7@s.whatsapp.net', chatName: 'Ravi' })]).get('628111'),
+    'Ravi',
+  );
+});
+
+test('a push name is inserted verbatim, unstripped — a real <bdi> element is what keeps it from becoming a link, not character filtering', () => {
+  const names = buildMentionNameMap([msg({ author: '6281112345@c.us', chatName: 'bit.ly/free' })]);
+  assert.equal(resolveMentions('hi @6281112345', names), `hi ${wrap('@bit.ly/free')}`);
+});
+
+test('a push name that is a bare word linkify-react would auto-link ("localhost") is still mention-wrapped, not stripped', () => {
+  const names = buildMentionNameMap([msg({ author: '6281112345@c.us', chatName: 'localhost' })]);
+  assert.equal(resolveMentions('@6281112345', names), wrap('@localhost'));
+});
+
+test('resolveMentions needs a left boundary: start of text, whitespace, or opening punctuation', () => {
+  const names = buildMentionNameMap([msg({ author: '12345678@c.us', chatName: 'Ravi' })]);
+  assert.equal(resolveMentions('@12345678', names), wrap('@Ravi'));
+  assert.equal(resolveMentions(' @12345678', names), ` ${wrap('@Ravi')}`);
+  assert.equal(resolveMentions('(@12345678)', names), `(${wrap('@Ravi')})`);
+  assert.equal(resolveMentions('[@12345678]', names), `[${wrap('@Ravi')}]`);
+  assert.equal(resolveMentions('"@12345678"', names), `"${wrap('@Ravi')}"`);
+  assert.equal(resolveMentions('*@12345678*', names), `*${wrap('@Ravi')}*`);
+});
+
+test('resolveMentions does not fire inside an email address', () => {
+  const names = buildMentionNameMap([msg({ author: '12345678@c.us', chatName: 'Ravi' })]);
+  assert.equal(resolveMentions('mail admin@12345678.com now', names), 'mail admin@12345678.com now');
+});
+
+test('resolveMentions does not fire in a URL path segment (a preceding "/" is not a left boundary)', () => {
+  const names = buildMentionNameMap([msg({ author: '12345678@c.us', chatName: 'Ravi' })]);
+  assert.equal(resolveMentions('see https://x.test/@12345678/profile', names), 'see https://x.test/@12345678/profile');
+});
+
+test('resolveMentions does not fire right after a backtick (an inline-code span is not a left boundary)', () => {
+  const names = buildMentionNameMap([msg({ author: '12345678@c.us', chatName: 'Ravi' })]);
+  assert.equal(resolveMentions('run `@12345678`', names), 'run `@12345678`');
+});
+
+test('resolveMentions resolves two mentions in the same message', () => {
+  const names = buildMentionNameMap([
+    msg({ author: '12345678@c.us', chatName: 'Ravi' }),
+    msg({ author: '87654321@c.us', chatName: 'Sam' }),
+  ]);
+  assert.equal(resolveMentions('@12345678 @87654321', names), `${wrap('@Ravi')} ${wrap('@Sam')}`);
+});
+
+test('a push name blank after trimming is skipped, so the mention stays as WhatsApp sent it instead of a bare @', () => {
+  const names = buildMentionNameMap([msg({ author: '6281112345@c.us', chatName: ' ' })]);
+  assert.equal(names.size, 0);
+  assert.equal(resolveMentions('@6281112345', names), '@6281112345');
+});
+
+test('a name made only of punctuation is not blank — it is a legitimate, if odd, push name now that character-stripping is gone', () => {
+  const names = buildMentionNameMap([msg({ author: '6281112346@c.us', chatName: '///' })]);
+  assert.equal(resolveMentions('@6281112346', names), wrap('@///'));
+});
+
+test('a push name of only U+3164 HANGUL FILLER is treated as blank, not as usable text', () => {
+  // HANGUL FILLER renders as nothing but is not Unicode whitespace, so a plain .trim() check
+  // alone would have let this through and rendered "@" with nothing after it.
+  const names = buildMentionNameMap([msg({ author: '6281112345@c.us', chatName: 'ㅤㅤ' })]);
+  assert.equal(names.size, 0);
+  assert.equal(resolveMentions('@6281112345', names), '@6281112345');
+});
+
+test('a later usable name for the same participant is still picked up after a blank one', () => {
+  const names = buildMentionNameMap([
+    msg({ author: '6281112345@c.us', chatName: ' ' }),
+    msg({ author: '6281112345@c.us', chatName: 'Ravi Kumar' }),
+  ]);
+  assert.equal(resolveMentions('@6281112345', names), wrap('@Ravi'));
+});
+
+test('a participant who changed their push name mid-thread resolves to the newest one, not the oldest', () => {
+  const names = buildMentionNameMap([
+    msg({ author: '6281112345@c.us', chatName: 'Ravi Kumar' }),
+    msg({ author: '6281112345@c.us', chatName: 'RK Office' }),
+    msg({ author: '6281112345@c.us', chatName: ' ' }),
+  ]);
+  assert.equal(resolveMentions('@6281112345', names), wrap('@RK'));
+});
+
+test('resolveMentions leaves a mention inside a ``` code block alone, so the block still renders as code', () => {
+  const names = buildMentionNameMap([msg({ author: '12345678@c.us', chatName: 'Ravi' })]);
+  assert.equal(resolveMentions('```\n@12345678\n```', names), '```\n@12345678\n```');
+  assert.equal(resolveMentions('see `x` @12345678', names), `see \`x\` ${wrap('@Ravi')}`);
+});
+
+test('resolveMentions does not fire right after a closing backtick', () => {
+  const names = buildMentionNameMap([msg({ author: '12345678@c.us', chatName: 'Ravi' })]);
+  assert.equal(resolveMentions('`x`@12345678', names), '`x`@12345678');
+});
+
+test('a push name made only of other invisible code points is blank too, not just the Hangul filler', () => {
+  for (const cp of [
+    '\u200B',
+    '\u00AD',
+    '\u2060',
+    '\u200E',
+    '\u034F',
+    '\u115F',
+    '\u1160',
+    '\uFFA0',
+    '\u2800',
+    '\u180E',
+  ]) {
+    const names = buildMentionNameMap([msg({ author: '6281112345@c.us', chatName: cp + cp })]);
+    assert.equal(names.size, 0, `U+${cp.codePointAt(0)?.toString(16)} should count as blank`);
+  }
+  // A visible character among them keeps the name usable.
+  const names = buildMentionNameMap([msg({ author: '6281112345@c.us', chatName: '\u200BRavi\u200B' })]);
+  assert.equal(resolveMentions('@6281112345', names), wrap('@\u200BRavi\u200B'));
+});
+
+test('a push name carrying the span delimiters cannot close its own mention early', () => {
+  const names = buildMentionNameMap([
+    msg({ author: '6281112345@c.us', chatName: `X${MENTION_CLOSE}bit.ly/free ${MENTION_OPEN}Y` }),
+  ]);
+  assert.equal(resolveMentions('hi @6281112345', names), `hi ${wrap('@Xbit.ly/free')}`);
+});
+
+test('resolveMentions does not fire after "_" or "(" inside a URL, only when the opener run follows whitespace', () => {
+  const names = buildMentionNameMap([msg({ author: '6281234567@c.us', chatName: 'Ann' })]);
+  for (const body of ['https://x.example/p_@6281234567/doc', 'https://x.example/wiki/A_(@6281234567)']) {
+    assert.equal(resolveMentions(body, names), body);
+  }
+  assert.equal(resolveMentions('hi _(@6281234567)_', names), `hi _(${wrap('@Ann')})_`);
+  assert.equal(resolveMentions('`x`*@6281234567*', names), `\`x\`*${wrap('@Ann')}*`);
+});
+
+test('a span delimiter already in a raw body is dropped, so it can never parse as a mention', () => {
+  const raw = `see ${MENTION_OPEN}*not bold* https://x.example${MENTION_CLOSE} end`;
+  assert.equal(stripMentionDelimiters(raw), 'see *not bold* https://x.example end');
+  assert.equal(resolveMentions(raw, new Map()), 'see *not bold* https://x.example end');
+  const names = buildMentionNameMap([msg({ author: '6281112345@c.us', chatName: 'Ann' })]);
+  assert.equal(resolveMentions(`${MENTION_OPEN} *hi* @6281112345`, names), ` *hi* ${wrap('@Ann')}`);
+});
+
+test('a push name whose first word is invisible renders its first visible word, not a bare @', () => {
+  for (const blank of ['\u3164', '\u200B', '\u2800']) {
+    const names = buildMentionNameMap([msg({ author: '6281112345@c.us', chatName: `${blank} Bob Smith` })]);
+    assert.equal(resolveMentions('@6281112345', names), wrap('@Bob'));
+  }
+});
+
+test('live and history poll choices survive metadata projection', () => {
+  const poll = { name: 'Q', options: ['a', 'b'], allowMultipleAnswers: true };
+  assert.deepEqual(liveMessageMetadata({ poll }), { poll });
+  const mapped = mapEngineHistoryMessage({
+    id: 'p',
+    chatId: 'c@c.us',
+    from: 'c@c.us',
+    to: 'me',
+    body: 'Q',
+    type: 'poll',
+    timestamp: 100,
+    fromMe: false,
+    isGroup: false,
+    kind: 'individual',
+    poll,
+  });
+  assert.deepEqual(mapped.metadata?.poll, poll);
+});
+
+test('legacy poll rows inherit available history choices without replacing stored state', () => {
+  const poll = { name: 'Q', options: ['a', 'b'], allowMultipleAnswers: false };
+  const historical = mapEngineHistoryMessage(hist({ type: 'poll', poll }));
+  const stored = { ...historical, status: 'delivered' as const, metadata: { reactions: { sender: 'ok' } } };
+  const merged = mergeChatMessages([stored], [historical])[0];
+  assert.equal(merged.status, 'delivered');
+  assert.deepEqual(merged.metadata, { reactions: { sender: 'ok' }, poll });
+  const revoked = mergeChatMessages([{ ...stored, type: 'revoked', body: '', metadata: undefined }], [historical])[0];
+  assert.equal(revoked.metadata?.poll, undefined);
 });

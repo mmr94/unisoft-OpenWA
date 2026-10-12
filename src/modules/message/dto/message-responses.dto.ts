@@ -57,7 +57,8 @@ export class MessageListItemDto {
   @ApiPropertyOptional({
     type: String,
     nullable: true,
-    description: 'Human-readable chat name when known (contact pushName, group subject).',
+    description:
+      "Sender's push name, or their saved contact name when the engine reported no push name; in a group this is the member who posted, not the group subject. Null when neither was known.",
     example: 'Alice',
   })
   chatName?: string | null;
@@ -65,7 +66,8 @@ export class MessageListItemDto {
   @ApiPropertyOptional({
     type: String,
     nullable: true,
-    description: 'Group participant who posted the message (`from` is the group JID there).',
+    description:
+      'Sender of a group, status or broadcast-list message (`from` is the group, `status@broadcast` or list id there). On Baileys a list message the account received is filed under the sender, so `from` is the sender too.',
     example: '628123456789@c.us',
   })
   author?: string | null;
@@ -118,6 +120,11 @@ export class MessageListItemDto {
 }
 
 export class MessageListResponseDto {
+  @ApiPropertyOptional({
+    description:
+      'Rows matching the non-time filters with unknown message time, before time bounds. Present only for time selections; excluded from their messages and total. Stored history is not proof of complete remote history.',
+  })
+  unknownTimestampTotal?: number;
   @ApiProperty({ type: [MessageListItemDto], description: 'Newest first.' })
   messages!: MessageListItemDto[];
 
@@ -247,6 +254,17 @@ export class ChatHistoryProductDto {
   businessOwnerJid?: string;
 }
 
+export class ChatHistoryPollDto {
+  @ApiProperty({ example: 'Where?' })
+  name!: string;
+
+  @ApiProperty({ type: [String], example: ['Park', 'Beach'] })
+  options!: string[];
+
+  @ApiProperty({ example: false })
+  allowMultipleAnswers!: boolean;
+}
+
 /** OpenAPI mirror of the engine `IncomingMessage` served by the live chat-history route. */
 export class ChatHistoryMessageDto {
   @ApiProperty({ example: 'true_628123456789@c.us_3EB0123456789' })
@@ -286,7 +304,8 @@ export class ChatHistoryMessageDto {
   ephemeralDuration?: number;
 
   @ApiPropertyOptional({
-    description: 'Group participant who actually sent it (`from` is the group JID there).',
+    description:
+      'Sender of a group, status or broadcast-list message (`from` is the group, `status@broadcast` or list id there). On Baileys a list message the account received is filed under the sender, so `from` is the sender too.',
     example: '628123456789@c.us',
   })
   author?: string;
@@ -303,7 +322,8 @@ export class ChatHistoryMessageDto {
   @ApiPropertyOptional({
     type: String,
     nullable: true,
-    description: 'Best-effort phone digits of a privacy-id sender, when resolved.',
+    description:
+      'Never set on this route: live history does no privacy-id resolution. Resolve an @lid sender with GET /api/sessions/{sessionId}/contacts/{contactId}/phone.',
     example: null,
   })
   senderPhone?: string | null;
@@ -322,6 +342,9 @@ export class ChatHistoryMessageDto {
 
   @ApiPropertyOptional({ type: ChatHistoryQuotedMessageDto })
   quotedMessage?: ChatHistoryQuotedMessageDto;
+
+  @ApiPropertyOptional({ type: ChatHistoryPollDto, description: 'Poll choices and selection mode, when available.' })
+  poll?: ChatHistoryPollDto;
 
   @ApiPropertyOptional({ type: ChatHistoryLocationDto })
   location?: ChatHistoryLocationDto;

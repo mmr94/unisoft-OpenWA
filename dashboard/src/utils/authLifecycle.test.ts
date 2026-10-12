@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { createElement } from 'react';
 import { QueryClient } from '@tanstack/react-query';
 import type { installJsdomGlobals as installJsdomGlobalsFn } from '../test-helpers/jsdom.ts';
-import { clearActorState, isUserRole, resolveStartupValidation } from './authLifecycle.ts';
+import { clearActorState, isKeyUnusable, isUserRole, resolveStartupValidation } from './authLifecycle.ts';
 
 test('logout cleanup wipes the React Query cache (no cross-actor residue)', () => {
   const queryClient = new QueryClient();
@@ -44,6 +44,30 @@ test('startup validation: ok + role refreshes the cached role from the server', 
   assert.deepEqual(resolveStartupValidation(200, { valid: true, role: 'viewer' }), {
     action: 'role',
     role: 'viewer',
+    scoped: false,
+  });
+});
+
+test('startup validation: ok + role also carries the engine the server reports', () => {
+  assert.deepEqual(resolveStartupValidation(200, { valid: true, role: 'operator', engineType: 'baileys' }), {
+    action: 'role',
+    role: 'operator',
+    scoped: false,
+    engineType: 'baileys',
+  });
+});
+
+test('startup validation: ok + role carries whether the key is session-scoped', () => {
+  assert.deepEqual(resolveStartupValidation(200, { valid: true, role: 'admin', scoped: true }), {
+    action: 'role',
+    role: 'admin',
+    scoped: true,
+  });
+  // Anything but a literal true is unscoped.
+  assert.deepEqual(resolveStartupValidation(200, { valid: true, role: 'admin', scoped: 'yes' }), {
+    action: 'role',
+    role: 'admin',
+    scoped: false,
   });
 });
 
@@ -67,6 +91,8 @@ test('isUserRole accepts exactly the three known roles', () => {
 
 const LOGIN_KEY = 'openwa_api_key';
 const ROLE_KEY = 'openwa_user_role';
+const ENGINE_KEY = 'openwa_engine_type';
+const SCOPED_KEY = 'openwa_key_scoped';
 
 interface FetchCall {
   method: string;
@@ -78,7 +104,11 @@ const fetchCalls: FetchCall[] = [];
 // Per-test body for POST /auth/validate. The home page's stats endpoints need their object shapes
 // ([] would crash Dashboard's overview render); every other request gets an empty list, which the
 // post-login pages' React Query hooks tolerate.
-let validateBody: { valid?: boolean; role?: string } = { valid: true, role: 'operator' };
+let validateBody: { valid?: boolean; role?: string; engineType?: string; scoped?: boolean } = {
+  valid: true,
+  role: 'operator',
+  engineType: 'whatsapp-web.js',
+};
 
 function installFetchStub(): void {
   globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -151,7 +181,7 @@ afterEach(() => {
   localStorage.clear();
   sessionStorage.clear();
   fetchCalls.length = 0;
-  validateBody = { valid: true, role: 'operator' };
+  validateBody = { valid: true, role: 'operator', engineType: 'whatsapp-web.js' };
 });
 
 // Types a key into the login form and submits it, then waits until App has applied the role from
@@ -161,7 +191,7 @@ async function signIn(apiKey: string): Promise<void> {
   const input = await screen.findByLabelText('API Key');
   fireEvent.change(input, { target: { value: apiKey } });
   fireEvent.submit(input.closest('form')!);
-  await waitFor(() => assert.ok(localStorage.getItem(ROLE_KEY), 'expected a role to be stored after sign-in'));
+  await waitFor(() => assert.ok(sessionStorage.getItem(ROLE_KEY), 'expected a role to be stored after sign-in'));
   // Give the post-login render and its effects a macrotask to fire before counting requests.
   await new Promise(resolve => setTimeout(resolve, 50));
 }
@@ -174,8 +204,10 @@ test('a fresh sign-in makes exactly one /auth/validate request, feeding the role
   // The login page's own validate is the one request; the startup re-validation effect must not
   // re-fire on the null→key transition that storing the fresh key causes.
   assert.equal(validateCallCount(), 1);
-  assert.equal(localStorage.getItem(ROLE_KEY), 'operator');
+  assert.equal(sessionStorage.getItem(ROLE_KEY), 'operator');
   assert.equal(sessionStorage.getItem(LOGIN_KEY), 'fresh-key');
+  // The engine comes from the same response: a non-admin key cannot read /infra/engines/current.
+  assert.equal(sessionStorage.getItem(ENGINE_KEY), 'whatsapp-web.js');
 });
 
 test('a fresh sign-in with a role-less validate response still degrades to viewer', async () => {
@@ -185,17 +217,71 @@ test('a fresh sign-in with a role-less validate response still degrades to viewe
   await signIn('fresh-key');
 
   assert.equal(validateCallCount(), 1);
-  assert.equal(localStorage.getItem(ROLE_KEY), 'viewer');
+  assert.equal(sessionStorage.getItem(ROLE_KEY), 'viewer');
 });
 
 test('a page reload with a saved key re-validates once at startup and refreshes the cached role', async () => {
   sessionStorage.setItem(LOGIN_KEY, 'saved-key');
-  localStorage.setItem(ROLE_KEY, 'viewer'); // stale cached role
-  validateBody = { valid: true, role: 'admin' };
+  sessionStorage.setItem(ROLE_KEY, 'viewer'); // stale cached role
+  validateBody = { valid: true, role: 'admin', engineType: 'baileys' };
   rtl.render(createElement(App));
 
-  await rtl.waitFor(() => assert.equal(localStorage.getItem(ROLE_KEY), 'admin'));
+  await rtl.waitFor(() => assert.equal(sessionStorage.getItem(ROLE_KEY), 'admin'));
   await new Promise(resolve => setTimeout(resolve, 50));
 
   assert.equal(validateCallCount(), 1);
+  assert.equal(sessionStorage.getItem(ENGINE_KEY), 'baileys');
+});
+
+test('a 401, or a 403 from allowedIps refusing this client, makes the key unusable', () => {
+  assert.equal(isKeyUnusable(401, undefined), true);
+  assert.equal(isKeyUnusable(401, 'Invalid API key'), true);
+  assert.equal(isKeyUnusable(403, 'IP address not allowed'), true);
+  assert.equal(isKeyUnusable(403, 'Client IP could not be determined'), true);
+});
+
+test('a role or scope 403 and other failures keep the key', () => {
+  assert.equal(isKeyUnusable(403, 'Insufficient permissions'), false);
+  assert.equal(isKeyUnusable(403, undefined), false);
+  assert.equal(isKeyUnusable(403, ['IP address not allowed']), false);
+  assert.equal(isKeyUnusable(400, 'IP address not allowed'), false);
+  assert.equal(isKeyUnusable(429, undefined), false);
+  assert.equal(isKeyUnusable(500, undefined), false);
+});
+
+test('a fresh sign-in with a session-scoped admin key keeps the scope from the validate response', async () => {
+  validateBody = { valid: true, role: 'admin', engineType: 'baileys', scoped: true };
+  rtl.render(createElement(App));
+
+  await signIn('scoped-key');
+
+  assert.equal(sessionStorage.getItem(ROLE_KEY), 'admin');
+  assert.equal(sessionStorage.getItem(SCOPED_KEY), 'true');
+});
+
+test('a page reload refreshes the cached scope from the server', async () => {
+  sessionStorage.setItem(LOGIN_KEY, 'saved-key');
+  sessionStorage.setItem(ROLE_KEY, 'admin');
+  sessionStorage.setItem(SCOPED_KEY, 'true'); // stale: the key has since been unscoped
+  validateBody = { valid: true, role: 'admin', engineType: 'baileys', scoped: false };
+  rtl.render(createElement(App));
+
+  await rtl.waitFor(() => assert.equal(sessionStorage.getItem(SCOPED_KEY), null));
+});
+
+test('a startup 401 drops the cached scope with the role', async () => {
+  sessionStorage.setItem(LOGIN_KEY, 'revoked-key');
+  sessionStorage.setItem(ROLE_KEY, 'admin');
+  sessionStorage.setItem(SCOPED_KEY, 'true');
+  const stub = globalThis.fetch;
+  // Only the validate answer is refused: a 401 on any other read sends the page back to '/' first.
+  globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) =>
+    String(input).endsWith('/auth/validate') ? Promise.resolve(new Response('{}', { status: 401 })) : stub(input, init);
+  try {
+    rtl.render(createElement(App));
+    await rtl.waitFor(() => assert.equal(sessionStorage.getItem(ROLE_KEY), null));
+    assert.equal(sessionStorage.getItem(SCOPED_KEY), null);
+  } finally {
+    globalThis.fetch = stub;
+  }
 });

@@ -128,11 +128,20 @@ const FORBIDDEN_PROD_SECRETS = new Set([
 
 /**
  * Whether to warn that API_KEY_PEPPER is unset in production. Without a pepper, stored API-key hashes
- * fall back to plain SHA-256 (still functional). Advisory only — enabling a pepper re-hashes keys and
- * invalidates existing ones (see api-key-hash.ts), so it stays opt-in and must never be enforced.
+ * fall back to plain SHA-256 (still functional). Advisory only: enabling a pepper on an install with keys
+ * locks every key out (see api-key-hash.ts), so it stays opt-in and must never be enforced.
  */
 export function isApiKeyPepperMissingInProduction(nodeEnv?: string, apiKeyPepper?: string): boolean {
   return nodeEnv === 'production' && !apiKeyPepper?.trim();
+}
+
+/**
+ * Whether to warn that the main (auth/audit) DB schema is also managed by synchronize in production.
+ * After the migrations-main chain, synchronize alters api_keys/audit_logs to this release's entities
+ * without recording those changes in the migration ledger. Advisory only: the explicit opt-in keeps working.
+ */
+export function isMainDbSynchronizeInProduction(nodeEnv?: string, mainDbSynchronize?: string): boolean {
+  return nodeEnv === 'production' && mainDbSynchronize === 'true';
 }
 
 /**
@@ -187,8 +196,8 @@ export interface SecretCheckEnv {
  * whenever it is set. Throws with the offending var names so the operator can fix them.
  */
 export function assertNoDefaultSecretsInProduction(env: SecretCheckEnv): void {
-  // Deny-list, not an allow-list: main.ts calls this BEFORE NestFactory.create, so NODE_ENV has not
-  // been through boot validation yet and is still an arbitrary string here. Recognising only
+  // Deny-list, not an allow-list: main.ts runs validateEnv first, which already rejects an unknown
+  // NODE_ENV, but this guard must not depend on that ordering. Recognising only
   // 'production' meant every unrecognised value — a `prod` typo, a `staging` deployment — skipped the
   // guard silently, including the ALLOW_DEV_API_KEY rejection below. Only the two values that are
   // deliberately not production (and an unset or blank variable, the standard Node default for local
@@ -208,7 +217,8 @@ export function assertNoDefaultSecretsInProduction(env: SecretCheckEnv): void {
   const isWeak = (value?: string): boolean => !value || FORBIDDEN_PROD_SECRETS.has(value.trim().toLowerCase());
   const problems: string[] = [];
 
-  // Built-in datastores run on the internal-only Docker network (not published), so their fixed
+  // Built-in datastores run on the internal-only Docker network (the managed container specs in
+  // docker.service.ts publish no host ports), so their fixed
   // 'openwa'/'minioadmin' credentials are not internet-reachable — exempt them so selecting the
   // built-in option doesn't crash-loop a production boot. The exemption requires BOTH the built-in
   // flag AND an internal host: a host-pinned EXTERNAL datastore (even with the built-in flag set) is
@@ -220,8 +230,10 @@ export function assertNoDefaultSecretsInProduction(env: SecretCheckEnv): void {
   }
   const s3Exempt = env.minioBuiltIn === 'true' && isInternalS3Endpoint(env.s3Endpoint);
   if (env.storageType === 's3' && !s3Exempt) {
-    if (isWeak(env.s3AccessKey)) problems.push('S3_ACCESS_KEY');
-    if (isWeak(env.s3SecretKey)) problems.push('S3_SECRET_KEY');
+    // Name the canonical variables even when the value came from the legacy S3_ACCESS_KEY /
+    // S3_SECRET_KEY fallback: they are what the docs and .env.example tell an operator to set.
+    if (isWeak(env.s3AccessKey)) problems.push('S3_ACCESS_KEY_ID');
+    if (isWeak(env.s3SecretKey)) problems.push('S3_SECRET_ACCESS_KEY');
   }
   // API_MASTER_KEY is optional, but if provided it must neither be a known default nor fall below
   // the length floor — both are refused the same way, like the other weak secrets above. Unset stays

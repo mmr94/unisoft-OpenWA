@@ -72,6 +72,51 @@ describe('validateIngressManifest', () => {
     expect(() => validateIngressManifest(m as never)).toThrow(/toleranceSec/);
   });
 
+  it('rejects a toleranceSec that is not a finite number, which would disable the replay window', () => {
+    for (const tol of ['5m', '300s', '', {}, true, [], null, JSON.parse('1e999') as number]) {
+      for (const scheme of ['hmac-sha256', 'standard-webhooks']) {
+        const m = baseManifest();
+        m.ingress[0].signature.scheme = scheme;
+        (m.ingress[0].signature as { toleranceSec?: unknown }).toleranceSec = tol;
+        expect(() => validateIngressManifest(m as never)).toThrow(/toleranceSec/);
+      }
+    }
+  });
+
+  it('still loads a numeric toleranceSec, quoted or not', () => {
+    for (const tol of [300, '300']) {
+      const m = baseManifest();
+      (m.ingress[0].signature as { toleranceSec?: unknown }).toleranceSec = tol;
+      expect(() => validateIngressManifest(m as never)).not.toThrow();
+    }
+  });
+
+  it('rejects a route that is not a single URL path segment', () => {
+    for (const route of ['events/message', '/hook', 'a\\b', 'a?b', 'a#b', 'a%2Fb', 'a\nb', '.', '..']) {
+      const m = baseManifest();
+      m.ingress[0].route = route;
+      expect(() => validateIngressManifest(m as never)).toThrow(/single URL path segment/);
+    }
+    // A space or a non-ASCII letter is percent-encoded by the client and decoded before the match.
+    for (const route of ['send-sms', 'chatwoot', 'v1.events', 'a_b~c', 'a b', 'café', '...']) {
+      const m = baseManifest();
+      m.ingress[0].route = route;
+      expect(() => validateIngressManifest(m as never)).not.toThrow();
+    }
+  });
+
+  it('rejects a route holding a lone UTF-16 surrogate (no URL can encode or decode to it)', () => {
+    for (const route of ['\ud800', 'a\udc00b', 'x\ud83d']) {
+      const m = baseManifest();
+      m.ingress[0].route = route;
+      expect(() => validateIngressManifest(m as never)).toThrow(/single URL path segment/);
+    }
+    // A well-formed surrogate pair is an ordinary astral character.
+    const m = baseManifest();
+    m.ingress[0].route = 'hook-\ud83d\ude80';
+    expect(() => validateIngressManifest(m as never)).not.toThrow();
+  });
+
   it('rejects a dedupOn value other than header or body', () => {
     const m = baseManifest();
     (m.ingress[0] as { dedupOn?: string }).dedupOn = 'bdy';
@@ -82,6 +127,45 @@ describe('validateIngressManifest', () => {
     const m = baseManifest();
     (m.ingress[0] as { dedupOn?: string }).dedupOn = 'body';
     expect(() => validateIngressManifest(m as never)).not.toThrow();
+  });
+
+  // An unknown scheme used to load and then fail every delivery as a signature mismatch, with nothing
+  // pointing at the manifest; a missing signature object failed the load with a bare TypeError.
+  it.each(['hmac_sha256', 'HMAC-SHA256', 'standard-webhook', undefined])(
+    'rejects signature.scheme %p, naming the route',
+    scheme => {
+      const m = baseManifest();
+      (m.ingress[0].signature as { scheme?: string }).scheme = scheme;
+      expect(() => validateIngressManifest(m as never)).toThrow(/route 'chatwoot' signature\.scheme must be one of/);
+    },
+  );
+
+  it('rejects a route with no signature object as a manifest error', () => {
+    const m = baseManifest();
+    delete (m.ingress[0] as { signature?: unknown }).signature;
+    expect(() => validateIngressManifest(m as never)).toThrow(/route 'chatwoot' signature\.scheme must be one of/);
+  });
+
+  it('rejects an hmac-sha256 signature.encoding other than hex or base64', () => {
+    const m = baseManifest();
+    (m.ingress[0].signature as { encoding?: string }).encoding = 'b64';
+    expect(() => validateIngressManifest(m as never)).toThrow(/route 'chatwoot' signature\.encoding must be/);
+  });
+
+  // Only hmac-sha256 reads `encoding`, so a stray value on another scheme must not fail the plugin's load.
+  it.each(['shared-secret', 'standard-webhooks'])('ignores signature.encoding on a %s route', scheme => {
+    const m = baseManifest();
+    m.ingress[0].signature.scheme = scheme;
+    (m.ingress[0].signature as { encoding?: string }).encoding = 'b64';
+    expect(() => validateIngressManifest(m as never)).not.toThrow();
+  });
+
+  it('accepts every declared scheme', () => {
+    for (const scheme of ['hmac-sha256', 'shared-secret', 'standard-webhooks', 'none']) {
+      const m = baseManifest();
+      m.ingress[0].signature.scheme = scheme;
+      expect(() => validateIngressManifest(m as never, true)).not.toThrow();
+    }
   });
 
   it('rejects a duplicate route within one manifest', () => {
@@ -208,22 +292,51 @@ describe('warnUnsignedTimestampRoutes', () => {
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
-  it('stays silent when no timestamp is involved at all', () => {
+  const withDedupOnBody = (manifest: ReturnType<typeof hmacRoute>) => ({
+    ...manifest,
+    ingress: manifest.ingress.map(route => ({ ...route, dedupOn: 'body' })),
+  });
+
+  it('warns once when an hmac route binds no timestamp and dedups on its header', () => {
     const logger = { warn: jest.fn() };
     warnUnsignedTimestampRoutes(
       hmacRoute({ scheme: 'hmac-sha256', header: 'X-Sig', contentTemplate: '{rawBody}' }) as never,
       logger,
     );
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringMatching(/dedupOn: 'body'/),
+      expect.objectContaining({ pluginId: 'p', route: 'r', action: 'ingress_replayable_route' }),
+    );
+  });
+
+  it('stays silent for an hmac route without a timestamp that dedups on the body', () => {
+    const logger = { warn: jest.fn() };
+    warnUnsignedTimestampRoutes(
+      withDedupOnBody(hmacRoute({ scheme: 'hmac-sha256', header: 'X-Sig', contentTemplate: '{rawBody}' })) as never,
+      logger,
+    );
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
-  it('ignores non-hmac schemes (their wire format is not templatable)', () => {
+  it('warns for a shared-secret route unless it dedups on the body', () => {
+    const logger = { warn: jest.fn() };
+    const route = hmacRoute({ scheme: 'shared-secret', header: 'X-Token', timestampHeader: 'X-Ts' });
+    warnUnsignedTimestampRoutes(route as never, logger);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringMatching(/shared-secret/),
+      expect.objectContaining({ pluginId: 'p', route: 'r', action: 'ingress_replayable_route' }),
+    );
+
+    logger.warn.mockClear();
+    warnUnsignedTimestampRoutes(withDedupOnBody(route) as never, logger);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('ignores standard-webhooks (its dedup id and timestamp are signed)', () => {
     const logger = { warn: jest.fn() };
     warnUnsignedTimestampRoutes(hmacRoute({ scheme: 'standard-webhooks', dedupHeader: 'webhook-id' }) as never, logger);
-    warnUnsignedTimestampRoutes(
-      hmacRoute({ scheme: 'shared-secret', header: 'X-Token', timestampHeader: 'X-Ts' }) as never,
-      logger,
-    );
     expect(logger.warn).not.toHaveBeenCalled();
   });
 });
@@ -287,6 +400,28 @@ describe('validateIngressManifest: response contract', () => {
     ).toThrow(/invalid characters/);
   });
 
+  it('rejects a 1xx ack.status, which Node sends with no final response after it', () => {
+    for (const status of [100, 103, 199]) {
+      expect(() => validateIngressManifest(manifestWithRoute({ response: { ack: { status } } }))).toThrow(
+        /ack\.status/,
+      );
+    }
+    expect(() => validateIngressManifest(manifestWithRoute({ response: { ack: { status: 200 } } }))).not.toThrow();
+  });
+
+  it('rejects an ack header value Node cannot write, and keeps Latin-1 and HTAB', () => {
+    for (const value of ['ok \u2713', 'a\u0000b', 'a\u007fb', 'a\u001bb']) {
+      expect(() =>
+        validateIngressManifest(manifestWithRoute({ response: { ack: { headers: { 'x-note': value } } } })),
+      ).toThrow(/invalid characters/);
+    }
+    for (const value of ['caf\u00e9', 'a\tb']) {
+      expect(() =>
+        validateIngressManifest(manifestWithRoute({ response: { ack: { headers: { 'x-note': value } } } })),
+      ).not.toThrow();
+    }
+  });
+
   it('rejects a non-string ack body', () => {
     // A manifest is third-party JSON. Left unchecked, a number or object here reached the renderer,
     // which drops anything that is not a string, so the route answered every delivery with an EMPTY
@@ -297,7 +432,7 @@ describe('validateIngressManifest: response contract', () => {
   });
 
   it('rejects a non-string ack header value', () => {
-    // Same silent drop, and the CR/LF guard below does not catch it: RegExp.test coerces its
+    // Same silent drop, and the character guard does not catch it: RegExp.test coerces its
     // argument, so a number passes the injection check and is then filtered out at render time.
     expect(() =>
       validateIngressManifest(

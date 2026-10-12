@@ -13,9 +13,9 @@ import { createLogger } from '../../common/services/logger.service';
  * render wrong (text as a `[chat]` media bubble, voice notes as document links) and stats split the
  * same kind across old/new tokens.
  *
- * This runs on startup in EVERY DB mode. A TypeORM data migration would NOT suffice: the zero-config
- * SQLite default uses `synchronize: true`, under which `migrationsRun` is false, so migrations never
- * run there. The mapping is forward-only and collision-free (the neutral targets were never valid
+ * This runs on startup in EVERY DB mode. A TypeORM data migration would NOT suffice: a SQLite data DB
+ * under the opt-in DATABASE_SYNCHRONIZE=true (e.g. docker-compose.dev.yml) runs with `migrationsRun`
+ * false, so migrations never run there. The mapping is forward-only and collision-free (the neutral targets were never valid
  * raw tokens, and passthrough kinds already match), so re-running on already-converted rows is a
  * no-op — safe to execute on every boot.
  */
@@ -29,9 +29,12 @@ export class MessageTypeBackfillService implements OnApplicationBootstrap {
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
-    // [legacy wwebjs token(s)] -> neutral MessageType. Kept in sync with mapWwebjsMessageType.
+    // [legacy wwebjs token(s)] -> neutral MessageType, for the tokens mapWwebjsMessageType renames.
+    // call_log and poll_creation are left out on purpose: a pre-#265 row carries no call or poll
+    // metadata, so relabelling it would render an empty call or poll bubble.
     const conversions: Array<{ from: string[]; to: string }> = [
       { from: ['chat'], to: 'text' },
+      { from: ['buttons_response', 'list_response', 'template_button_reply'], to: 'text' },
       { from: ['ptt'], to: 'voice' },
       { from: ['vcard', 'multi_vcard'], to: 'contact' },
     ];

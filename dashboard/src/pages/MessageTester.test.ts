@@ -45,7 +45,7 @@ afterEach(() => {
   rtl.cleanup();
   textReads = 0;
   globalThis.fetch = emptyFetch;
-  window.localStorage.removeItem('openwa_user_role');
+  window.sessionStorage.removeItem('openwa_user_role');
 });
 
 interface BulkItem {
@@ -88,7 +88,7 @@ function stubGateway(): { bulkBodies: { messages: BulkItem[] }[] } {
 }
 
 async function renderBulkAsWriter(): Promise<HTMLElement> {
-  window.localStorage.setItem('openwa_user_role', 'admin');
+  window.sessionStorage.setItem('openwa_user_role', 'admin');
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1_000 } } });
   const { container } = rtl.render(
     createElement(QueryClientProvider, { client }, createElement(RoleProvider, null, createElement(MessageTester))),
@@ -137,25 +137,33 @@ let restoreFetch: (() => void) | null = null;
 afterEach(() => {
   restoreFetch?.();
   restoreFetch = null;
-  window.localStorage.removeItem('openwa_user_role');
+  window.sessionStorage.removeItem('openwa_user_role');
 });
 
 function groupJsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
-function stubGroupGateway(groups: { id: string; name?: string }[], refuseFirstWith?: number): { textSends: string[] } {
+function stubGroupGateway(
+  groups: { id: string; name?: string }[],
+  refuseFirstWith?: number,
+): { textSends: string[]; imageBodies: { chatId: string; url?: string; caption?: string }[] } {
   const previousFetch = globalThis.fetch;
   restoreFetch = () => {
     globalThis.fetch = previousFetch;
   };
   const textSends: string[] = [];
+  const imageBodies: { chatId: string; url?: string; caption?: string }[] = [];
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     if (url.endsWith('/sessions')) {
       return Promise.resolve(groupJsonResponse([{ id: 's1', name: 'Main', status: 'ready', phone: '15550000000' }]));
     }
     if (url.endsWith('/sessions/s1/groups')) return Promise.resolve(groupJsonResponse(groups));
+    if (url.endsWith('/messages/send-image')) {
+      imageBodies.push(JSON.parse(String(init?.body)) as { chatId: string; url?: string; caption?: string });
+      return Promise.resolve(groupJsonResponse({ messageId: 'img1', timestamp: 1 }, 201));
+    }
     if (url.endsWith('/messages/send-text')) {
       const { chatId } = JSON.parse(String(init?.body)) as { chatId: string };
       textSends.push(chatId);
@@ -166,11 +174,11 @@ function stubGroupGateway(groups: { id: string; name?: string }[], refuseFirstWi
     }
     return Promise.resolve(groupJsonResponse([]));
   }) as typeof fetch;
-  return { textSends };
+  return { textSends, imageBodies };
 }
 
 async function renderGroupsAsWriter(): Promise<void> {
-  window.localStorage.setItem('openwa_user_role', 'admin');
+  window.sessionStorage.setItem('openwa_user_role', 'admin');
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1_000 } } });
   rtl.render(
     createElement(QueryClientProvider, { client }, createElement(RoleProvider, null, createElement(MessageTester))),
@@ -217,7 +225,7 @@ test('cancelling a group send stops the groups still waiting', async () => {
   assert.ok(rtl.screen.getByText('1/2 sent'));
   // One of two groups sent is not a success.
   assert.ok(rtl.screen.getByText('Failed'));
-  assert.equal(rtl.screen.queryByText('Success'), null);
+  assert.equal(rtl.screen.queryByText('Success') === null, true);
   assert.equal(window.document.getElementById('mt-2')?.matches(':disabled'), false);
 });
 
@@ -235,6 +243,197 @@ test('a 429 from the gateway stops the run instead of trying the rest', async ()
   await rtl.screen.findByText('1, stopped after HTTP 429');
   assert.deepEqual(gateway.textSends, ['g1@g.us']);
   assert.ok(rtl.screen.getByText('Failed'));
+});
+
+test('a 409 (engine not ready) stops the run, since every group would fail alike', async () => {
+  const gateway = stubGroupGateway(
+    [
+      { id: 'g1@g.us', name: 'Family' },
+      { id: 'g2@g.us', name: 'Work' },
+    ],
+    409,
+  );
+  await renderGroupsAsWriter();
+  await sendTextToAllGroups();
+
+  await rtl.screen.findByText('1, stopped after HTTP 409');
+  assert.deepEqual(gateway.textSends, ['g1@g.us']);
+});
+
+test('an empty message or a media type with no file or URL keeps Send disabled', async () => {
+  stubGroupGateway([
+    { id: 'g1@g.us', name: 'Family' },
+    { id: 'g2@g.us', name: 'Work' },
+  ]);
+  await renderGroupsAsWriter();
+  await rtl.screen.findByRole('checkbox', { name: 'Work' });
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Select all' }));
+
+  const message = rtl.screen.getByPlaceholderText('Enter your message here...');
+  rtl.fireEvent.change(message, { target: { value: '   ' } });
+  assert.equal(sendMessageButton().disabled, true);
+  rtl.fireEvent.change(message, { target: { value: 'hi' } });
+  await rtl.waitFor(() => assert.equal(sendMessageButton().disabled, false));
+
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Image' }));
+  assert.equal(sendMessageButton().disabled, true);
+});
+
+test('a group media send holds a URL or caption the gateway would refuse, and sends the URL trimmed', async () => {
+  const gateway = stubGroupGateway([{ id: 'g1@g.us', name: 'Family' }]);
+  await renderGroupsAsWriter();
+  rtl.fireEvent.click(await rtl.screen.findByRole('checkbox', { name: 'Family' }));
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Image' }));
+  const mediaUrl = window.document.getElementById('mt-3')!;
+  const caption = window.document.getElementById('mt-14')!;
+
+  // Without a scheme the gateway reads the string as base64 and refuses it, once per group.
+  rtl.fireEvent.change(mediaUrl, { target: { value: 'cdn.example.com/a.jpg' } });
+  await rtl.screen.findByText('Use a full http:// or https:// address, like https://example.com/file.pdf.');
+  assert.equal(sendMessageButton().disabled, true);
+
+  rtl.fireEvent.change(mediaUrl, { target: { value: ' https://cdn.example.com/a.jpg' } });
+  rtl.fireEvent.change(caption, { target: { value: 'x'.repeat(1025) } });
+  assert.equal(sendMessageButton().disabled, true);
+  rtl.fireEvent.change(caption, { target: { value: 'x'.repeat(1024) } });
+  await rtl.waitFor(() => assert.equal(sendMessageButton().disabled, false));
+
+  rtl.fireEvent.click(sendMessageButton());
+  await rtl.waitFor(() => assert.equal(gateway.imageBodies.length, 1));
+  assert.equal(gateway.imageBodies[0].url, 'https://cdn.example.com/a.jpg');
+});
+
+/** Render a group send to one group and switch to `type`. */
+async function renderGroupSendOf(type: string): Promise<void> {
+  stubGroupGateway([{ id: 'g1@g.us', name: 'Family' }]);
+  await renderGroupsAsWriter();
+  rtl.fireEvent.click(await rtl.screen.findByRole('checkbox', { name: 'Family' }));
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: type }));
+}
+
+function byId(id: string): HTMLElement {
+  const element = window.document.getElementById(id);
+  assert.ok(element, `expected #${id}`);
+  return element;
+}
+
+function setValue(element: HTMLElement, value: string): void {
+  rtl.fireEvent.change(element, { target: { value } });
+}
+
+/** Exactly `max` characters in `element` lets Send through; one more holds it and says why. */
+async function assertLengthBound(element: HTMLElement, max: number, char = 'x'): Promise<void> {
+  const reason = `Limited to ${max} characters (${max + 1} now).`;
+  setValue(element, char.repeat(max));
+  await rtl.waitFor(() => assert.equal(sendMessageButton().disabled, false));
+  assert.equal(rtl.screen.queryByText(reason), null);
+  setValue(element, char.repeat(max + 1));
+  assert.equal(sendMessageButton().disabled, true);
+  rtl.screen.getByText(reason);
+  setValue(element, char.repeat(max));
+}
+
+test('a group text send holds a message over 4096 characters', async () => {
+  await renderGroupSendOf('Text');
+  await assertLengthBound(byId('mt-2'), 4096);
+});
+
+test('a group document send holds a filename over 255 characters', async () => {
+  await renderGroupSendOf('Document');
+  setValue(byId('mt-3'), 'https://cdn.example.com/a.pdf');
+  await assertLengthBound(byId('mt-14'), 255);
+});
+
+test('a group location send holds a description or address over 1024 characters', async () => {
+  await renderGroupSendOf('Location');
+  setValue(byId('mt-4'), '-6.2');
+  setValue(byId('mt-5'), '106.8');
+  await assertLengthBound(byId('mt-15'), 1024);
+  await assertLengthBound(byId('mt-16'), 1024);
+});
+
+test('a group contact send holds a name over 255 or a number over 30 characters', async () => {
+  await renderGroupSendOf('Contact');
+  setValue(byId('mt-6'), 'Ann');
+  setValue(byId('mt-7'), '15550000000');
+  await assertLengthBound(byId('mt-6'), 255);
+  await assertLengthBound(byId('mt-7'), 30, '1');
+});
+
+test('a group poll send holds a question over 255 or an option over 100 characters', async () => {
+  await renderGroupSendOf('Poll');
+  setValue(rtl.screen.getByPlaceholderText('Option 1'), 'a');
+  setValue(rtl.screen.getByPlaceholderText('Option 2'), 'b');
+  await assertLengthBound(byId('mt-8'), 255);
+  await assertLengthBound(rtl.screen.getByPlaceholderText('Option 1'), 100);
+});
+
+test('no single-send field truncates input by UTF-16 units', async () => {
+  // A native maxlength counts a surrogate pair as two and cuts pasted text the gateway would accept;
+  // Send alone holds an over-limit field, counting characters the way the gateway does.
+  const capped = (element: HTMLElement): boolean => element.hasAttribute('maxlength');
+  await renderGroupSendOf('Text');
+  assert.equal(capped(byId('mt-2')), false);
+  await assertLengthBound(byId('mt-2'), 4096, '\u{1F600}');
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Image' }));
+  assert.equal(capped(byId('mt-14')), false);
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Location' }));
+  assert.equal(capped(byId('mt-15')), false);
+  assert.equal(capped(byId('mt-16')), false);
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Contact' }));
+  assert.equal(capped(byId('mt-6')), false);
+  assert.equal(capped(byId('mt-7')), false);
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Poll' }));
+  assert.equal(capped(byId('mt-8')), false);
+  assert.equal(capped(rtl.screen.getByPlaceholderText('Option 1')), false);
+});
+
+test('a session that stops being ready is replaced by what the selector shows', async () => {
+  const status: Record<string, string> = { s1: 'ready', s2: 'ready' };
+  const sends: string[] = [];
+  globalThis.fetch = ((input: RequestInfo | URL): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url.endsWith('/sessions')) {
+      return Promise.resolve(
+        jsonResponse([
+          { id: 's1', name: 'Alpha', status: status.s1, phone: '15550000001' },
+          { id: 's2', name: 'Beta', status: status.s2, phone: '15550000002' },
+        ]),
+      );
+    }
+    if (url.endsWith('/groups')) return Promise.resolve(jsonResponse([{ id: 'g1@g.us', name: 'Family' }]));
+    if (url.endsWith('/messages/send-text')) {
+      sends.push(url);
+      return Promise.resolve(jsonResponse({ messageId: 'm1', timestamp: 1 }, 201));
+    }
+    return Promise.resolve(jsonResponse([]));
+  }) as typeof fetch;
+  window.sessionStorage.setItem('openwa_user_role', 'admin');
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1_000 } } });
+  const { container } = rtl.render(
+    createElement(QueryClientProvider, { client }, createElement(RoleProvider, null, createElement(MessageTester))),
+  );
+  await rtl.screen.findByRole('option', { name: /Beta/ });
+  const select = field(container, '#mt-1');
+  rtl.fireEvent.change(select, { target: { value: 's2' } });
+  await rtl.waitFor(() => assert.equal(select.value, 's2'));
+
+  status.s2 = 'disconnected';
+  await client.invalidateQueries({ queryKey: ['sessions'] });
+  await rtl.waitFor(() => assert.equal(select.value, 's1'));
+
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Group' }));
+  rtl.fireEvent.click(await rtl.screen.findByRole('checkbox', { name: 'Family' }));
+  rtl.fireEvent.change(rtl.screen.getByPlaceholderText('Enter your message here...'), { target: { value: 'hi' } });
+  await rtl.waitFor(() => assert.equal(sendButton().disabled, false));
+  rtl.fireEvent.click(sendButton());
+  await rtl.waitFor(() => assert.equal(sends.length, 1));
+  assert.ok(sends[0].includes('/sessions/s1/'), sends[0]);
+
+  status.s1 = 'disconnected';
+  await client.invalidateQueries({ queryKey: ['sessions'] });
+  await rtl.waitFor(() => assert.equal(select.value, ''));
+  await rtl.waitFor(() => assert.equal(sendButton().disabled, true));
 });
 
 test('a recipients file over the cap is refused without being read', async () => {
@@ -279,6 +478,248 @@ test('a bulk send with a picked image carries it in every item', async () => {
     assert.equal(item.content.image?.mimetype, 'image/png');
     assert.ok(item.content.image?.base64, 'expected the file inline');
   }
+});
+
+test('a bulk text over 4096 characters with no attachment keeps Send disabled and says why', async () => {
+  stubGateway();
+  const container = await renderBulkAsWriter();
+  type(container, '#mt-11', '15550000001');
+  type(container, '#mt-12', 'x'.repeat(4096));
+  await rtl.waitFor(() => assert.equal(sendButton().disabled, false));
+  type(container, '#mt-12', 'x'.repeat(4097));
+  assert.equal(sendButton().disabled, true);
+  rtl.screen.getByText('Limited to 4096 characters (4097 now).');
+});
+
+test('a bulk send that resolves after the page is left starts no progress polling', async () => {
+  let release: (response: Response) => void = () => {};
+  let bulkPosted = false;
+  globalThis.fetch = ((input: RequestInfo | URL): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url.endsWith('/sessions')) {
+      return Promise.resolve(jsonResponse([{ id: 's1', name: 'Main', status: 'ready', phone: '15550000000' }]));
+    }
+    if (url.endsWith('/messages/send-bulk')) {
+      bulkPosted = true;
+      return new Promise<Response>(resolve => {
+        release = resolve;
+      });
+    }
+    return Promise.resolve(jsonResponse([]));
+  }) as typeof fetch;
+  const container = await renderBulkAsWriter();
+  type(container, '#mt-11', '15550000001');
+  rtl.fireEvent.change(rtl.screen.getByPlaceholderText('Enter your message here...'), { target: { value: 'hi' } });
+  await rtl.waitFor(() => assert.equal(sendButton().disabled, false));
+  rtl.fireEvent.click(sendButton());
+  await rtl.waitFor(() => assert.ok(bulkPosted));
+
+  // Record the poller instead of waiting it out, and clear it so a regression fails instead of hanging.
+  const pollers: ReturnType<typeof setInterval>[] = [];
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = ((handler: () => void, ms?: number) => {
+    const id = realSetInterval(handler, ms);
+    if (ms === 2000) pollers.push(id);
+    return id;
+  }) as typeof setInterval;
+  try {
+    rtl.cleanup();
+    release(jsonResponse({ batchId: 'b1', status: 'pending', totalMessages: 1 }, 202));
+    await new Promise(resolve => setTimeout(resolve, 100));
+  } finally {
+    globalThis.setInterval = realSetInterval;
+    pollers.forEach(clearInterval);
+  }
+  assert.equal(pollers.length, 0);
+});
+
+test('a progress poll that answers after Cancel does not undo the cancel', async () => {
+  const progress = { total: 1, sent: 0, failed: 0, pending: 0, cancelled: 0 };
+  let answerPoll: (response: Response) => void = () => {};
+  globalThis.fetch = ((input: RequestInfo | URL): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url.endsWith('/sessions')) {
+      return Promise.resolve(jsonResponse([{ id: 's1', name: 'Main', status: 'ready', phone: '15550000000' }]));
+    }
+    if (url.endsWith('/messages/send-bulk')) {
+      return Promise.resolve(jsonResponse({ batchId: 'b1', status: 'pending', totalMessages: 1 }, 202));
+    }
+    if (url.endsWith('/messages/batch/b1/cancel')) {
+      return Promise.resolve(
+        jsonResponse({ batchId: 'b1', status: 'cancelled', progress: { ...progress, cancelled: 1 }, results: [] }),
+      );
+    }
+    if (url.endsWith('/messages/batch/b1')) {
+      return new Promise<Response>(resolve => {
+        answerPoll = resolve;
+      });
+    }
+    return Promise.resolve(jsonResponse([]));
+  }) as typeof fetch;
+
+  // Run the progress poll by hand instead of waiting out its 2 s interval.
+  const polls: Array<() => void> = [];
+  const timers: ReturnType<typeof setInterval>[] = [];
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = ((handler: () => void, ms?: number) => {
+    const id = ms === 2000 ? realSetInterval(() => {}, 2 ** 30) : realSetInterval(handler, ms);
+    if (ms === 2000) polls.push(handler);
+    timers.push(id);
+    return id;
+  }) as typeof setInterval;
+  try {
+    const container = await renderBulkAsWriter();
+    type(container, '#mt-11', '15550000001');
+    rtl.fireEvent.change(rtl.screen.getByPlaceholderText('Enter your message here...'), { target: { value: 'hi' } });
+    await rtl.waitFor(() => assert.equal(sendButton().disabled, false));
+    rtl.fireEvent.click(sendButton());
+    const cancel = await rtl.screen.findByRole('button', { name: 'Cancel Batch' });
+    const badge = () => container.querySelector('.batch-badge')?.textContent;
+
+    polls[0]();
+    rtl.fireEvent.click(cancel);
+    await rtl.waitFor(() => assert.equal(badge(), 'Cancelled'));
+    await rtl.act(async () => {
+      answerPoll(
+        jsonResponse({ batchId: 'b1', status: 'processing', progress: { ...progress, pending: 1 }, results: [] }),
+      );
+      await new Promise(resolve => setTimeout(resolve, 50));
+    });
+
+    assert.equal(badge(), 'Cancelled', 'a poll that answered after the cancel put the batch back to processing');
+  } finally {
+    globalThis.setInterval = realSetInterval;
+    timers.forEach(clearInterval);
+  }
+});
+
+// Sends one bulk batch 'b1' with its 2 s progress poll run by hand: `poll()` runs one tick inside act
+// (`tick()` runs it bare, for a poll left in flight), `stopped()` says whether the poll's timer was
+// cleared, and the progress route answers `answer()`.
+async function withManualBatchPoll(
+  answer: () => Promise<Response>,
+  body: (h: {
+    container: HTMLElement;
+    poll: () => Promise<void>;
+    tick: () => Promise<void>;
+    stopped: () => boolean;
+    badge: () => string | null | undefined;
+    error: () => string | null | undefined;
+  }) => Promise<void>,
+): Promise<void> {
+  globalThis.fetch = ((input: RequestInfo | URL): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url.endsWith('/sessions')) {
+      return Promise.resolve(jsonResponse([{ id: 's1', name: 'Main', status: 'ready', phone: '15550000000' }]));
+    }
+    if (url.endsWith('/messages/send-bulk')) {
+      return Promise.resolve(jsonResponse({ batchId: 'b1', status: 'pending', totalMessages: 1 }, 202));
+    }
+    if (url.endsWith('/messages/batch/b1/cancel')) {
+      return Promise.resolve(
+        jsonResponse({
+          batchId: 'b1',
+          status: 'cancelled',
+          progress: { total: 1, sent: 0, failed: 0, pending: 0, cancelled: 1 },
+          results: [],
+        }),
+      );
+    }
+    if (url.endsWith('/messages/batch/b1')) return answer();
+    return Promise.resolve(jsonResponse([]));
+  }) as typeof fetch;
+
+  const polls: Array<() => Promise<void>> = [];
+  const pollTimers: ReturnType<typeof setInterval>[] = [];
+  const cleared: unknown[] = [];
+  const timers: ReturnType<typeof setInterval>[] = [];
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  globalThis.setInterval = ((handler: () => Promise<void>, ms?: number) => {
+    const id = ms === 2000 ? realSetInterval(() => {}, 2 ** 30) : realSetInterval(handler, ms);
+    if (ms === 2000) {
+      polls.push(handler);
+      pollTimers.push(id);
+    }
+    timers.push(id);
+    return id;
+  }) as typeof setInterval;
+  globalThis.clearInterval = ((id: ReturnType<typeof setInterval>) => {
+    cleared.push(id);
+    realClearInterval(id);
+  }) as typeof clearInterval;
+  try {
+    const container = await renderBulkAsWriter();
+    type(container, '#mt-11', '15550000001');
+    rtl.fireEvent.change(rtl.screen.getByPlaceholderText('Enter your message here...'), { target: { value: 'hi' } });
+    await rtl.waitFor(() => assert.equal(sendButton().disabled, false));
+    rtl.fireEvent.click(sendButton());
+    await rtl.screen.findByRole('button', { name: 'Cancel Batch' });
+    await body({
+      container,
+      poll: () =>
+        rtl.act(async () => {
+          await polls[0]();
+        }),
+      tick: () => polls[0](),
+      stopped: () => cleared.includes(pollTimers[0]),
+      badge: () => container.querySelector('.batch-badge')?.textContent,
+      error: () => container.querySelector('.batch-error')?.textContent,
+    });
+  } finally {
+    globalThis.setInterval = realSetInterval;
+    globalThis.clearInterval = realClearInterval;
+    timers.forEach(id => realClearInterval(id));
+  }
+}
+
+for (const status of [404, 403]) {
+  test(`a progress poll answered ${status} stops polling and shows the error`, async () => {
+    const answer = () =>
+      Promise.resolve(jsonResponse({ statusCode: status, message: `Batch 'b1' not found`, error: 'x' }, status));
+    await withManualBatchPoll(answer, async ({ poll, stopped, badge, error }) => {
+      await poll();
+      assert.equal(error(), `Batch 'b1' not found`);
+      assert.ok(stopped(), `a ${status} kept the progress poll running`);
+      assert.equal(badge(), 'Pending', 'the last known status was dropped');
+    });
+  });
+}
+
+test('a progress poll answered 503 keeps polling', async () => {
+  const progress = { total: 1, sent: 0, failed: 0, pending: 1, cancelled: 0 };
+  const answers = [
+    () => Promise.resolve(new Response('bad gateway', { status: 503 })),
+    () => Promise.resolve(jsonResponse({ batchId: 'b1', status: 'processing', progress, results: [] })),
+  ];
+  await withManualBatchPoll(
+    () => answers.shift()!(),
+    async ({ poll, stopped, badge, error }) => {
+      await poll();
+      assert.equal(error(), undefined);
+      assert.ok(!stopped(), 'a transient 503 stopped the progress poll');
+      await poll();
+      assert.equal(badge(), 'Processing');
+    },
+  );
+});
+
+test('a 404 from a poll that answers after Cancel shows no error', async () => {
+  let answerPoll: (response: Response) => void = () => {};
+  const answer = () =>
+    new Promise<Response>(resolve => {
+      answerPoll = resolve;
+    });
+  await withManualBatchPoll(answer, async ({ tick, badge, error }) => {
+    const pending = tick();
+    rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Cancel Batch' }));
+    await rtl.waitFor(() => assert.equal(badge(), 'Cancelled'));
+    await rtl.act(async () => {
+      answerPoll(jsonResponse({ statusCode: 404, message: `Batch 'b1' not found`, error: 'Not Found' }, 404));
+      await pending;
+    });
+    assert.equal(error(), undefined, 'a poll the cancel had already stopped raised an error');
+  });
 });
 
 test('an inline file too large for the recipient count keeps Send disabled', async () => {
@@ -348,8 +789,89 @@ test('a media file that cannot be read is reported and not attached', async () =
     pickMedia(container, new window.File(['x'], 'broken.png', { type: 'image/png' }));
 
     await rtl.screen.findByText('File read failed');
-    assert.equal(rtl.screen.queryByText('broken.png'), null);
+    assert.equal(rtl.screen.queryByText('broken.png') === null, true);
   } finally {
     globalThis.FileReader.prototype.readAsDataURL = readAsDataURL;
   }
+});
+
+function renderTesterAsWriter(): void {
+  window.sessionStorage.setItem('openwa_user_role', 'admin');
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1_000 } } });
+  rtl.render(
+    createElement(QueryClientProvider, { client }, createElement(RoleProvider, null, createElement(MessageTester))),
+  );
+}
+
+test('a failed sessions read is reported, not shown as "no ready sessions"', async () => {
+  globalThis.fetch = ((): Promise<Response> =>
+    Promise.resolve(jsonResponse({ message: 'gateway restarting' }, 502))) as typeof fetch;
+  renderTesterAsWriter();
+
+  const alert = await rtl.screen.findByRole('alert');
+  rtl.within(alert).getByText(/Failed to load data/);
+  rtl.within(alert).getByText(/gateway restarting/);
+  assert.equal(rtl.screen.queryByRole('option', { name: 'No ready sessions' }) === null, true);
+});
+
+test('a failed groups read is reported, not shown as "no groups found"', async () => {
+  globalThis.fetch = ((input: RequestInfo | URL): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url.endsWith('/sessions')) {
+      return Promise.resolve(jsonResponse([{ id: 's1', name: 'Main', status: 'ready', phone: '15550000000' }]));
+    }
+    if (url.endsWith('/sessions/s1/groups')) return Promise.resolve(jsonResponse({ message: 'engine busy' }, 500));
+    return Promise.resolve(jsonResponse([]));
+  }) as typeof fetch;
+  renderTesterAsWriter();
+  await rtl.screen.findByRole('option', { name: /Main/ });
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Group' }));
+
+  const alert = await rtl.screen.findByRole('alert');
+  rtl.within(alert).getByText(/Failed to load data/);
+  assert.equal(rtl.screen.queryByText('No groups found') === null, true);
+});
+
+test('Send stays disabled while a batch cancel is in flight, so its answer cannot land on a newer batch', async () => {
+  const progress = { total: 1, sent: 0, failed: 0, pending: 1, cancelled: 0 };
+  let answerCancel: (response: Response) => void = () => {};
+  globalThis.fetch = ((input: RequestInfo | URL): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url.endsWith('/sessions')) {
+      return Promise.resolve(jsonResponse([{ id: 's1', name: 'Main', status: 'ready', phone: '15550000000' }]));
+    }
+    if (url.endsWith('/messages/send-bulk')) {
+      return Promise.resolve(jsonResponse({ batchId: 'b1', status: 'pending', totalMessages: 1 }, 202));
+    }
+    if (url.endsWith('/messages/batch/b1/cancel')) {
+      return new Promise<Response>(resolve => {
+        answerCancel = resolve;
+      });
+    }
+    if (url.endsWith('/messages/batch/b1')) {
+      return Promise.resolve(jsonResponse({ batchId: 'b1', status: 'processing', progress, results: [] }));
+    }
+    return Promise.resolve(jsonResponse([]));
+  }) as typeof fetch;
+  const container = await renderBulkAsWriter();
+  type(container, '#mt-11', '15550000001');
+  rtl.fireEvent.change(rtl.screen.getByPlaceholderText('Enter your message here...'), { target: { value: 'hi' } });
+  await rtl.waitFor(() => assert.equal(sendButton().disabled, false));
+  rtl.fireEvent.click(sendButton());
+  rtl.fireEvent.click(await rtl.screen.findByRole('button', { name: 'Cancel Batch' }));
+  await rtl.screen.findByRole('button', { name: 'Cancelling...' });
+
+  assert.equal(sendButton().disabled, true, 'a new batch could start while the cancel was unanswered');
+  await rtl.act(async () => {
+    answerCancel(
+      jsonResponse({
+        batchId: 'b1',
+        status: 'cancelled',
+        progress: { ...progress, pending: 0, cancelled: 1 },
+        results: [],
+      }),
+    );
+    await new Promise(resolve => setTimeout(resolve, 20));
+  });
+  assert.equal(sendButton().disabled, false);
 });

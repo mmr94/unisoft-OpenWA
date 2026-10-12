@@ -10,6 +10,9 @@ import request from 'supertest';
 import type { App } from 'supertest/types';
 import { AppModule } from '../src/app.module';
 import { applyGlobalValidation } from '../src/config/app-validation';
+import { AuthService } from '../src/modules/auth/auth.service';
+import { ApiKeyRole } from '../src/modules/auth/entities/api-key.entity';
+import { SessionService } from '../src/modules/session/session.service';
 
 // --- MCP protocol helpers ---
 
@@ -52,6 +55,16 @@ function parseMcpResponse(res: { body: unknown; text: string }): Record<string, 
 
 describe('MCP server (e2e)', () => {
   let app: INestApplication<App>;
+  let viewerKey: string;
+  let chatKey: string;
+  let ipKey: string;
+  const scopedSession = '11111111-1111-4111-8111-111111111111';
+  const initialize = () =>
+    jsonRpcRequest('initialize', {
+      protocolVersion: '2025-11-25',
+      capabilities: {},
+      clientInfo: { name: 'test-client', version: '0.0.1' },
+    });
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -61,6 +74,19 @@ describe('MCP server (e2e)', () => {
     app = moduleFixture.createNestApplication();
     applyGlobalValidation(app);
     await app.init();
+
+    const authService = app.get(AuthService);
+    viewerKey = (await authService.createApiKey({ name: 'e2e-mcp-viewer', role: ApiKeyRole.VIEWER })).rawKey;
+    chatKey = (
+      await authService.createApiKey({
+        name: 'e2e-mcp-chat',
+        role: ApiKeyRole.VIEWER,
+        allowedSessions: [scopedSession],
+        allowedChats: ['628123@c.us'],
+      })
+    ).rawKey;
+    ipKey = (await authService.createApiKey({ name: 'e2e-mcp-ip', role: ApiKeyRole.VIEWER, allowedIps: ['127.0.0.1'] }))
+      .rawKey;
   }, 30_000);
 
   afterAll(async () => {
@@ -72,19 +98,14 @@ describe('MCP server (e2e)', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 1. MCP endpoint is reachable — initialize succeeds
+  // 1. MCP endpoint is reachable with a key: initialize succeeds
   // ---------------------------------------------------------------------------
   it('POST /mcp with initialize request responds with 200', async () => {
     const res = await request(app.getHttpServer())
       .post('/mcp')
       .set(MCP_HEADERS)
-      .send(
-        jsonRpcRequest('initialize', {
-          protocolVersion: '2025-11-25',
-          capabilities: {},
-          clientInfo: { name: 'test-client', version: '0.0.1' },
-        }),
-      );
+      .set('X-API-Key', viewerKey)
+      .send(initialize());
 
     expect([200, 202]).toContain(res.status);
   });
@@ -93,7 +114,11 @@ describe('MCP server (e2e)', () => {
   // 2. tools/list returns the tool catalogue with known names
   // ---------------------------------------------------------------------------
   it('tools/list returns the tool catalogue', async () => {
-    const res = await request(app.getHttpServer()).post('/mcp').set(MCP_HEADERS).send(jsonRpcRequest('tools/list'));
+    const res = await request(app.getHttpServer())
+      .post('/mcp')
+      .set(MCP_HEADERS)
+      .set('Authorization', `Bearer ${viewerKey}`)
+      .send(jsonRpcRequest('tools/list'));
 
     expect(res.status).toBe(200);
     const body = parseMcpResponse(res);
@@ -108,30 +133,124 @@ describe('MCP server (e2e)', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 3. tools/call without API key returns an error tool result
-  //    (auth is protocol-level: tool errors surface as isError=true, not HTTP 401)
+  // 3. Every request needs a valid key: nothing is answered before it
   // ---------------------------------------------------------------------------
-  it('tools/call without API key returns isError tool result', async () => {
+  it('initialize without a key answers 401 and discloses no server info', async () => {
+    const res = await request(app.getHttpServer()).post('/mcp').set(MCP_HEADERS).send(initialize());
+
+    expect(res.status).toBe(401);
+    expect(res.headers['www-authenticate']).toBe('Bearer');
+    expect(res.body).toEqual({ jsonrpc: '2.0', error: { code: -32000, message: 'Missing API key' }, id: null });
+    expect(res.text).not.toContain('serverInfo');
+  });
+
+  it('tools/list with an unknown key answers 401 and lists no tools', async () => {
     const res = await request(app.getHttpServer())
       .post('/mcp')
       .set(MCP_HEADERS)
-      .send(
-        jsonRpcRequest('tools/call', {
-          name: 'SessionFindAll',
-          arguments: {},
-        }),
-      );
+      .set('X-API-Key', 'owa_k1_not-a-real-key')
+      .send(jsonRpcRequest('tools/list'));
+
+    expect(res.status).toBe(401);
+    expect(res.text).not.toContain('SessionFindAll');
+  });
+
+  it('tools/call without a key answers 401', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/mcp')
+      .set(MCP_HEADERS)
+      .send(jsonRpcRequest('tools/call', { name: 'SessionFindAll', arguments: {} }));
+
+    expect(res.status).toBe(401);
+  });
+
+  it('refuses a key with an IP allow-list at the gate, as every MCP tool call does', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/mcp')
+      .set(MCP_HEADERS)
+      .set('X-API-Key', ipKey)
+      .send(jsonRpcRequest('tools/list'));
+
+    expect(res.status).toBe(403);
+    expect(res.headers['www-authenticate']).toBeUndefined();
+  });
+
+  // Role, session and chat scope stay per tool call, answered in-band once the key passes the gate.
+  it('a chat-restricted key passes the gate and is refused in-band by the tool call', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/mcp')
+      .set(MCP_HEADERS)
+      .set('X-API-Key', chatKey)
+      .send(jsonRpcRequest('tools/call', { name: 'SessionFindAll', arguments: {} }));
 
     expect(res.status).toBe(200);
-    const body = parseMcpResponse(res);
-    // The tool handler catches UnauthorizedException and routes through handleToolError,
-    // returning a tool result with isError=true.
-    const result = body.result as Record<string, unknown> | undefined;
+    const result = parseMcpResponse(res).result as Record<string, unknown> | undefined;
     expect(result?.isError).toBe(true);
     const content = result?.content as Array<{ type: string; text?: string }> | undefined;
-    expect(Array.isArray(content)).toBe(true);
-    const text = content?.find(c => c.type === 'text')?.text ?? '';
-    expect(text).toMatch(/unauthorized|missing api key/i);
+    expect(content?.find(c => c.type === 'text')?.text ?? '').toMatch(/restricted to selected chats/i);
+  });
+
+  it('a chat-restricted key receives only allowed chats before pagination', async () => {
+    const list = jest
+      .spyOn(app.get(SessionService), 'listChats')
+      .mockResolvedValue([{ id: 'other@c.us' }, { id: '628123@c.us' }] as Awaited<
+        ReturnType<SessionService['listChats']>
+      >);
+    try {
+      const res = await request(app.getHttpServer())
+        .post('/mcp')
+        .set(MCP_HEADERS)
+        .set('X-API-Key', chatKey)
+        .send(
+          jsonRpcRequest('tools/call', { name: 'SessionGetChats', arguments: { sessionId: scopedSession, limit: 1 } }),
+        );
+      expect(res.status).toBe(200);
+      const result = parseMcpResponse(res).result as { isError?: boolean; content: Array<{ text: string }> };
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(result.content[0].text)).toEqual([{ id: '628123@c.us' }]);
+      expect(list).toHaveBeenCalledWith(scopedSession);
+    } finally {
+      list.mockRestore();
+    }
+  });
+
+  it('a chat-restricted key cannot read history from another chat', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/mcp')
+      .set(MCP_HEADERS)
+      .set('X-API-Key', chatKey)
+      .send(
+        jsonRpcRequest('tools/call', {
+          name: 'MessageHistory',
+          arguments: { sessionId: scopedSession, chatId: 'other@c.us' },
+        }),
+      );
+    expect(res.status).toBe(200);
+    const result = parseMcpResponse(res).result as { isError?: boolean; content: Array<{ text: string }> };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('API key not authorized for this chat');
+  });
+
+  it('chat filtering retains the session fence', async () => {
+    const list = jest.spyOn(app.get(SessionService), 'listChats');
+    try {
+      const res = await request(app.getHttpServer())
+        .post('/mcp')
+        .set(MCP_HEADERS)
+        .set('X-API-Key', chatKey)
+        .send(
+          jsonRpcRequest('tools/call', {
+            name: 'SessionGetChats',
+            arguments: { sessionId: '22222222-2222-4222-8222-222222222222' },
+          }),
+        );
+      expect(res.status).toBe(200);
+      const result = parseMcpResponse(res).result as { isError?: boolean };
+      expect(result.isError).toBe(true);
+      expect(list).not.toHaveBeenCalled();
+    } finally {
+      list.mockRestore();
+    }
   });
 
   // ---------------------------------------------------------------------------
@@ -141,9 +260,26 @@ describe('MCP server (e2e)', () => {
     const res = await request(app.getHttpServer())
       .post('/mcp')
       .set({ 'Content-Type': 'text/plain', Accept: 'application/json, text/event-stream' })
+      .set('X-API-Key', viewerKey)
       .send('{}');
 
     expect(res.status).toBe(415);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 4b. GET / DELETE: the stateless transport offers no SSE stream and no session,
+  //     so both answer 405 (an SDK client treats anything else as an error)
+  // ---------------------------------------------------------------------------
+  it('GET and DELETE /mcp answer 405 with Allow: POST', async () => {
+    const server = app.getHttpServer();
+    const get = await request(server).get('/mcp').set('Accept', 'text/event-stream');
+    expect(get.status).toBe(405);
+    expect(get.headers['allow']).toBe('POST');
+    expect(get.body).toEqual({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed.' }, id: null });
+
+    const del = await request(server).delete('/mcp');
+    expect(del.status).toBe(405);
+    expect(del.headers['allow']).toBe('POST');
   });
 
   // ---------------------------------------------------------------------------

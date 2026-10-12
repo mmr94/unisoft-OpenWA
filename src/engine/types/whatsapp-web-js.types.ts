@@ -45,6 +45,8 @@ export interface GroupMetadataRaw {
   restrict?: boolean;
   /** Disappearing-messages timer in seconds, when WA Web reports one on the group model. */
   ephemeralDuration?: number;
+  /** Unix seconds the group was created (WA Web group model). */
+  creation?: number;
   /**
    * Who may add participants. Typed loosely on purpose: whatsapp-web.js declares this `boolean`
    * (index.d.ts:890, documented as "true = only admins") but actually writes WhatsApp's raw strings
@@ -66,9 +68,7 @@ export interface GroupChat extends Omit<Chat, 'isReadOnly' | 'getLabels'> {
   }>;
   description?: string;
   owner?: { _serialized: string };
-  createdAt?: number;
   isReadOnly?: boolean;
-  isAnnounce?: boolean;
   groupMetadata?: GroupMetadataRaw;
   addParticipants(
     ids: string[],
@@ -121,14 +121,12 @@ export interface BusinessClient extends Omit<
   | 'subscribeToChannel'
   | 'unsubscribeFromChannel'
   | 'getLabels'
-  | 'getLabelById'
   | 'getChannels'
   | 'getChatsByLabelId'
   | 'createChannel'
   | 'deleteChannel'
 > {
   getLabels(): Promise<Array<{ id: string; name: string; hexColor: string }>>;
-  getLabelById(id: string): Promise<{ id: string; name: string; hexColor: string } | null>;
   /** Chats carrying a label. whatsapp-web.js has the read but exposes no label create/update/delete. */
   getChatsByLabelId(labelId: string): Promise<
     Array<
@@ -142,6 +140,7 @@ export interface BusinessClient extends Omit<
           pinned?: boolean;
           isMuted?: boolean;
           muteExpiration?: number;
+          lastMessage?: { type: string };
         }
       | undefined
     >

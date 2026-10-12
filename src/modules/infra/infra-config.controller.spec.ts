@@ -30,6 +30,16 @@ import { SaveConfigDto } from './dto/save-config.dto';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { recordOsEnvKeys, recordPinnedEnvKeys } from '../../config/env-precedence';
 
+// With no boot snapshot every process.env key counts as host-supplied, so a shell exporting the
+// CI Postgres or compose Redis settings would otherwise feed the save guard and the pin checks.
+// Scrub the infrastructure keys for the whole file; tests that need a host value set it themselves.
+const HOST_ENV = Object.keys(process.env).filter(k =>
+  /^(DATABASE_|POSTGRES_|REDIS_|STORAGE_|S3_|MINIO_|QUEUE_|PUPPETEER_|ENGINE_TYPE$|SESSION_DATA_PATH$)/.test(k),
+);
+const hostEnvSaved = HOST_ENV.map(k => [k, process.env[k]] as const);
+beforeAll(() => HOST_ENV.forEach(k => delete process.env[k]));
+afterAll(() => hostEnvSaved.forEach(([k, v]) => (process.env[k] = v)));
+
 describe('InfraConfigController.saveConfig SSL reject-unauthorized', () => {
   function writtenEnv(config: unknown): string {
     const spy = jest.spyOn(fs, 'writeFileSync').mockImplementation(() => undefined);
@@ -90,6 +100,25 @@ describe('InfraConfigController PostgreSQL schema (POSTGRES_SCHEMA)', () => {
       'DATABASE_TYPE=postgres\nPOSTGRES_SCHEMA=openwa\n',
     );
     expect(preserved).toContain('POSTGRES_SCHEMA=openwa');
+  });
+
+  it('refuses a schema the next boot would reject instead of writing it', () => {
+    (fs.writeFileSync as jest.Mock).mockClear();
+    for (const schema of ['OpenWA', 'pg_data', 'bad-name']) {
+      expect(() =>
+        newController().saveConfig({
+          database: { type: 'postgres', builtIn: false, host: 'db', schema, password: 'unit-test-pw' },
+        } as never),
+      ).toThrow(BadRequestException);
+    }
+    expect(fs.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it('still writes the public default for an empty schema', () => {
+    const env = written({
+      database: { type: 'postgres', builtIn: false, host: 'db', schema: '', password: 'unit-test-pw' },
+    });
+    expect(env).toContain('POSTGRES_SCHEMA=public');
   });
 
   it('pins POSTGRES_SCHEMA=public for the built-in Postgres container', () => {
@@ -238,6 +267,76 @@ describe('InfraConfigController.saveConfig rejects values that would inject extr
 
     expect(result.saved).toBe(true);
     expect(fs.writeFileSync as jest.Mock).toHaveBeenCalled();
+  });
+});
+
+describe('InfraConfigController.saveConfig writes values the next boot reads back unchanged', () => {
+  const newController = () => new InfraConfigController({} as never, {} as never, {} as never);
+
+  function savedPassword(password: string): { line: string | undefined; parsed: string | undefined } {
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.writeFileSync as jest.Mock).mockClear();
+    newController().saveConfig({ database: { type: 'postgres', builtIn: false, host: 'db', password } } as never);
+    const content = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
+    return {
+      line: content.split('\n').find(l => l.startsWith('DATABASE_PASSWORD=')),
+      parsed: jest.requireActual<typeof import('dotenv')>('dotenv').parse(content).DATABASE_PASSWORD,
+    };
+  }
+
+  // dotenv reads an unquoted `#` as a comment and trims outer quotes and whitespace, so a raw
+  // `KEY=value` line would boot with a different secret than the one saved.
+  it.each(['S3cr#tPass', ' spaced ', "'quoted'", '"dq"', 'p\\nq', `it's#`, `a'b"c#`])(
+    'round-trips %j through dotenv',
+    password => {
+      expect(savedPassword(password).parsed).toBe(password);
+    },
+  );
+
+  it('keeps a value that needs no quoting bare', () => {
+    expect(savedPassword('Str0ng!Passw0rd').line).toBe('DATABASE_PASSWORD=Str0ng!Passw0rd');
+  });
+
+  // Each line reads back on its own, but the next boot parses the whole file, where a quote one value
+  // leaves open can run on to a later line that holds the same quote character.
+  function savedFile(databasePassword: string, redisPassword: string): string {
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.writeFileSync as jest.Mock).mockClear();
+    newController().saveConfig({
+      database: { type: 'postgres', builtIn: false, host: 'db', password: databasePassword },
+      redis: { enabled: true, builtIn: false, host: 'cache', password: redisPassword },
+    } as never);
+    return ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
+  }
+
+  it('keeps every key intact when a value opens a quote that a later line closes', () => {
+    const dotenv = jest.requireActual<typeof import('dotenv')>('dotenv');
+    const content = savedFile('"x7Kp', 'ab"#cd');
+    const whole = dotenv.parse(content);
+    const lineByLine = Object.assign({}, ...content.split('\n').map(line => dotenv.parse(line))) as Record<
+      string,
+      string
+    >;
+
+    expect(whole).toEqual(lineByLine);
+    expect(whole).toMatchObject({ DATABASE_TYPE: 'postgres', DATABASE_PASSWORD: '"x7Kp', REDIS_PASSWORD: 'ab"#cd' });
+  });
+
+  it('refuses a quoted value that a later line would extend, writing nothing', () => {
+    // `#x\` needs quoting, and its `\'` escapes the closing quote once a later line holds a `'#`.
+    expect(() => savedFile('#x\\', `a'#b`)).toThrow(/DATABASE_PASSWORD/);
+    expect(fs.writeFileSync as jest.Mock).not.toHaveBeenCalled();
+  });
+
+  it('refuses a value no dotenv form can carry, writing nothing', () => {
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.writeFileSync as jest.Mock).mockClear();
+    expect(() =>
+      newController().saveConfig({
+        database: { type: 'postgres', builtIn: false, host: 'db', password: `a'b"c\`d#` },
+      } as never),
+    ).toThrow(BadRequestException);
+    expect(fs.writeFileSync as jest.Mock).not.toHaveBeenCalled();
   });
 });
 
@@ -734,7 +833,7 @@ describe('InfraConfigController.saveConfig built-in/external mode flips and the 
         },
       },
       BUILTIN_MINIO_ENV,
-      /S3_ACCESS_KEY, S3_SECRET_KEY/,
+      /S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY/,
     );
   });
 
@@ -751,7 +850,7 @@ describe('InfraConfigController.saveConfig built-in/external mode flips and the 
         },
       },
       undefined,
-      /S3_ACCESS_KEY, S3_SECRET_KEY/,
+      /S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY/,
     );
   });
 
@@ -842,6 +941,8 @@ describe('InfraConfigController.saveConfig built-in/external mode flips and the 
       'STORAGE_TYPE',
       'S3_ACCESS_KEY_ID',
       'S3_SECRET_ACCESS_KEY',
+      'S3_ACCESS_KEY',
+      'S3_SECRET_KEY',
       'S3_ENDPOINT',
       'MINIO_BUILTIN',
       'REDIS_PASSWORD',
@@ -899,6 +1000,17 @@ describe('InfraConfigController.saveConfig built-in/external mode flips and the 
       );
     });
 
+    it('accepts external S3 credentials supplied under the legacy names boot still reads', () => {
+      // main.ts and storage.service fall back to S3_ACCESS_KEY / S3_SECRET_KEY when the canonical
+      // names are unset, so a deployment configured that way boots and must be able to save.
+      process.env.STORAGE_TYPE = 's3';
+      process.env.S3_ENDPOINT = 'https://s3.example.com';
+      process.env.S3_ACCESS_KEY = 'AKIAEXAMPLESTRONG1';
+      process.env.S3_SECRET_KEY = 'Sup3rSecretS3Key!';
+      const env = written({ queue: { enabled: false } });
+      expect(env).toContain('QUEUE_ENABLED=false');
+    });
+
     // The cases above delete every guard key from process.env, which cannot happen in production:
     // load-env merges data/.env.generated INTO process.env at boot, so the file's own values are
     // sitting there while this save runs. Reading them back as if they were an orchestrator
@@ -934,6 +1046,60 @@ describe('InfraConfigController.saveConfig built-in/external mode flips and the 
           BUILTIN_POSTGRES_ENV,
         );
         expect(env).toContain('DATABASE_HOST=db.example.com');
+      });
+
+      it('honors a value from the project .env, which also outranks the saved file at boot', () => {
+        // load-env takes the host snapshot before ./.env loads, but ./.env still loads ahead of
+        // data/.env.generated with override:false, so its password is the one the next boot sees.
+        recordOsEnvKeys({});
+        recordPinnedEnvKeys({ DATABASE_PASSWORD: 'Sup3rSecret!' });
+        process.env.DATABASE_PASSWORD = 'Sup3rSecret!';
+        try {
+          const env = written(
+            {
+              database: {
+                type: 'postgres',
+                builtIn: false,
+                host: 'db.example.com',
+                username: 'app',
+                database: 'appdb',
+                password: '',
+              },
+            },
+            'DATABASE_TYPE=postgres\nPOSTGRES_BUILTIN=false\nDATABASE_HOST=db.example.com\n',
+          );
+          expect(env).toContain('DATABASE_HOST=db.example.com');
+        } finally {
+          recordPinnedEnvKeys({});
+        }
+      });
+
+      it('a blank project .env line keeps the key blank at boot, so fresh S3 keys cannot satisfy the guard', () => {
+        // clearBlankEnv runs on the host env before either snapshot, so a pinned blank can only be a
+        // `KEY=` line in ./.env. dotenv keeps it, data/.env.generated cannot fill it, and the next
+        // production boot refuses the empty credentials: the save must be refused the same way.
+        recordOsEnvKeys({});
+        recordPinnedEnvKeys({ S3_ACCESS_KEY_ID: '', S3_SECRET_ACCESS_KEY: '' });
+        process.env.S3_ACCESS_KEY_ID = '';
+        process.env.S3_SECRET_ACCESS_KEY = '';
+        try {
+          expectRejected(
+            {
+              storage: {
+                type: 's3',
+                builtIn: false,
+                s3Bucket: 'b',
+                s3AccessKey: 'AKIAEXAMPLESTRONG1',
+                s3SecretKey: 'Sup3rSecretS3Key!',
+                s3Endpoint: 'https://s3.example.com',
+              },
+            },
+            'STORAGE_TYPE=local\n',
+            /S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY/,
+          );
+        } finally {
+          recordPinnedEnvKeys({});
+        }
       });
     });
   });
@@ -1005,6 +1171,21 @@ describe('InfraConfigController.getConfig (#226)', () => {
     expect(JSON.stringify(cfg)).not.toContain('secret');
     expect(JSON.stringify(cfg)).not.toContain('"ak"');
   });
+
+  it('reports S3 credentials set under the legacy names the runtime still reads', () => {
+    recordPinnedEnvKeys({ S3_ACCESS_KEY: 'ak', S3_SECRET_KEY: 'sk' });
+    process.env.S3_ACCESS_KEY = 'ak';
+    process.env.S3_SECRET_KEY = 'sk';
+    try {
+      expect(
+        new InfraConfigController({} as never, {} as never, {} as never).getConfig().storage.s3CredentialsSet,
+      ).toBe(true);
+    } finally {
+      delete process.env.S3_ACCESS_KEY;
+      delete process.env.S3_SECRET_KEY;
+      recordPinnedEnvKeys({});
+    }
+  });
 });
 
 describe('InfraConfigController.getConfig reflects environment-pinned values (#1313)', () => {
@@ -1023,9 +1204,9 @@ describe('InfraConfigController.getConfig reflects environment-pinned values (#1
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
-    // Restore the permissive snapshot the rest of the file assumes (no snapshot = isEnvPinned
-    // false everywhere, which is what the other describes rely on).
-    recordPinnedEnvKeys(process.env);
+    // Restore the permissive snapshot the rest of the file assumes (an empty one, like no snapshot,
+    // leaves isEnvPinned false everywhere, which is what the other describes rely on).
+    recordPinnedEnvKeys({});
   });
 
   it('reports host-provided engine/database/redis values over the first-run file defaults', () => {
@@ -1063,15 +1244,16 @@ describe('InfraConfigController.getConfig reflects environment-pinned values (#1
     (fs.readFileSync as jest.Mock).mockReturnValue('');
   });
 
-  it('a blank pinned forward counts as unset, so the file value applies', () => {
-    // Compose renders `- KEY=${KEY:-}` as an empty value when the operator set nothing; boot's
-    // clearBlankEnv treats it as unset, and the read must agree or the blank would shadow the file.
+  it('a blank pinned value hides the file value, as it does at boot', () => {
+    // clearBlankEnv runs on the host env before the snapshot, so a pinned blank can only be an
+    // `ENGINE_TYPE=` line in ./.env. dotenv keeps it and data/.env.generated cannot fill it, so the
+    // runtime falls back to the default engine and the form must report that, not the file value.
     recordPinnedEnvKeys({ ENGINE_TYPE: '' });
     process.env.ENGINE_TYPE = '';
     (fs.existsSync as jest.Mock).mockReturnValue(true);
     (fs.readFileSync as jest.Mock).mockReturnValue('ENGINE_TYPE=baileys\n');
 
-    expect(newController().getConfig().engine.type).toBe('baileys');
+    expect(newController().getConfig().engine.type).toBe('whatsapp-web.js');
 
     (fs.existsSync as jest.Mock).mockReturnValue(false);
     (fs.readFileSync as jest.Mock).mockReturnValue('');
@@ -1137,6 +1319,62 @@ describe('InfraConfigController.requestRestart constrains teardown to managed pr
       errors: ['Failed to stop redis'],
     });
     expect(JSON.stringify(result.removal)).not.toContain('removed');
+  });
+
+  describe('a service the environment pins the app to', () => {
+    const KEYS = ['DATABASE_HOST', 'REDIS_HOST', 'S3_ENDPOINT'];
+    let savedEnv: Array<[string, string | undefined]>;
+
+    beforeEach(() => {
+      savedEnv = KEYS.map(k => [k, process.env[k]]);
+    });
+    afterEach(() => {
+      for (const [k, v] of savedEnv) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      // Back to the no-snapshot default the rest of the file assumes (an empty snapshot pins nothing).
+      recordPinnedEnvKeys({});
+    });
+
+    it('is never stopped, since the restarted app would still point at it', async () => {
+      // The documented manual built-in Postgres setup: DATABASE_HOST=postgres in .env or on the host.
+      process.env.DATABASE_HOST = 'postgres';
+      process.env.REDIS_HOST = 'redis';
+      process.env.S3_ENDPOINT = 'http://minio:9000';
+      recordPinnedEnvKeys(process.env);
+      const stopManagedService = jest.fn().mockResolvedValue(true);
+      const controller = buildController({
+        isDockerAvailable: () => true,
+        stopManagedService,
+        orchestrateProfiles: jest.fn().mockResolvedValue({}),
+      });
+
+      const result = await controller.requestRestart({ profilesToRemove: ['postgres', 'redis', 'minio'] });
+
+      expect(stopManagedService).not.toHaveBeenCalled();
+      expect(result.profilesToRemove).toEqual([]);
+    });
+
+    it('is still stopped when the pin names a different host', async () => {
+      process.env.DATABASE_HOST = 'db.example.internal';
+      delete process.env.REDIS_HOST;
+      delete process.env.S3_ENDPOINT;
+      recordPinnedEnvKeys(process.env);
+      const stopManagedService = jest.fn().mockResolvedValue(true);
+      const controller = buildController({
+        isDockerAvailable: () => true,
+        stopManagedService,
+        orchestrateProfiles: jest.fn().mockResolvedValue({}),
+      });
+
+      await controller.requestRestart({ profilesToRemove: ['postgres', 'redis'] });
+
+      expect(stopManagedService.mock.calls.map(call => String((call as unknown[])[0])).sort()).toEqual([
+        'postgres',
+        'redis',
+      ]);
+    });
   });
 
   it('starts only allowlisted profiles, never an unknown entry (symmetry with teardown)', async () => {

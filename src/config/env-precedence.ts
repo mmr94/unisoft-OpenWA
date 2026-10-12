@@ -36,6 +36,7 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'MEDIA_DOWNLOAD_MAX_BYTES',
   'MEDIA_DOWNLOAD_TIMEOUT_MS',
   'INBOUND_MEDIA_CONCURRENCY',
+  'INBOUND_MEDIA_GLOBAL_CONCURRENCY',
   // Whether a caller-supplied URL is fetched through the named session's egress proxy.
   'SESSION_PROXY_URL_FETCH',
   // Database selection + connection details (#488)
@@ -47,10 +48,14 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'DATABASE_PASSWORD',
   // PostgreSQL schema (dashboard-managed + compose blank-forwarded, like the other DATABASE_* keys)
   'POSTGRES_SCHEMA',
+  // PostgreSQL TLS, same arrangement: a blank forward must not pin a dashboard-saved value off.
+  'DATABASE_SSL',
+  'DATABASE_SSL_REJECT_UNAUTHORIZED',
   // Storage selection + S3 details (#488)
   'STORAGE_TYPE',
   'STORAGE_LOCAL_PATH',
   'S3_BUCKET',
+  'S3_KEY_PREFIX',
   'S3_ENDPOINT',
   'S3_REGION',
   'S3_ACCESS_KEY_ID',
@@ -65,6 +70,7 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'CHAT_MEDIA_ARCHIVE_OUTBOUND',
   'CHAT_MEDIA_ARCHIVE_MAX_BYTES',
   'CHAT_MEDIA_ARCHIVE_TTL_DAYS',
+  'MESSAGE_INLINE_MEDIA',
   'CHAT_MEDIA_ORPHAN_SWEEP_INTERVAL_MS',
   'CHAT_MEDIA_ORPHAN_GRACE_MS',
   // Send pacing. Blank-forwarded by compose like the chat-media keys, so an operator who sets
@@ -168,7 +174,9 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'WEBHOOK_MAX_PAYLOAD_BYTES',
   'WEBHOOK_MAX_PER_SESSION',
   'WEBHOOK_FAILURE_RETENTION_DAYS',
+  'WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS',
   'WEBHOOK_WORKER_CONCURRENCY',
+  'WEBHOOK_DEGRADED_SESSION_CONCURRENCY',
   'INGRESS_INSTANCE_LIMIT',
   'INGRESS_INSTANCE_TTL',
   'INGRESS_IP_LIMIT',
@@ -201,6 +209,8 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'REDIS_USERNAME',
   'REDIS_PASSWORD',
   'REDIS_CONNECT_TIMEOUT_MS',
+  'REDIS_TLS',
+  'REDIS_CACHE_DB',
   'MAX_CONCURRENT_SESSIONS',
   'BAILEYS_AUTH_DIR',
   'BAILEYS_BROWSER_NAME',
@@ -220,6 +230,7 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'STORAGE_LIST_MAX_FILES',
   'STORAGE_IMPORT_MAX_BYTES',
   'STORAGE_IMPORT_MAX_ENTRIES',
+  'STORAGE_IMPORT_MAX_TOTAL_BYTES',
   'STORAGE_EXPORT_TTL_MS',
   'STORAGE_EXPORT_SWEEP_MAX_AGE_MS',
   'S3_REPROBE_INTERVAL_MS',
@@ -233,6 +244,7 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'PLUGIN_STORAGE_MAX_BYTES',
   'UPDATE_CHECK_ENABLED',
   'AUDIT_RETENTION_DAYS',
+  'MESSAGE_RETENTION_DAYS',
   'BULK_MAX_CONCURRENT_BATCHES',
   'TEMPLATE_RENDER_MAX_CHARS',
   'STATS_CACHE_TTL_MS',
@@ -283,10 +295,10 @@ export function isOsProvidedEnv(key: string): boolean {
  * OR by the project `.env`, both of which load with `override: false` and therefore win over the
  * dashboard-saved file for good.
  *
- * Distinct from `osEnvKeys` on purpose. That snapshot answers "may this value win over the file being
- * WRITTEN?" for the save-config guard, where only a host value counts. This one answers "can the
- * dashboard change this setting at all?", and there a project `.env` pins exactly as hard as an
- * orchestrator variable does.
+ * Distinct from `osEnvKeys` on purpose. That snapshot records what the host supplied; the save-config
+ * guard now reads both snapshots, since the host and the project .env both outrank the file being
+ * WRITTEN. This one answers "can the dashboard change this setting at all?", and there a project
+ * `.env` pins exactly as hard as an orchestrator variable does.
  */
 let pinnedEnvKeys: Set<string> | null = null;
 

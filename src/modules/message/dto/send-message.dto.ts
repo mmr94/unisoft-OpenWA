@@ -5,8 +5,6 @@ import {
   IsNotEmpty,
   IsOptional,
   MaxLength,
-  IsUrl,
-  ValidateIf,
   IsArray,
   ArrayMaxSize,
   IsBoolean,
@@ -15,6 +13,8 @@ import {
 import { Type } from 'class-transformer';
 import { IsMentionWidConstraint } from './is-mention-wid.validator';
 import { ToStrictBoolean } from '../../../common/utils/strict-boolean';
+import { IsMediaUrl } from '../../../common/media/media-url';
+import { stripBase64DataUri } from '../media-cap.util';
 
 export const MENTIONS_DESCRIPTION =
   'WIDs to @mention (e.g. ["62811@c.us"]). The text/caption must also contain the @<number> token.';
@@ -63,6 +63,7 @@ export class CustomLinkPreviewDto {
   @ApiProperty({
     description: 'The URL as it appears in the message text — WhatsApp anchors the preview to it.',
     example: 'https://example.com/launch',
+    maxLength: CUSTOM_PREVIEW_URL_MAX_LENGTH,
   })
   @IsString()
   @IsNotEmpty()
@@ -105,7 +106,13 @@ export class SendTextMessageDto {
   @MaxLength(MESSAGE_TEXT_MAX_LENGTH)
   text!: string;
 
-  @ApiPropertyOptional({ description: MENTIONS_DESCRIPTION, example: ['628123456789@c.us'], type: [String] })
+  @ApiPropertyOptional({
+    description: MENTIONS_DESCRIPTION,
+    example: ['628123456789@c.us'],
+    type: [String],
+    maxItems: MENTIONS_MAX,
+    items: { type: 'string', maxLength: MENTION_WID_MAX_LENGTH },
+  })
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(MENTIONS_MAX)
@@ -193,8 +200,9 @@ export class SendMediaMessageDto {
     example: 'https://example.com/image.jpg',
   })
   @IsOptional()
-  @IsUrl()
-  @ValidateIf((o: SendMediaMessageDto) => !o.base64)
+  // base64 wins when it holds data, so a url next to it is not fetched and not checked; a base64 that
+  // is only a data-URI prefix strips to nothing, and then the url is what gets sent.
+  @IsMediaUrl<SendMediaMessageDto>({ ignoreWhen: o => !!stripBase64DataUri(o.base64) })
   url?: string;
 
   @ApiPropertyOptional({
@@ -202,7 +210,6 @@ export class SendMediaMessageDto {
   })
   @IsOptional()
   @IsString()
-  @ValidateIf((o: SendMediaMessageDto) => !o.url)
   base64?: string;
 
   @ApiPropertyOptional({
@@ -217,6 +224,7 @@ export class SendMediaMessageDto {
     description:
       "Filename for the media. Only rendered on document sends — defaults to 'file' when omitted (a URL-based document send on whatsapp-web.js first derives the URL basename)",
     example: 'image.jpg',
+    maxLength: 255,
   })
   @IsOptional()
   @IsString()
@@ -233,7 +241,13 @@ export class SendMediaMessageDto {
   @MaxLength(1024)
   caption?: string;
 
-  @ApiPropertyOptional({ description: MENTIONS_DESCRIPTION, example: ['628123456789@c.us'], type: [String] })
+  @ApiPropertyOptional({
+    description: MENTIONS_DESCRIPTION,
+    example: ['628123456789@c.us'],
+    type: [String],
+    maxItems: MENTIONS_MAX,
+    items: { type: 'string', maxLength: MENTION_WID_MAX_LENGTH },
+  })
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(MENTIONS_MAX)
@@ -329,14 +343,11 @@ export class MessageResponseDto {
   @ApiProperty({
     description:
       'The message id, assigned when the gateway accepts the message for sending. A 201 here means the ' +
-      'message was handed to the WhatsApp client — it does NOT confirm delivery. WhatsApp does not reject ' +
-      'an unregistered recipient synchronously, so a message to a number that is not on WhatsApp still ' +
-      'returns 201 with a valid messageId; whether it later delivers, stalls, or is reported as an error ' +
-      'reaches you asynchronously, if at all. To confirm a number is on WhatsApp before ' +
-      'sending, use GET /api/sessions/{sessionId}/contacts/check/{number}; track real delivery via the ' +
-      'message `status` field (sent → delivered → read, or failed if WhatsApp reports an error for it). ' +
-      'A message resting at `sent` is not diagnostic on its own: a registered recipient whose device has ' +
-      'not come online since the send stays at `sent` too.',
+      'message was handed to the WhatsApp session; it does not confirm delivery. Baileys checks phone ' +
+      'destinations without a LID mapping and rejects a number reported as unregistered with 400. An ' +
+      'unanswered lookup returns 503 before sending. Known LIDs skip the number check. Track delivery ' +
+      'through the message status (sent, delivered, read, or failed). A message resting at sent can ' +
+      'also belong to a registered recipient whose device is offline.',
     example: 'true_628123456789@c.us_3EB0123456789',
   })
   messageId!: string;

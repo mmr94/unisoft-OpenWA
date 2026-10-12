@@ -1,7 +1,7 @@
-import { Controller, Get, Header, Req } from '@nestjs/common';
+import { Controller, Get, Header, Req, Res } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiSecurity } from '@nestjs/swagger';
 import { SkipThrottle } from '@nestjs/throttler';
-import type { Request } from 'express';
+import type { Request, Response } from 'express';
 import { Public } from '../auth/decorators/auth.decorators';
 import { MetricsService } from './metrics.service';
 import { METRICS_BEARER_SCHEME } from '../../config/swagger.config';
@@ -9,7 +9,8 @@ import { METRICS_BEARER_SCHEME } from '../../config/swagger.config';
 /**
  * Prometheus scrape endpoint. `@Public()` bypasses the API-key guard and
  * `@SkipThrottle()` keeps a scrape interval from eating the rate-limit budget; access is
- * instead gated by METRICS_TOKEN inside the service (disabled-by-default).
+ * instead gated by METRICS_TOKEN inside the service (disabled-by-default), which bounds
+ * failed token attempts per client on its own.
  */
 @ApiTags('metrics')
 @Controller('metrics')
@@ -28,12 +29,14 @@ export class MetricsController {
   })
   @ApiResponse({ status: 401, description: 'METRICS_TOKEN is configured but the bearer is missing or wrong' })
   @ApiResponse({ status: 404, description: 'Metrics endpoint is disabled (METRICS_TOKEN unset)' })
-  @Header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8')
+  @ApiResponse({ status: 429, description: 'Too many failed token attempts from this client; retry after a minute' })
   @Header('Cache-Control', 'no-store')
   // @Req (not @Headers('authorization')) so the OpenAPI op doesn't sprout a spurious required
   // `authorization` header parameter — the bearer is expressed via the security scheme above.
-  async scrape(@Req() req: Request): Promise<string> {
-    this.metricsService.assertScrapeAuthorized(req.headers.authorization);
+  async scrape(@Req() req: Request, @Res({ passthrough: true }) res: Response): Promise<string> {
+    this.metricsService.assertScrapeAuthorized(req.headers.authorization, req);
+    // Set only once authorized: a text/plain type on a refused (JSON) reply makes Nest log a warning.
+    res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
     return this.metricsService.render();
   }
 }

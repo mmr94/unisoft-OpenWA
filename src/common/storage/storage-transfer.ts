@@ -9,6 +9,24 @@ import { LoggerService } from '../services/logger.service';
 const DEFAULT_IMPORT_MAX_BYTES = 200 * 1024 * 1024;
 /** Max number of entries an import archive may contain. Bounds an entry-count DoS. */
 const DEFAULT_IMPORT_MAX_ENTRIES = 100_000;
+/** Cap on the bytes one import extracts in total (10 GiB). The two caps above still allow terabytes. */
+const DEFAULT_IMPORT_MAX_TOTAL_BYTES = 10 * 1024 * 1024 * 1024;
+
+/**
+ * True when a storage read failed because the object is simply not there.
+ *
+ * Both backends must be covered, and they report it differently: the local backend raises a POSIX
+ * `ENOENT` (a `.code`), while S3 raises `NoSuchKey`/`NotFound`, which carries a `.name` and no
+ * `.code` at all; `StorageService.getS3File` rethrows that original error when the local read-through
+ * also misses. Checking only `.code` turns a missing S3 object into a 500 on the one backend where
+ * retention and bucket lifecycle rules make a miss most likely.
+ */
+export function isMissingObjectError(error: unknown): boolean {
+  const e = error as { code?: string; name?: string; $metadata?: { httpStatusCode?: number } };
+  return (
+    e?.code === 'ENOENT' || e?.name === 'NoSuchKey' || e?.name === 'NotFound' || e?.$metadata?.httpStatusCode === 404
+  );
+}
 
 function positiveIntFromEnv(name: string, fallback: number): number {
   const parsed = Number.parseInt(process.env[name] ?? '', 10);
@@ -30,9 +48,11 @@ export interface ExportFileSource {
 
 // Returns the output as soon as the file list is known and fills the archive in the background, one
 // entry at a time: each file is opened only after the previous entry has been written through to the
-// consumer, so memory holds one file's in-flight chunks, not the whole store. A file that cannot be
-// opened is skipped with a warning; a read that fails part-way destroys the output with that error,
-// because its tar header is already written and skipping it would leave a corrupt archive.
+// consumer, so memory holds one file's in-flight chunks, not the whole store. A file deleted since the
+// listing is skipped with a warning. Any other open failure (a throttled or unreachable store) destroys
+// the output, so the export fails instead of reporting success for an archive missing that file; so
+// does a read that fails part-way, because its tar header is already written and skipping it would
+// leave a corrupt archive.
 export async function createExportStream(
   listFiles: () => Promise<string[]>,
   openFile: (filePath: string) => Promise<ExportFileSource>,
@@ -96,15 +116,24 @@ async function appendEntries(
   output: PassThrough,
   logger: LoggerService,
 ): Promise<void> {
+  let exportedBytes = 0;
+  let largest = { file: '', size: 0 };
   for (const file of files) {
     let source: ExportFileSource;
     try {
       source = await openFile(file);
     } catch (error) {
+      // Only a per-object miss is skippable: ENOENT locally, NoSuchKey from S3 (openS3File returns it
+      // once the local fallback also misses). isMissingObjectError also counts any 404, which includes
+      // a bucket that is gone, and skipping that would report a partial archive as a finished export.
+      const { code, name } = error as { code?: string; name?: string };
+      if (code !== 'ENOENT' && name !== 'NoSuchKey') throw error;
       logger.warn(`Failed to export file: ${file}`, { error: String(error) });
       continue;
     }
     const { stream, size } = source;
+    exportedBytes += size ?? 0;
+    if ((size ?? 0) > largest.size) largest = { file, size: size ?? 0 };
     // The output closes early when the archive fails or the consumer goes away: stop reading files.
     // Checked synchronously before waiting, so a 'close' that already fired cannot be missed.
     if (output.destroyed) {
@@ -143,6 +172,26 @@ async function appendEntries(
     archive.abort();
     return;
   }
+  // Same reasoning as the entry-count warning in createExportStream, for the import's total-bytes cap.
+  const localByteCap = positiveIntFromEnv('STORAGE_IMPORT_MAX_TOTAL_BYTES', DEFAULT_IMPORT_MAX_TOTAL_BYTES);
+  const warnAboveBytes = Math.min(localByteCap, DEFAULT_IMPORT_MAX_TOTAL_BYTES);
+  if (exportedBytes > warnAboveBytes) {
+    logger.warn(
+      `Export contains ${exportedBytes} bytes, above the import limit of ${warnAboveBytes} ` +
+        `(this deployment: ${localByteCap}, shipped default: ${DEFAULT_IMPORT_MAX_TOTAL_BYTES}). ` +
+        'Raise STORAGE_IMPORT_MAX_TOTAL_BYTES on the destination before restoring this archive.',
+    );
+  }
+  // And for the per-entry cap: one file above it aborts the whole import.
+  const localEntryCap = positiveIntFromEnv('STORAGE_IMPORT_MAX_BYTES', DEFAULT_IMPORT_MAX_BYTES);
+  const warnAboveEntry = Math.min(localEntryCap, DEFAULT_IMPORT_MAX_BYTES);
+  if (largest.size > warnAboveEntry) {
+    logger.warn(
+      `Export contains ${largest.file} (${largest.size} bytes), above the per-entry import limit of ${warnAboveEntry} ` +
+        `(this deployment: ${localEntryCap}, shipped default: ${DEFAULT_IMPORT_MAX_BYTES}). ` +
+        'Raise STORAGE_IMPORT_MAX_BYTES on the destination before restoring this archive.',
+    );
+  }
   // finalize() rejections also emit via the 'error' handler above; catch the promise so it
   // never surfaces as an unhandled rejection.
   archive.finalize().catch(() => undefined);
@@ -155,24 +204,29 @@ async function appendEntries(
 // Best-effort, NOT atomic: a single bad/traversing entry is skipped and the rest still import, and a
 // resource-cap breach aborts the rest but KEEPS the entries already written (no rollback). Callers
 // re-running an import is safe (putFile overwrites). A staging-dir + atomic promote would make it
-// transactional, but is out of scope here.
+// transactional, but is out of scope here. Resolves with how many entries were written and how many
+// putFile refused, so a caller can tell an import that wrote nothing from an empty archive.
 export async function importFromStream(
   inputStream: Readable,
   putFile: (filePath: string, data: Buffer) => Promise<void>,
   logger: LoggerService,
-): Promise<number> {
+): Promise<{ imported: number; failed: number }> {
   let importedCount = 0;
+  let failedCount = 0;
   let entryCount = 0;
+  let totalBytes = 0;
   const maxEntryBytes = positiveIntFromEnv('STORAGE_IMPORT_MAX_BYTES', DEFAULT_IMPORT_MAX_BYTES);
   const maxEntries = positiveIntFromEnv('STORAGE_IMPORT_MAX_ENTRIES', DEFAULT_IMPORT_MAX_ENTRIES);
+  const maxTotalBytes = positiveIntFromEnv('STORAGE_IMPORT_MAX_TOTAL_BYTES', DEFAULT_IMPORT_MAX_TOTAL_BYTES);
 
   const extract = tar.extract();
   const gunzip = createGunzip();
 
-  return new Promise<number>((resolve, reject) => {
+  return new Promise<{ imported: number; failed: number }>((resolve, reject) => {
     let settled = false;
-    // Abort the whole import: a per-entry overflow or too many entries is a (zip-bomb) attack, not
-    // a per-file skip — tear down the pipeline and reject so nothing further is buffered or written.
+    // Abort the whole import, not just the entry: a cap breach can be a decompression bomb or a store
+    // larger than the configured limit. Tear down the pipeline and reject so nothing further is buffered
+    // or written.
     const fail = (err: Error): void => {
       if (settled) return;
       settled = true;
@@ -180,7 +234,9 @@ export async function importFromStream(
       gunzip.destroy();
       // Destroying the input mid-pipe stops the source; without an error arg it emits no 'error'.
       inputStream.destroy();
-      reject(err);
+      // The counts reached so far ride on the rejection for the caller's audit row. A lower bound: a
+      // putFile already in flight when a gzip or input error lands can still complete afterwards.
+      reject(Object.assign(err, { imported: importedCount, failed: failedCount }));
     };
     // Every stream in the pipeline needs an 'error' listener: an EventEmitter with none CRASHES the
     // process on error. pipe() does not forward errors, so a corrupt gzip (zlib error on gunzip) or
@@ -202,9 +258,20 @@ export async function importFromStream(
       }
       if (++entryCount > maxEntries) {
         stream.resume();
-        fail(new Error(`Import aborted: archive exceeds the ${maxEntries}-entry limit`));
+        fail(new Error(`Import aborted: archive exceeds the ${maxEntries}-entry limit (STORAGE_IMPORT_MAX_ENTRIES)`));
         return;
       }
+      // Only regular files are media. A directory or link entry carries no content, and writing it
+      // through putFile would store an empty file over any existing object with that key.
+      if (header.type !== 'file' && header.type !== 'contiguous-file') {
+        logger.debug(`Skipped ${header.type ?? 'unknown'} entry: ${header.name}`);
+        stream.on('end', () => next());
+        stream.resume();
+        return;
+      }
+      // An archive packed with `tar -C dir .` names every entry `./…`; the export's keys have no such
+      // segment, and on S3 it would become part of the object key.
+      const key = header.name.replace(/^(?:\.\/)+/, '');
 
       const chunks: Buffer[] = [];
       let entryBytes = 0;
@@ -213,10 +280,24 @@ export async function importFromStream(
       stream.on('data', (chunk: Buffer) => {
         if (entryAborted || settled) return;
         entryBytes += chunk.length;
+        totalBytes += chunk.length;
         if (entryBytes > maxEntryBytes) {
           entryAborted = true;
           stream.resume(); // drain the remainder so the source can end
-          fail(new Error(`Import aborted: entry "${header.name}" exceeds the ${maxEntryBytes}-byte per-entry cap`));
+          fail(
+            new Error(
+              `Import aborted: entry "${key}" exceeds the ${maxEntryBytes}-byte per-entry cap (STORAGE_IMPORT_MAX_BYTES)`,
+            ),
+          );
+        } else if (totalBytes > maxTotalBytes) {
+          // The entry that crosses the cap is dropped, so no import writes more than maxTotalBytes.
+          entryAborted = true;
+          stream.resume();
+          fail(
+            new Error(
+              `Import aborted: archive exceeds the ${maxTotalBytes}-byte total cap (STORAGE_IMPORT_MAX_TOTAL_BYTES)`,
+            ),
+          );
         } else {
           chunks.push(chunk);
         }
@@ -225,14 +306,15 @@ export async function importFromStream(
       stream.on('end', () => {
         if (entryAborted || settled) return;
         const data = Buffer.concat(chunks);
-        putFile(header.name, data)
+        putFile(key, data)
           .then(() => {
             importedCount++;
-            logger.debug(`Imported file: ${header.name}`);
+            logger.debug(`Imported file: ${key}`);
             next();
           })
           .catch((error: unknown) => {
-            logger.error(`Failed to import file: ${header.name}`, String(error));
+            failedCount++;
+            logger.error(`Failed to import file: ${key}`, String(error));
             next();
           });
       });
@@ -242,8 +324,8 @@ export async function importFromStream(
     extract.on('finish', () => {
       if (settled) return;
       settled = true;
-      logger.log(`Import completed: ${importedCount} files`);
-      resolve(importedCount);
+      logger.log(`Import completed: ${importedCount} files, ${failedCount} failed`);
+      resolve({ imported: importedCount, failed: failedCount });
     });
 
     extract.on('error', (err: Error) => {

@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto';
+import { throttlerMessage } from '@nestjs/throttler';
 import { safeEqualStr, verifyIngressSignature } from './ingress-signature';
 import { PluginIngressRoute } from '../../core/plugins/plugin.interfaces';
 import { IngressJobData } from '../queue/processors/ingress.processor';
 import type { EngineStatus } from '../../engine/interfaces/whatsapp-engine.interface';
 import { evaluatePreflight } from './ingress-preflight';
 import { renderAck } from './ingress-ack';
+import type { IngressAdmission } from './ingress-instance-limit';
 import { parseBodyLimitBytes } from '../../config/inflight-body-budget';
 import { resolveBodyLimit } from '../../config/bootstrap-security';
 import { createLogger } from '../../common/services/logger.service';
@@ -17,6 +19,11 @@ export interface IngressRequest {
   headers: Record<string, string>; // lower-cased keys
   query: Record<string, string>;
   rawBody: string;
+  /**
+   * A body arrived in a content type no parser captured (only JSON and form bodies are), so `rawBody`
+   * is empty rather than the bytes that were sent.
+   */
+  unparsedBody?: boolean;
 }
 
 export interface ResolvedInstance {
@@ -42,7 +49,13 @@ export interface IngressDeps {
       pluginId: string;
       providerDeliveryId: string;
       route: string;
-      payload: { headers: Record<string, string>; query: Record<string, string>; body: string; rawBody: string };
+      payload: {
+        headers: Record<string, string>;
+        query: Record<string, string>;
+        body: string;
+        rawBody: string;
+        method?: string;
+      };
       payloadHash: string;
       sessionId: string | null;
     }): Promise<boolean>;
@@ -58,13 +71,17 @@ export interface IngressDeps {
   // Optional structured sink for preflight rejections, so operators can audit deliveries that were
   // rejected host-side (and therefore leave no dedup/DLQ row). Absent in pure unit tests.
   log?: (event: string, meta: Record<string, unknown>) => void;
+  // Optional per-instance rate bucket (admitIngressInstance), charged only for a verified delivery.
+  // Absent in pure unit tests: every delivery is admitted and no rate headers are added.
+  admitInstance?: (pluginId: string, instanceId: string) => Promise<IngressAdmission>;
   now: () => number;
 }
 
 /**
  * The fast-ack ingress pipeline. Pure orchestration over injected deps so it is unit-testable without
  * Nest DI: resolve the instance → answer a GET challenge host-side → size cap → verify over the RAW
- * body → dedup (persist-before-ack) → best-effort conversation id → enqueue (or inline) → 202.
+ * body → per-instance rate bucket → dedup (persist-before-ack) → best-effort conversation id →
+ * enqueue (or inline) → 202.
  */
 export class IngressService {
   private readonly logger = createLogger('IngressService');
@@ -108,6 +125,11 @@ export class IngressService {
       return { status: 403, body: 'challenge failed' };
     }
 
+    // Handled as the empty body, it would pass a scheme that signs only a header, and every such delivery
+    // would hash to one dedup key: the first stored without its body, the rest acked and dropped. It
+    // would also slip past the size cap below.
+    if (req.unparsedBody) return { status: 415, body: 'unsupported ingress content type' };
+
     // `n > undefined` is always false, so a manifest that omits maxBodyBytes — or carries a
     // non-numeric or non-positive value — left this check inert: the 413 the published contract
     // promises never fired, and every accepted delivery is persisted with the body stored twice
@@ -141,6 +163,20 @@ export class IngressService {
       instanceId: req.instanceId,
     });
     if (!verdict.ok) return { status: 401, body: verdict.reason ?? 'signature verification failed' };
+
+    // The per-instance bucket is charged here, after verification; everything above is bounded by the
+    // guard's per-client-IP tier.
+    // Before the preflight, so a signed provider hammering a dead session is still bounded.
+    const admission = this.deps.admitInstance ? await this.deps.admitInstance(req.pluginId, req.instanceId) : undefined;
+    if (admission && !admission.ok) {
+      return {
+        status: 429,
+        // The body the global filter writes for a guard's ThrottlerException, so the wire shape is
+        // the same one this route answered with before the charge moved here.
+        body: JSON.stringify({ statusCode: 429, message: throttlerMessage }),
+        headers: { 'content-type': 'application/json', ...admission.headers },
+      };
+    }
 
     // Host-side preflight (e.g. session-alive). AFTER signature verify (so an unauthenticated caller
     // cannot probe liveness) and BEFORE the dedup persist (so a 5xx-rejected delivery never writes a
@@ -176,37 +212,44 @@ export class IngressService {
     const deliveryId = route.dedupOn === 'body' || !headerId ? deriveDeliveryId(req) : headerId;
     // Provider request headers persist with the event (redrive/debugging); credentials must not.
     // Signature headers are re-derivable, auth material is not — redact before the first write.
-    // A shared-secret route carries the instance secret itself in its declared header.
+    // A shared-secret route carries the instance secret itself in its declared header, and an hmac
+    // route's declared header carries a signature that is only useful to re-send the same body.
     const payload = {
       headers: redactSensitiveHeaders(
         req.headers,
-        route.signature.scheme === 'shared-secret' ? route.signature.header : undefined,
+        route.signature.scheme === 'shared-secret' || route.signature.scheme === 'hmac-sha256'
+          ? route.signature.header
+          : undefined,
       ),
       query: req.query,
       body: req.rawBody,
       rawBody: req.rawBody,
     };
-    // Rendered BEFORE the dedup check so a provider retry gets the byte-identical ack rather than a
-    // second contract on the same route. The ctx is the request in hand (rawBody, deliveryId, now),
-    // never stored state, which is what makes rendering it on a dedup hit sound: an ack field that had
-    // to reflect the PERSISTED row would echo the retry's values as the original's. Keep it that way.
-    const ack = renderAck(route.response?.ack, {
+    // Rendered BEFORE the dedup check so a provider retry gets the route's ack (same status and headers)
+    // rather than a second contract on the same route. A body template renders from the retry, not the
+    // first delivery, and a retry still passes the preflight above first. The ctx is the request in
+    // hand (rawBody, deliveryId, now), never stored state, which is what makes rendering it on a dedup
+    // hit sound: an ack field that had to reflect the PERSISTED row would echo the retry's values as the
+    // original's. Keep it that way.
+    const rendered = renderAck(route.response?.ack, {
       rawBody: req.rawBody,
       timestamp: String(Math.floor(this.deps.now() / 1000)),
       id: deliveryId,
     });
+    const ack = admission ? { ...rendered, headers: { ...rendered.headers, ...admission.headers } } : rendered;
 
     const isNew = await this.deps.events.recordOrSkip({
       instanceId: req.instanceId,
       pluginId: req.pluginId,
       providerDeliveryId: deliveryId,
       route: req.route,
-      payload,
+      // The method rides with the row so a reconciler replay reaches the handler as this attempt does.
+      payload: { ...payload, method: req.method },
       // The slim content fingerprint kept after the payload is retired on dispatch (see the entity).
       payloadHash: createHash('sha256').update(req.rawBody).digest('hex'),
       sessionId: instance.sessionScope,
     });
-    if (!isNew) return ack; // already persisted/acked; a retry gets the first delivery's ack
+    if (!isNew) return ack; // already persisted/acked; a retry gets the route's ack, not enqueued again
 
     // Best-effort conversation id for P1 ordering. Never throws — a malformed body just yields undefined.
     const providerConversationId = extractConversationId(route.conversationId, req.headers, req.rawBody);
@@ -226,8 +269,8 @@ export class IngressService {
       // Sync-response route: the ack is host-side and final; enqueue (queued or inline) must NOT block
       // it — a queue-disabled deployment otherwise holds the HTTP response for up to the inline dispatch
       // timeout. enqueue() is not awaited; the dedup row already persisted is the durability handle. The
-      // .catch() is a defensive guard: enqueue() never rejects today (it swallows inline failures and the
-      // factory wrapper writes a DLQ row on 'failed'), but a future regression must not become an unhandled
+      // .catch() is a defensive guard: enqueue() never rejects without a signal (it swallows inline failures
+      // and the factory wrapper writes a DLQ row on 'failed'), but a future regression must not become an unhandled
       // rejection that crashes the process on the ingress hot path.
       void this.deps.enqueue(jobData, deliveryId).catch(err => {
         this.deps.log?.('ingress_enqueue_unhandled', {

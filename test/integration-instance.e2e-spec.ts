@@ -7,6 +7,7 @@ process.env.ALLOW_DEV_API_KEY = 'true';
 process.env.BASE_URL = 'https://api.example.com';
 
 import { INestApplication } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -16,8 +17,11 @@ import { AppModule } from '../src/app.module';
 import { applyGlobalValidation } from '../src/config/app-validation';
 import { PluginLoaderService } from '../src/core/plugins/plugin-loader.service';
 import { AuthService } from '../src/modules/auth/auth.service';
+import { AuditAction, AuditLog } from '../src/modules/audit/entities/audit-log.entity';
 import { ApiKeyRole } from '../src/modules/auth/entities/api-key.entity';
 import { IntegrationDeliveryFailure } from '../src/modules/integration/entities/integration-delivery-failure.entity';
+import { InfraDataService } from '../src/modules/infra/infra-data.service';
+import { ScopeBindingService } from '../src/modules/integration/scope-binding.service';
 
 // A stub ingress-capable plugin so the capability check passes without a real plugin on disk. The
 // configSchema carries a NESTED secret field so the masking tests can prove a `secret:true` config
@@ -90,6 +94,13 @@ describe('IntegrationInstanceController (e2e)', () => {
     } catch {
       /* ignore teardown-only multi-datasource quirk */
     }
+  });
+
+  // InfraDataService re-syncs plugin bindings after an import through a non-strict lookup of
+  // ScopeBindingService, which lives in another module. Proven against the real module graph.
+  it('lets InfraDataService resolve the app ScopeBindingService for the post-import resync', () => {
+    const infraModuleRef = Reflect.get(app.get(InfraDataService), 'moduleRef') as ModuleRef | undefined;
+    expect(infraModuleRef?.get(ScopeBindingService, { strict: false })).toBe(app.get(ScopeBindingService));
   });
 
   it('requires an API key (401 without one)', async () => {
@@ -238,6 +249,16 @@ describe('IntegrationInstanceController (e2e)', () => {
   it('deletes the instance (204) and audits it', async () => {
     await request(app.getHttpServer()).delete(`${base}/chatwoot/instances/acct1`).set('X-API-Key', key).expect(204);
     await request(app.getHttpServer()).get(`${base}/chatwoot/instances/acct1`).set('X-API-Key', key).expect(404);
+
+    // The audit write is fire-and-forget, so poll briefly for the row.
+    const auditRepo: Repository<AuditLog> = app.get(getRepositoryToken(AuditLog, 'main'));
+    let row: AuditLog | undefined;
+    for (let i = 0; i < 50 && !row; i++) {
+      const rows = await auditRepo.find({ where: { action: AuditAction.INTEGRATION_INSTANCE_DELETED } });
+      row = rows.find(r => r.metadata?.pluginId === 'chatwoot' && r.metadata?.instanceId === 'acct1');
+      if (!row) await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    expect(row?.metadata).toEqual({ pluginId: 'chatwoot', instanceId: 'acct1' });
   });
 
   /**
@@ -341,6 +362,16 @@ describe('IntegrationInstanceController (e2e)', () => {
         .post('/api/integration/instances/chatwoot/other1/redrive')
         .set('X-API-Key', scopedKey)
         .expect(404);
+      // own1 was disabled above; dispatch refuses a disabled instance, so the redrive is refused too.
+      await request(app.getHttpServer())
+        .post('/api/integration/instances/chatwoot/own1/redrive')
+        .set('X-API-Key', scopedKey)
+        .expect(409);
+      await request(app.getHttpServer())
+        .patch(`${base}/chatwoot/instances/own1`)
+        .set('X-API-Key', scopedKey)
+        .send({ enabled: true })
+        .expect(200);
       await request(app.getHttpServer())
         .post('/api/integration/instances/chatwoot/own1/redrive')
         .set('X-API-Key', scopedKey)

@@ -23,6 +23,15 @@ export const ENGINE_NOT_READY_409 =
   'into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.';
 
 /**
+ * `EngineRegistry.require()`'s default `BadRequestException` (400): the session has no engine at all,
+ * the case ENGINE_NOT_READY_409 leaves out. The catalog and status routes answer this with a 404
+ * instead; see SESSION_NOT_STARTED_404.
+ */
+export const SESSION_NOT_STARTED_400 =
+  'The session is not started: no engine is running for it (never started, stopped, or logged out). ' +
+  'Start the session and retry.';
+
+/**
  * `EngineNotReadyError` (409) on `POST /sessions/:sessionId/pairing-code`, where the generic wording
  * above points the caller at the wrong state: both engines accept a pairing request only while the
  * session is `qr_ready`, and a session that reads `ready` is already linked and answers `400`.
@@ -76,6 +85,7 @@ export const SESSION_NOT_STARTED_404 =
  * a 404 meaning that four of the six routes carrying this constant do not even declare.
  */
 export const RECIPIENT_UNREACHABLE_400 =
+  'Baileys rejects a phone number reported as unregistered. ' +
   'The request was rejected before anything was sent. Among the causes: the recipient could not be ' +
   'addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number ' +
   'is not on WhatsApp — as well as body validation and a session that is not active.';
@@ -84,6 +94,10 @@ export const RECIPIENT_UNREACHABLE_400 =
 export const ENGINE_REFUSED_403 =
   'WhatsApp refused the operation. The request was well formed — the refusal happened WhatsApp-side, ' +
   'most often because the account lacks the admin rights the operation requires.';
+
+export const RECIPIENT_LOOKUP_503 =
+  'Baileys could not complete the recipient lookup within the request budget. On send routes, ' +
+  'no message was handed to WhatsApp for this lookup failure.';
 
 /** `MessageNotFoundError` (404): outside the adapter's lookup window, or revoked. */
 export const MESSAGE_NOT_FOUND_404 =
@@ -147,7 +161,28 @@ export const CHANNEL_MEDIA_501 =
  * came to expect a `400` the code never sends.
  */
 export const MEDIA_TOO_LARGE_413 =
-  'The decoded base64 media exceeds the media byte cap (`MEDIA_DOWNLOAD_MAX_BYTES`, 50 MiB by ' +
-  'default). A whole request is separately bounded by `BODY_SIZE_LIMIT` (25 mb by default), and ' +
+  'The decoded base64 media, or the media downloaded from `url`, exceeds the media byte cap ' +
+  '(`MEDIA_DOWNLOAD_MAX_BYTES`, 50 MiB by default). A whole request is separately bounded by `BODY_SIZE_LIMIT` (25 mb by default), and ' +
   'base64 inflates by about a third, so a large send usually meets that coarser limit first: the ' +
   'body parser rejects the request before this check runs.';
+
+/**
+ * send-bulk's 413: only the base64 of an item is checked while the request is open. A `url` item is
+ * fetched after the 202, and one over the cap fails that item in the batch results instead.
+ */
+export const BULK_MEDIA_TOO_LARGE_413 =
+  "An item's decoded base64 media exceeds the media byte cap (`MEDIA_DOWNLOAD_MAX_BYTES`, 50 MiB by " +
+  'default). A `url` item is fetched after the `202`; one over the cap fails that item in the batch ' +
+  'results (`GET /messages/batch/{batchId}`) instead. The whole request is separately bounded by ' +
+  '`BODY_SIZE_LIMIT` (25 mb by default).';
+
+/**
+ * `ServiceUnavailableException` (503), thrown by `loadRemoteMediaBuffer` when a `url` fetched through
+ * the session's egress proxy fails before any response arrives. undici cannot tell a dead proxy from
+ * an unreachable target there, so the text names both rather than blaming either one.
+ */
+export const MEDIA_URL_PROXY_503 =
+  'The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out ' +
+  'before any response arrived, so the request was not carried out. The proxy or the target behind it ' +
+  'may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy ' +
+  'works points at the `url`. Without a session proxy the same failure answers `400`.';

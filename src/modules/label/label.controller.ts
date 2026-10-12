@@ -5,8 +5,9 @@ import { ChatSummaryDto } from '../session/dto/chat-summary.dto';
 import { LabelService } from './label.service';
 import { AddLabelDto } from './dto/add-label.dto';
 import { UpsertLabelDto } from './dto/upsert-label.dto';
-import { RequireRole } from '../auth/decorators/auth.decorators';
-import { ApiKeyRole } from '../auth/entities/api-key.entity';
+import { ChatScoped, CurrentApiKey, RequireRole } from '../auth/decorators/auth.decorators';
+import { type ApiKey, ApiKeyRole } from '../auth/entities/api-key.entity';
+import { ChatScopeService } from '../auth/chat-scope.service';
 import {
   ENGINE_NOT_READY_409,
   ENGINE_NOT_SUPPORTED_501,
@@ -16,13 +17,20 @@ import {
 @ApiTags('labels')
 @Controller('sessions/:sessionId/labels')
 export class LabelController {
-  constructor(private readonly labelService: LabelService) {}
+  constructor(
+    private readonly labelService: LabelService,
+    private readonly chatScope: ChatScopeService,
+  ) {}
 
   @Get()
   @ApiOperation({ summary: 'Get all labels (WhatsApp Business only)' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
-  @ApiResponse({ status: 200, description: 'List of labels', type: [LabelDto] })
-  @ApiResponse({ status: 400, description: 'Session not ready or not a business account' })
+  @ApiResponse({
+    status: 200,
+    description: 'List of labels (empty on a personal, non-Business account)',
+    type: [LabelDto],
+  })
+  @ApiResponse({ status: 400, description: 'Session not started' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiResponse({ status: 501, description: ENGINE_NOT_SUPPORTED_501 })
   @ApiResponse({
@@ -40,6 +48,7 @@ export class LabelController {
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'labelId', description: 'Label ID' })
   @ApiResponse({ status: 200, description: 'Label details', type: LabelDto })
+  @ApiResponse({ status: 400, description: 'Session not started' })
   @ApiResponse({ status: 404, description: 'Label not found' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiResponse({ status: 501, description: ENGINE_NOT_SUPPORTED_501 })
@@ -53,6 +62,7 @@ export class LabelController {
     return this.labelService.getLabelById(sessionId, labelId);
   }
 
+  @ChatScoped('filtered')
   @Get(':labelId/chats')
   @ApiOperation({
     summary: 'Get every chat carrying a label',
@@ -67,14 +77,18 @@ export class LabelController {
   @ApiResponse({
     status: 503,
     description:
-      'The whatsapp-web.js page connection died mid-read, so nothing could be read. Deliberately not ' +
-      'reported as a missing label — a page that went away says nothing about whether the label exists. ' +
-      'The other engine never answers this: Baileys has no label query at all and answers 501 above.',
+      'WhatsApp Web did not answer (the page died or the command timed out), so nothing could be ' +
+      'read. Deliberately not reported as a missing label: no answer says nothing about whether the label ' +
+      'exists. The other engine never answers this: Baileys has no label query at all and answers 501 above.',
   })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiResponse({ status: 404, description: LABEL_NOT_FOUND_404 })
-  async getChatsByLabel(@Param('sessionId') sessionId: string, @Param('labelId') labelId: string) {
-    return this.labelService.getChatsByLabel(sessionId, labelId);
+  async getChatsByLabel(
+    @Param('sessionId') sessionId: string,
+    @Param('labelId') labelId: string,
+    @CurrentApiKey() apiKey?: ApiKey,
+  ) {
+    return this.chatScope.filter(apiKey, await this.labelService.getChatsByLabel(sessionId, labelId), c => c.id);
   }
 
   @Put(':labelId')
@@ -142,11 +156,13 @@ export class LabelController {
     return { success: true };
   }
 
+  @ChatScoped('fenced')
   @Get('chat/:chatId')
   @ApiOperation({ summary: 'Get labels for a specific chat' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'chatId', description: 'Chat ID' })
   @ApiResponse({ status: 200, description: 'List of labels for the chat', type: [LabelDto] })
+  @ApiResponse({ status: 400, description: 'Session not started' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiResponse({ status: 501, description: ENGINE_NOT_SUPPORTED_501 })
   @ApiResponse({
@@ -159,6 +175,7 @@ export class LabelController {
     return this.labelService.getChatLabels(sessionId, chatId);
   }
 
+  @ChatScoped('fenced')
   @Post('chat/:chatId')
   @RequireRole(ApiKeyRole.OPERATOR)
   @HttpCode(HttpStatus.OK)
@@ -175,6 +192,13 @@ export class LabelController {
     },
   })
   @ApiResponse({ status: 200, description: 'Label added to chat', type: LabelAckResponseDto })
+  @ApiResponse({ status: 400, description: 'Session not started, or validation failed' })
+  @ApiResponse({
+    status: 404,
+    description:
+      'The chat does not exist on this session, or the account has no label with this id, so nothing was ' +
+      'written (whatsapp-web.js)',
+  })
   @ApiResponse({
     status: 422,
     description: 'Labels require a WhatsApp Business account, or the chat type has no labels',
@@ -195,6 +219,7 @@ export class LabelController {
     return { success: true };
   }
 
+  @ChatScoped('fenced')
   @Delete('chat/:chatId/:labelId')
   @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Remove a label from a chat' })
@@ -202,6 +227,11 @@ export class LabelController {
   @ApiParam({ name: 'chatId', description: 'Chat ID' })
   @ApiParam({ name: 'labelId', description: 'Label ID to remove' })
   @ApiResponse({ status: 200, description: 'Label removed from chat', type: LabelAckResponseDto })
+  @ApiResponse({ status: 400, description: 'Session not started' })
+  @ApiResponse({
+    status: 404,
+    description: 'The chat does not exist on this session, so nothing was written (whatsapp-web.js)',
+  })
   @ApiResponse({
     status: 422,
     description: 'Labels require a WhatsApp Business account, or the chat type has no labels',

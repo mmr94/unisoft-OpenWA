@@ -19,17 +19,25 @@ import { SESSION_SCOPED_KEY } from '../auth/decorators/auth.decorators';
 import { createLogger } from '../../common/services/logger.service';
 import { normalizeIp } from '../../common/utils/ip';
 
-/** The request headers a forwarded call carries over. Everything else is this hop's business. */
-const FORWARDED_REQUEST_HEADERS = ['x-api-key', 'authorization', 'content-type', 'accept'] as const;
+/**
+ * The request headers a forwarded call carries over. Everything else is this hop's business.
+ * content-type is not among them: forward() sends every body as JSON and labels it so itself.
+ * idempotency-key travels so the OWNER claims it: the claim is part of the request's meaning, not
+ * of this hop.
+ */
+const FORWARDED_REQUEST_HEADERS = ['x-api-key', 'authorization', 'accept', 'idempotency-key'] as const;
 
 /** The response headers relayed back. Deliberately short: hop-by-hop headers must not leak through. */
 const RELAYED_RESPONSE_HEADERS = [
   'content-type',
   'content-disposition',
   'x-content-type-options',
+  // Tells the client the owner answered from a stored Idempotency-Key response, not a new send.
+  'idempotent-replayed',
   // Throttle answers come from the OWNER's counters, so the client must be told what the owner
-  // said: without these a forwarded 429 arrives with no indication of when to retry. The suffixed
-  // names are the ones the throttler actually sets (there is no bare Retry-After).
+  // said: without these a forwarded 429 arrives with no indication of when to retry.
+  // ProxyAwareThrottlerGuard sets the plain Retry-After that HTTP clients read; the base throttler
+  // adds the per-tier Retry-After-<name> and X-RateLimit-* headers. All of them are relayed.
   'retry-after',
   'retry-after-short',
   'retry-after-medium',
@@ -62,7 +70,8 @@ const NOT_DISPATCHED_CODES = new Set([
 export const FORWARDED_HEADER = 'x-openwa-forwarded';
 
 /**
- * The URL to forward to: ALWAYS the owner's origin, carrying only the request's path and query.
+ * The URL to forward to: ALWAYS the owner's origin (under its NODE_URL path, if it has one),
+ * carrying only the request's path and query.
  *
  * The request target is caller-controlled. HTTP/1.1 allows the absolute form
  * (`GET http://elsewhere/api/sessions/x HTTP/1.1`), Express matches the route for it, and
@@ -85,7 +94,8 @@ export function forwardTarget(originalUrl: string, ownerNodeUrl: string): string
   const base = new URL(ownerNodeUrl);
   const requested = new URL(originalUrl, base);
   const target = new URL(base.toString());
-  target.pathname = requested.pathname;
+  // Joined, not replaced: an owner behind a path-prefixed reverse proxy is reachable only under it.
+  target.pathname = base.pathname.replace(/\/$/, '') + requested.pathname;
   target.search = requested.search;
   return target.toString();
 }
@@ -97,8 +107,8 @@ export function forwardTarget(originalUrl: string, ownerNodeUrl: string): string
  * landing on the wrong node — a load balancer round-robining across replicas knows nothing about
  * session placement — is forwarded to the owner's `nodeUrl` and the owner's response is relayed
  * back. Interceptor rather than middleware so it runs AFTER the API-key guard: a node only spends
- * outbound work on requests that authenticated here first (the owner authenticates them again —
- * both nodes share the auth database).
+ * outbound work on requests that authenticated here first (the owner authenticates them again
+ * against its own key store; API keys live in each node's main SQLite file and are not shared).
  *
  * Entirely inert unless the operator configured routing: without NODE_URL on this node the
  * interceptor never even looks up the session, so single-node deployments pay nothing.
@@ -193,11 +203,15 @@ export class SessionProxyInterceptor implements NestInterceptor {
   ): Promise<void> {
     const timeoutMs = this.configService?.get<number>('session.proxyTimeoutMs', 60_000) ?? 60_000;
 
+    const hasBody = !['GET', 'HEAD'].includes(request.method);
     const headers: Record<string, string> = { [FORWARDED_HEADER]: this.ownership?.nodeId ?? '1' };
     for (const name of FORWARDED_REQUEST_HEADERS) {
       const value = request.headers[name];
       if (typeof value === 'string') headers[name] = value;
     }
+    // Label the bytes actually sent: a form-encoded request, relabelled as the client sent it, would
+    // have the owner's urlencoded parser read the JSON text as one form key and answer 400.
+    if (hasBody) headers['content-type'] = 'application/json';
 
     // The owner re-authenticates the forwarded call (allowedIps) and throttles per client IP, so
     // the chain must carry what this hop observed — without it every forwarded call shows up as
@@ -210,7 +224,6 @@ export class SessionProxyInterceptor implements NestInterceptor {
       headers['x-forwarded-for'] = inboundChain ? `${inboundChain}, ${observedPeer}` : observedPeer;
     }
 
-    const hasBody = !['GET', 'HEAD'].includes(request.method);
     let target: string | undefined;
     try {
       // Inside the try: a NODE_URL that is not a usable absolute URL makes this throw, and that is
@@ -220,8 +233,9 @@ export class SessionProxyInterceptor implements NestInterceptor {
       const upstream = await fetch(target, {
         method: request.method,
         headers,
-        // The body has already been parsed by this hop's JSON body-parser; re-serialising it is
-        // byte-equivalent for the JSON API surface (there are no multipart session routes).
+        // The body has already been parsed by this hop's JSON or urlencoded body-parser; re-serialising
+        // it as JSON keeps the parsed values the owner's DTOs would have seen (there are no multipart
+        // session routes).
         body: hasBody ? JSON.stringify(request.body ?? {}) : undefined,
         signal: AbortSignal.timeout(timeoutMs),
         redirect: 'manual',

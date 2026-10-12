@@ -1,4 +1,8 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { ConsoleLogger, Logger } from '@nestjs/common';
 import { LoggerService, LogLevel, LogFormat, createLogger } from './logger.service';
+import { runWithRequestId } from './request-context';
 
 interface LogEntry {
   timestamp: string;
@@ -95,6 +99,50 @@ describe('LoggerService', () => {
     });
   });
 
+  // Plugin ctx.logger meta reaches the logger verbatim, so caller metadata must not be able to rewrite
+  // the fields a reader trusts to say who logged what, at which level.
+  describe('structural fields', () => {
+    it('keeps level, context, message, timestamp, trace and requestId out of reach of caller metadata', () => {
+      logger.log('[plugin-a] hi', {
+        level: 'error',
+        context: 'AuthService',
+        message: 'API key rotated',
+        timestamp: '1970-01-01T00:00:00.000Z',
+        trace: 'forged stack',
+        requestId: 'forged',
+        pluginId: 'plugin-a',
+      });
+
+      const output = getLogOutput(consoleSpy) as unknown as Record<string, unknown>;
+      expect(output.level).toBe('info');
+      expect(output.context).toBe('TestContext');
+      expect(output.message).toBe('[plugin-a] hi');
+      expect(output.timestamp).not.toBe('1970-01-01T00:00:00.000Z');
+      expect(output).not.toHaveProperty('trace');
+      expect(output).not.toHaveProperty('requestId');
+      expect(output.pluginId).toBe('plugin-a');
+    });
+
+    it("still takes error()'s trace and string context from its own parameters", () => {
+      const errorSpy = jest.spyOn(console, 'error');
+      logger.error('boom', 'real stack', 'OtherContext');
+
+      const output = getLogOutput(errorSpy);
+      expect(output.context).toBe('OtherContext');
+      expect(output.trace).toBe('real stack');
+    });
+
+    it("keeps error()'s own trace over one smuggled in its metadata", () => {
+      const errorSpy = jest.spyOn(console, 'error');
+      logger.error('boom', 'real stack', { trace: 'forged stack', sessionId: 's1' });
+
+      const output = getLogOutput(errorSpy);
+      expect(output.trace).toBe('real stack');
+      expect(output.context).toBe('TestContext');
+      expect(output.sessionId).toBe('s1');
+    });
+  });
+
   describe('warn', () => {
     it('should log warning messages to console.warn', () => {
       const warnSpy = jest.spyOn(console, 'warn');
@@ -160,6 +208,85 @@ describe('LoggerService', () => {
       expect(output).toContain('stack trace line');
       expect(output).toMatch(/\n.*stack trace line/);
     });
+  });
+
+  describe('non-string input (the call shapes Nest uses)', () => {
+    it('renders an Error passed as the message with its stack as the trace', () => {
+      const errorSpy = jest.spyOn(console, 'error');
+      logger.error(new Error('boom'));
+
+      const output = getLogOutput(errorSpy);
+      expect(output.message).toBe('boom');
+      expect(output.trace).toContain('Error: boom');
+      expect(output.trace).toMatch(/\n\s+at /);
+    });
+
+    it('turns an Error or other value passed as the trace into a string', () => {
+      const errorSpy = jest.spyOn(console, 'error');
+      logger.error('failed', new Error('inner'));
+      logger.error('failed', 42);
+
+      const calls = errorSpy.mock.calls as string[][];
+      expect((JSON.parse(calls[0][0]) as LogEntry).trace).toContain('Error: inner');
+      expect((JSON.parse(calls[1][0]) as LogEntry).trace).toBe('42');
+    });
+
+    it('serializes an object message with secret-named keys redacted', () => {
+      logger.log({ a: 1, password: 'p' });
+
+      expect(getLogOutput(consoleSpy).message).toBe('{"a":1,"password":"[REDACTED]"}');
+    });
+
+    it('does not throw on a circular object message', () => {
+      const circular: Record<string, unknown> = {};
+      circular.self = circular;
+
+      expect(() => logger.log(circular)).not.toThrow();
+      expect(typeof getLogOutput(consoleSpy).message).toBe('string');
+    });
+
+    it('writes fatal() at error level', () => {
+      const errorSpy = jest.spyOn(console, 'error');
+      logger.fatal('down');
+
+      const output = getLogOutput(errorSpy);
+      expect(output.level).toBe('error');
+      expect(output.message).toBe('down');
+    });
+  });
+
+  describe('as the Nest framework logger', () => {
+    beforeEach(() => {
+      Logger.overrideLogger(createLogger('Nest'));
+    });
+    afterEach(() => {
+      Logger.overrideLogger(new ConsoleLogger());
+    });
+
+    it("keeps the exception handler's message, stack, context and request id", () => {
+      const errorSpy = jest.spyOn(console, 'error');
+      runWithRequestId('req-1', () => new Logger('ExceptionsHandler').error(new Error('boom')));
+
+      const output = getLogOutput(errorSpy) as LogEntry & { requestId?: string };
+      expect(output.context).toBe('ExceptionsHandler');
+      expect(output.message).toBe('boom');
+      expect(output.trace).toContain('Error: boom');
+      expect(output.requestId).toBe('req-1');
+    });
+
+    it('applies LOG_LEVEL to framework lines', () => {
+      new Logger('X').debug('d');
+      expect(consoleSpy).not.toHaveBeenCalled();
+
+      new Logger('X').log('m');
+      expect(getLogOutput(consoleSpy).context).toBe('X');
+    });
+  });
+
+  // Without the option Nest keeps its ConsoleLogger, which ignores LOG_LEVEL and LOG_FORMAT.
+  it('is installed as the framework logger by main.ts', () => {
+    const mainSrc = readFileSync(join(__dirname, '..', '..', 'main.ts'), 'utf8');
+    expect(mainSrc).toMatch(/await NestFactory\.create\(AppModule, \{[^}]*\blogger: createLogger\('Nest'\)/);
   });
 
   describe('createLogger', () => {

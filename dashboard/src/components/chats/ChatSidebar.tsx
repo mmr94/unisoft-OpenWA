@@ -2,6 +2,7 @@ import { useTranslation } from 'react-i18next';
 import { AlertCircle, CircleDashed, Loader2, Megaphone, Plus, Search } from 'lucide-react';
 import type { UseQueryResult } from '@tanstack/react-query';
 import type { Channel, Chat, ContactStatusGroup, Session } from '../../services/api';
+import { useRole } from '../../hooks/useRole';
 import ChatAvatar from './ChatAvatar';
 
 export type ChatsTab = 'chats' | 'channels' | 'status';
@@ -57,12 +58,14 @@ function ChatSidebar({
   statusTab,
 }: ChatSidebarProps) {
   const { t } = useTranslation();
+  // Posting a status needs an operator key; a read-only key would only reach a 403.
+  const { canWrite } = useRole();
 
   const formatLastMessageSnippet = (chat: Chat) => chat.lastMessage || '';
 
-  // Shared row markup for the Chats and Status lists — a plain function (not memoized) since it
-  // closes over render-scoped props (chatsTab.activeChatId, chatsTab.pictures) that already
-  // change every render.
+  // Row markup for the Chats list: a plain function (not memoized) since it closes over
+  // render-scoped props (chatsTab.activeChatId, chatsTab.pictures) that already change every
+  // render.
   const renderChatRow = (chat: Chat) => {
     const isActive = chatsTab.activeChatId === chat.id;
     return (
@@ -96,10 +99,20 @@ function ChatSidebar({
             {chat.timestamp ? <span className="chat-item-time">{formatChatTime(chat.timestamp)}</span> : null}
           </div>
           <div className="chat-item-bottom">
+            {/* An empty snippet with a timestamp is a message with no text (a voice note, a sticker,
+                an uncaptioned photo), not an empty chat. */}
             <span className="chat-item-snippet" title={formatLastMessageSnippet(chat)}>
-              {formatLastMessageSnippet(chat) || <span className="no-message">{t('chats.noMessageYet')}</span>}
+              {formatLastMessageSnippet(chat) ||
+                (!chat.timestamp && <span className="no-message">{t('chats.noMessageYet')}</span>)}
             </span>
-            {chat.unreadCount > 0 && (
+            {/* A negative count is a chat marked unread (Baileys reports -1): a badge with no number. */}
+            {chat.unreadCount < 0 ? (
+              <span
+                className="chat-unread-badge"
+                title={t('chats.markedUnread')}
+                aria-label={t('chats.markedUnread')}
+              />
+            ) : chat.unreadCount > 0 ? (
               <span
                 className="chat-unread-badge"
                 title={t('chats.unreadBadge', { count: chat.unreadCount })}
@@ -107,7 +120,7 @@ function ChatSidebar({
               >
                 {chat.unreadCount > 99 ? '99+' : chat.unreadCount}
               </span>
-            )}
+            ) : null}
           </div>
         </div>
       </div>
@@ -164,7 +177,7 @@ function ChatSidebar({
         </div>
 
         {/* Compose a new status — only meaningful on the Status tab. */}
-        {activeTab === 'status' && (
+        {activeTab === 'status' && canWrite && (
           <button type="button" className="btn-primary status-compose-trigger" onClick={onComposeStatus}>
             <Plus size={16} />
             {t('chats.status.compose')}
@@ -215,6 +228,11 @@ function ChatSidebar({
           ) : (channelsTab.query.data?.length ?? 0) === 0 ? (
             <div className="chats-list-empty">
               <span>{t('chats.channels.empty')}</span>
+            </div>
+          ) : channelsTab.channels.length === 0 ? (
+            // Subscribed, but the search matches none of them.
+            <div className="chats-list-empty">
+              <span>{t('chats.empty')}</span>
             </div>
           ) : (
             channelsTab.channels.map(ch => (

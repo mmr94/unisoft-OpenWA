@@ -21,6 +21,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     connectedAt: new Date(Date.now() - 10 * 60_000),
     lastActiveAt: null,
     lastSentAt: null,
+    desiredState: null,
     nodeId: null,
     claimedAt: null,
     nodeUrl: null,
@@ -76,7 +77,7 @@ describe('SessionHibernationService', () => {
     it('retires the engine straight to HIBERNATED, never flashing disconnected', async () => {
       await service.hibernate('sess-1');
 
-      expect(lifecycle.stop).toHaveBeenCalledWith('sess-1', SessionStatus.HIBERNATED);
+      expect(lifecycle.stop).toHaveBeenCalledWith('sess-1', {}, SessionStatus.HIBERNATED);
       // Set before anything is awaited, so a reconnect timer cannot slip a fresh engine in first.
       expect(lifecycle.markStopping).toHaveBeenCalledWith('sess-1');
       expect(hookManager.execute).toHaveBeenCalledWith(
@@ -113,6 +114,13 @@ describe('SessionHibernationService', () => {
 
       await expect(service.wake('sess-1')).rejects.toBeInstanceOf(BadRequestException);
       expect(lifecycle.start).not.toHaveBeenCalled();
+    });
+
+    it('refuses a stale hibernated row carrying an operator stop', async () => {
+      repository.findOne.mockResolvedValue(makeSession({ status: SessionStatus.HIBERNATED, desiredState: 'stopped' }));
+      await expect(service.wake('sess-1')).rejects.toBeInstanceOf(BadRequestException);
+      expect(lifecycle.start).not.toHaveBeenCalled();
+      expect(hookManager.execute).not.toHaveBeenCalled();
     });
 
     it('serves concurrent wakes from one resume instead of failing the losers', async () => {
@@ -206,7 +214,7 @@ describe('SessionHibernationService', () => {
 
       await service.hibernateIdleSessions();
 
-      expect(lifecycle.stop).toHaveBeenCalledWith('sess-1', SessionStatus.HIBERNATED);
+      expect(lifecycle.stop).toHaveBeenCalledWith('sess-1', {}, SessionStatus.HIBERNATED);
     });
 
     it('leaves a session inside its idle window alone', async () => {
@@ -250,7 +258,7 @@ describe('SessionHibernationService', () => {
 
       await service.hibernateIdleSessions();
 
-      expect(lifecycle.stop).toHaveBeenCalledWith('sess-1', SessionStatus.HIBERNATED);
+      expect(lifecycle.stop).toHaveBeenCalledWith('sess-1', {}, SessionStatus.HIBERNATED);
     });
 
     it('keeps sweeping after one session fails', async () => {
@@ -262,7 +270,7 @@ describe('SessionHibernationService', () => {
       await service.hibernateIdleSessions();
 
       expect(lifecycle.stop).toHaveBeenCalledTimes(1);
-      expect(lifecycle.stop).toHaveBeenCalledWith('sess-2', SessionStatus.HIBERNATED);
+      expect(lifecycle.stop).toHaveBeenCalledWith('sess-2', {}, SessionStatus.HIBERNATED);
     });
 
     it('runs no timer at all while hibernation is disabled', () => {

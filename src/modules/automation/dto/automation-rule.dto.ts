@@ -1,7 +1,9 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Expose, plainToInstance } from 'class-transformer';
-import { IsBoolean, IsInt, IsNotEmpty, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
+import { IsBoolean, IsInt, IsNotEmpty, IsOptional, IsString, Max, MaxLength, Min, ValidateIf } from 'class-validator';
 import { ToStrictBoolean, ToStrictNumber } from '../../../common/utils/strict-boolean';
+import { MaxCodePoints } from '../../../common/validation/max-code-points';
+import { NoNulCharacter } from '../../../common/validation/no-nul-character';
 import { MESSAGE_TEXT_MAX_LENGTH } from '../../message/dto/send-message.dto';
 import { WebhookFilters } from '../../webhook/filters/filter-types';
 import { IsValidWebhookFilters } from '../../webhook/filters/filter-validation';
@@ -13,7 +15,10 @@ export const AUTOMATION_COOLDOWN_MAX_SECONDS = 86_400;
 const CONDITIONS_DESCRIPTION =
   'Match conditions in the webhook filter format (message family: sender, recipient, chatId, body, ' +
   'type, isGroup, kind, fromMe, hasMedia, mentions). All conditions must match (AND). Omitted or ' +
-  'empty means the rule matches every inbound message.';
+  'empty means the rule matches every inbound message except channel, broadcast-list and status ' +
+  'messages, which a rule answers only when it has a `kind` condition that matches them. On Baileys ' +
+  "a message received through a contact's broadcast list is filed under the sender's chat (`kind` " +
+  'individual), so it matches.';
 
 const COOLDOWN_DESCRIPTION =
   'Quiet period per chat, in seconds: after the rule replies in a chat it stays silent there for ' +
@@ -24,7 +29,8 @@ export class CreateAutomationRuleDto {
   @ApiProperty({ description: 'Display name for the rule', example: 'Greet new enquiries', maxLength: 100 })
   @IsString()
   @IsNotEmpty()
-  @MaxLength(100)
+  @MaxCodePoints(100)
+  @NoNulCharacter()
   name!: string;
 
   @ApiProperty({
@@ -35,6 +41,7 @@ export class CreateAutomationRuleDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(MESSAGE_TEXT_MAX_LENGTH)
+  @NoNulCharacter()
   replyText!: string;
 
   @ApiPropertyOptional({ description: CONDITIONS_DESCRIPTION })
@@ -64,20 +71,23 @@ export class CreateAutomationRuleDto {
 
 export class UpdateAutomationRuleDto {
   @ApiPropertyOptional({ description: 'Display name for the rule', maxLength: 100 })
-  @IsOptional()
+  // Not @IsOptional on the NOT NULL columns: that also skips null, which then reaches save() as a 500.
+  @ValidateIf((o: UpdateAutomationRuleDto) => o.name !== undefined)
   @IsString()
   @IsNotEmpty()
-  @MaxLength(100)
+  @MaxCodePoints(100)
+  @NoNulCharacter()
   name?: string;
 
   @ApiPropertyOptional({
     description: 'Text sent back into the chat when the rule matches',
     maxLength: MESSAGE_TEXT_MAX_LENGTH,
   })
-  @IsOptional()
+  @ValidateIf((o: UpdateAutomationRuleDto) => o.replyText !== undefined)
   @IsString()
   @IsNotEmpty()
   @MaxLength(MESSAGE_TEXT_MAX_LENGTH)
+  @NoNulCharacter()
   replyText?: string;
 
   @ApiPropertyOptional({ description: CONDITIONS_DESCRIPTION })
@@ -86,7 +96,7 @@ export class UpdateAutomationRuleDto {
   conditions?: WebhookFilters | null;
 
   @ApiPropertyOptional({ description: COOLDOWN_DESCRIPTION, minimum: 0, maximum: AUTOMATION_COOLDOWN_MAX_SECONDS })
-  @IsOptional()
+  @ValidateIf((o: UpdateAutomationRuleDto) => o.cooldownSeconds !== undefined)
   @ToStrictNumber()
   @IsInt()
   @Min(0)
@@ -94,7 +104,7 @@ export class UpdateAutomationRuleDto {
   cooldownSeconds?: number;
 
   @ApiPropertyOptional({ description: 'Whether the rule is active' })
-  @IsOptional()
+  @ValidateIf((o: UpdateAutomationRuleDto) => o.enabled !== undefined)
   @ToStrictBoolean()
   @IsBoolean()
   enabled?: boolean;

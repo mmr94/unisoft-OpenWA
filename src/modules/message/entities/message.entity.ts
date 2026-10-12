@@ -1,10 +1,11 @@
 import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, Index, ValueTransformer } from 'typeorm';
 import { jsonColumnType } from '../../../common/utils/column-types';
+import { NulFreeTransformer } from '../../../common/transformers/nul-free.transformer';
 
 /**
  * A `bigint` column reads back as a string on PostgreSQL (pg avoids >2^53 precision loss) but as a
  * number on SQLite. WhatsApp epoch-seconds are far below 2^53, so coerce reads to a number for a
- * consistent REST/SDK/MCP contract (entity, DTO, all three SDKs, and dashboard declare `number`).
+ * consistent REST/SDK/MCP contract (entity, DTO, the typed SDKs, and dashboard declare a numeric type).
  * Writes pass through unchanged; null stays null.
  */
 export const bigintToNumberTransformer: ValueTransformer = {
@@ -34,6 +35,15 @@ export enum MessageStatus {
 @Entity('messages')
 @Index(['sessionId', 'createdAt'])
 @Index(['chatId'])
+// One chat's thread, paged newest-first, and its total; the send-pacing history probes filter on the
+// same (sessionId, chatId, createdAt) prefix. The standalone chatId index stays for the search and
+// stats reads that filter on chatId without a session. The explicit name matches the migration that
+// creates it on synchronize-disabled deployments, so both schema paths converge on one index.
+@Index('IDX_messages_sessionId_chatId_createdAt', ['sessionId', 'chatId', 'createdAt'])
+// Explicit id tiebreaking keeps a message-time walk stable across SQLite and PostgreSQL.
+@Index('IDX_messages_session_timestamp_id', ['sessionId', 'timestamp', 'id'])
+@Index('IDX_messages_session_chat_timestamp_id', ['sessionId', 'chatId', 'timestamp', 'id'])
+@Index('IDX_messages_session_direction_timestamp_id', ['sessionId', 'direction', 'timestamp', 'id'])
 // Composite index for the ack-driven status UPDATE (scoped by sessionId + waMessageId).
 // Without it every ack does a full table scan of a hot table.
 @Index('UQ_messages_sessionId_waMessageId', ['sessionId', 'waMessageId'], { unique: true })
@@ -42,7 +52,8 @@ export class Message {
   id!: string;
 
   // No standalone @Index here: sessionId-only lookups are already served by the composite indexes
-  // that lead with sessionId — (sessionId, createdAt) above and the unique (sessionId, waMessageId).
+  // that lead with sessionId: (sessionId, createdAt), (sessionId, chatId, createdAt) and the unique
+  // (sessionId, waMessageId).
   @Column()
   sessionId!: string;
 
@@ -52,14 +63,16 @@ export class Message {
   @Column()
   chatId!: string;
 
-  /** Human-readable name for the chat (contact pushName, group name, etc). Populated on save when available — null for legacy rows. */
-  @Column({ nullable: true })
+  /** The sender's contact name (pushName) as the engine reported it: in a group that is the member, not
+   *  the group. Null on legacy rows and on rows that carried no contact. */
+  @Column({ nullable: true, transformer: NulFreeTransformer })
   chatName?: string;
 
   /**
-   * Stable sender identity for a group message: the participant JID who actually posted (`from` is
-   * the group JID). Lets the chat view tell two same-named participants apart. Null on 1:1
-   * messages, outgoing echoes, and legacy rows.
+   * Stable sender identity for a group, status or broadcast-list message: the JID who actually
+   * posted (`from` is the group, `status@broadcast` or list id; on Baileys a list message the account
+   * received is filed under the sender, so `from` is the sender too). Lets the chat view tell two
+   * same-named participants apart. Null on 1:1 messages, outgoing echoes, and legacy rows.
    */
   @Column({ nullable: true })
   author?: string;
@@ -70,7 +83,7 @@ export class Message {
   @Column()
   to!: string;
 
-  @Column({ type: 'text', nullable: true })
+  @Column({ type: 'text', nullable: true, transformer: NulFreeTransformer })
   body!: string;
 
   @Column({ default: 'text' })
@@ -92,7 +105,7 @@ export class Message {
    * Storage key of this message's archived media, or null when nothing was archived — which is the
    * case for every row written while `CHAT_MEDIA_ARCHIVE_ENABLED` is off (the default), for non-media
    * messages, and for media above the archive cap. Independent of the inline base64 copy in
-   * `metadata.media`, which is unaffected by archiving.
+   * `metadata.media`, which stays inline by default and is replaced after verification in archive mode.
    */
   // Partial index for the chat-media orphan sweep's per-chunk `mediaPath IN (...)` lookup. NULL for
   // every un-archived row (archiving is opt-in), so the WHERE clause keeps the index to rows that
@@ -107,7 +120,7 @@ export class Message {
 
   /** Mimetype of the archived media, so the read endpoint can serve a Content-Type without
    *  depending on the inline copy. Null whenever `mediaPath` is. */
-  @Column({ nullable: true })
+  @Column({ nullable: true, transformer: NulFreeTransformer })
   mediaMimetype?: string;
 
   @Column({

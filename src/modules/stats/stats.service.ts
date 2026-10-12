@@ -3,8 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { ConfigService } from '@nestjs/config';
 import { Repository } from 'typeorm';
 import { Session, SessionStatus } from '../session/entities/session.entity';
-import { Message, MessageStatus } from '../message/entities/message.entity';
-import { CacheService } from '../../common/cache';
+import { Message, MessageDirection, MessageStatus } from '../message/entities/message.entity';
 
 /**
  * SQL for the time-series timestamp bucket, per DB dialect. SQLite has strftime(); Postgres has
@@ -41,6 +40,13 @@ export function maxCreatedAtSql(dbType: string): string {
     ? `to_char(MAX(m."createdAt"), 'YYYY-MM-DD HH24:MI:SS')`
     : `strftime('%Y-%m-%d %H:%M:%S', MAX(m.createdAt))`;
 }
+
+/**
+ * SQL for a top chat's label. `chatName` holds the SENDER's push name, not the chat's: MAX over a group's
+ * rows named the group after whichever member sorts last. Only a 1:1 chat's inbound rows carry the name
+ * of the chat itself, so groups get null and the dashboard falls back to the chat id.
+ */
+const CHAT_LABEL_SQL = `MAX(CASE WHEN m.direction = '${MessageDirection.INCOMING}' AND m.chatId NOT LIKE '%@g.us' THEN m.chatName END)`;
 
 export interface OverviewStats {
   sessions: {
@@ -86,16 +92,18 @@ export class StatsService {
    * entries expire after stats.cacheTtlMs; there is no write-path hook. Session-scoped entries
    * are additionally re-validated on serve (getSessionStats), so a deleted session is not
    * resurrected from the memo. Key cardinality is
-   * bounded (4 global shapes + one per session), so no size eviction is needed.
+   * bounded (4 global shapes + one per session), so no size eviction is needed. Concurrent misses
+   * on one key share a single computation (`inflight`), so an expired entry costs one scan, not one
+   * per waiting request; a rejection is handed to every waiter and never stored.
    */
   private readonly memo = new Map<string, { expiresAt: number; value: unknown }>();
+  private readonly inflight = new Map<string, Promise<unknown>>();
 
   constructor(
     @InjectRepository(Session, 'data')
     private readonly sessionRepo: Repository<Session>,
     @InjectRepository(Message, 'data')
     private readonly messageRepo: Repository<Message>,
-    private readonly cacheService: CacheService,
     private readonly configService: ConfigService,
   ) {}
 
@@ -109,16 +117,34 @@ export class StatsService {
     return this.configService.get<number>('stats.cacheTtlMs', 30000);
   }
 
-  /** Returns the memoized value for `key` while fresh; otherwise computes, stores, returns it. */
-  private async memoized<T>(key: string, compute: () => Promise<T>): Promise<T> {
+  /**
+   * Returns the memoized value for `key` while fresh; otherwise joins the computation already
+   * running for it, or starts one. The TTL runs from completion, so a scan slower than the TTL does
+   * not store an entry that is already stale. The identity check keeps a flight that was dropped
+   * (getSessionStats on a deleted session) from writing its result back.
+   */
+  private memoized<T>(key: string, compute: () => Promise<T>): Promise<T> {
     const ttl = this.memoTtlMs;
     if (ttl <= 0) return compute();
-    const now = Date.now();
     const hit = this.memo.get(key);
-    if (hit && hit.expiresAt > now) return hit.value as T;
-    const value = await compute();
-    this.memo.set(key, { expiresAt: now + ttl, value });
-    return value;
+    if (hit && hit.expiresAt > Date.now()) return Promise.resolve(hit.value as T);
+    const pending = this.inflight.get(key);
+    if (pending) return pending as Promise<T>;
+    const flight: Promise<T> = compute().then(
+      value => {
+        if (this.inflight.get(key) === flight) {
+          this.inflight.delete(key);
+          this.memo.set(key, { expiresAt: Date.now() + ttl, value });
+        }
+        return value;
+      },
+      (err: unknown) => {
+        if (this.inflight.get(key) === flight) this.inflight.delete(key);
+        throw err;
+      },
+    );
+    this.inflight.set(key, flight);
+    return flight;
   }
 
   async getOverview(): Promise<OverviewStats> {
@@ -165,13 +191,6 @@ export class StatsService {
       where: { status: MessageStatus.FAILED },
     });
 
-    // Cache session stats
-    await this.cacheService.setSessionsStats({
-      active,
-      total: sessions.length,
-      byStatus,
-    });
-
     return {
       sessions: {
         active,
@@ -206,7 +225,8 @@ export class StatsService {
       .select('m.type', 'type')
       .addSelect('COUNT(*)', 'count')
       .where('m.createdAt >= :since', { since })
-      .andWhere("(m.body IS NOT NULL AND m.body != '') OR m.metadata IS NOT NULL")
+      // Parenthesized: TypeORM does not wrap an andWhere, so a bare OR would escape the period bound.
+      .andWhere("((m.body IS NOT NULL AND m.body != '') OR m.metadata IS NOT NULL)")
       .groupBy('m.type')
       .getRawMany<{ type: string; count: string }>();
 
@@ -250,7 +270,7 @@ export class StatsService {
       .createQueryBuilder('m')
       .select('m.chatId', 'chatId')
       .addSelect('COUNT(*)', 'messageCount')
-      .addSelect('MAX(m.chatName)', 'chatName')
+      .addSelect(CHAT_LABEL_SQL, 'chatName')
       .where('m.createdAt >= :since', { since })
       .groupBy('m.chatId')
       // Order by the aggregate expression, not the "messageCount" alias: Postgres folds an unquoted
@@ -279,6 +299,7 @@ export class StatsService {
     const key = `session:${sessionId}`;
     if ((await this.sessionRepo.count({ where: { id: sessionId } })) === 0) {
       this.memo.delete(key);
+      this.inflight.delete(key);
       throw new NotFoundException('Session not found');
     }
     return this.memoized(key, () => this.loadSessionStats(sessionId));
@@ -322,7 +343,7 @@ export class StatsService {
       .select('m.chatId', 'chatId')
       .addSelect('COUNT(*)', 'count')
       .addSelect(maxCreatedAtSql(this.dataDbType), 'lastActive')
-      .addSelect('MAX(m.chatName)', 'chatName')
+      .addSelect(CHAT_LABEL_SQL, 'chatName')
       .where('m.sessionId = :sessionId', { sessionId })
       .groupBy('m.chatId')
       .orderBy('count', 'DESC')

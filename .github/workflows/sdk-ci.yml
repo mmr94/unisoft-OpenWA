@@ -1,12 +1,13 @@
 name: SDK CI
 
-# Runs the JavaScript/Python/PHP client SDK suites. Path-filtered to SDK sources AND the server
-# contract surfaces the SDK types mirror (DTOs + the engine interface), so a backend DTO change also
-# re-runs the SDK suites and surfaces contract drift. The JavaScript job also builds and runs the
-# dual-format packaging smoke test (require() + import() both consumable).
+# Runs the JavaScript, Python, PHP, Java and Go client SDK suites. Path-filtered to SDK sources AND
+# the server contract surfaces the SDK types mirror (DTOs, controllers, services + the engine
+# interface), so a backend DTO change also re-runs the SDK suites and surfaces contract drift. The
+# JavaScript job also builds and runs the dual-format packaging smoke test (require() + import() both
+# consumable) plus real requests through each build's client.
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
     paths:
       [
         'sdk/**',
@@ -17,7 +18,7 @@ on:
         'src/engine/interfaces/whatsapp-engine.interface.ts',
       ]
   pull_request:
-    branches: [main, develop]
+    branches: [main]
     paths:
       [
         'sdk/**',
@@ -33,8 +34,16 @@ permissions:
 
 jobs:
   javascript:
-    name: JavaScript SDK
+    name: JavaScript SDK (${{ matrix.node }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 18 is the published package's engines floor; vitest 5 needs Node 22.12+, so 18 and 20 only
+        # gate the typecheck, build and smoke (packaging plus real requests through each build's
+        # client), and the unit tests run on 22.
+        node: ['18', '20', '22']
     defaults:
       run:
         working-directory: sdk/javascript
@@ -42,20 +51,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: '22'
+          node-version: ${{ matrix.node }}
           cache: 'npm'
           cache-dependency-path: sdk/javascript/package-lock.json
-      - run: npm ci
+      # The lane that runs the tests installs with --engine-strict, so a locked toolchain that drops
+      # its Node fails here, naming the package, instead of warning and then testing on an
+      # unsupported runtime or failing at startup on a skipped native binding. The condition is the
+      # test step's own.
+      - run: npm ci --engine-strict=${{ matrix.node == '22' }}
       - run: npm test
+        if: matrix.node == '22'
       # The build tsconfigs exclude test/, and vitest strips types without checking them, so the
       # type-level wire contract in test/*.test-d.ts only gates if tsc runs over test/ too (#754).
       - run: npm run typecheck
       - run: npm run build
-      - run: npm run smoke # dual CJS+ESM consumable — must run after build
+      - run: npm run smoke # packaging plus request smoke; must run after build
 
   python:
     name: Python SDK (${{ matrix.python }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -79,6 +94,7 @@ jobs:
   php:
     name: PHP SDK (${{ matrix.php }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -97,12 +113,13 @@ jobs:
   java:
     name: Java SDK
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: sdk/java
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: '17'
@@ -112,6 +129,7 @@ jobs:
   go:
     name: Go SDK
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: sdk/go

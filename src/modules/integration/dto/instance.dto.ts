@@ -1,15 +1,26 @@
-import { IsBoolean, IsNotEmpty, IsObject, IsOptional, IsString, Matches, MaxLength, MinLength } from 'class-validator';
+import {
+  IsBoolean,
+  IsNotEmpty,
+  IsObject,
+  IsOptional,
+  IsString,
+  Matches,
+  MaxLength,
+  MinLength,
+  ValidateIf,
+} from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { IngressUrl } from '../ingress-url';
 import { ToStrictBoolean } from '../../../common/utils/strict-boolean';
 
-// Safe charset: also prevents an instanceId containing ':' (which would collide the P1 ordering key).
+// Safe charset: the instanceId goes unencoded into the ingress URL path and the `<pluginId>:<instanceId>` row id.
 const INSTANCE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
 
 export class CreateInstanceDto {
   @ApiProperty({
     description:
       'Operator-chosen instance id (unique within the plugin). Namespaces the ingress URL and the instance secret.',
+    pattern: INSTANCE_ID_PATTERN.source,
     example: 'chatwoot-prod-1',
   })
   @IsString()
@@ -18,6 +29,8 @@ export class CreateInstanceDto {
 
   @ApiPropertyOptional({
     description: 'Session id the instance is scoped to. Omit for all sessions.',
+    minLength: 1,
+    maxLength: 256,
     example: '8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a',
   })
   @IsOptional()
@@ -28,6 +41,7 @@ export class CreateInstanceDto {
 
   @ApiPropertyOptional({
     description: 'Token echoed back for the provider webhook verification handshake. Auto-generated when omitted.',
+    maxLength: 512,
     example: 'a1b2c3d4e5f6',
   })
   @IsOptional()
@@ -40,8 +54,10 @@ export class CreateInstanceDto {
   // Omit to auto-generate a random 64-hex secret.
   @ApiPropertyOptional({
     description:
-      'Ingress HMAC secret shared with the provider. Omit to auto-generate a random 64-hex secret. Masked (****) on every read.',
+      "Ingress HMAC secret shared with the provider. Omit to auto-generate a random 64-hex secret. Masked ('***') on every later read; plaintext returned only once on create/regenerate-secret.",
     writeOnly: true,
+    minLength: 16,
+    maxLength: 512,
     example: 'super-secret-provider-webhook-key',
   })
   @IsOptional()
@@ -65,16 +81,26 @@ export class UpdateInstanceDto {
     example: true,
   })
   @ToStrictBoolean()
-  @IsOptional()
+  // Not @IsOptional: that also skips null, which then reaches the NOT NULL column as a 500.
+  @ValidateIf((o: UpdateInstanceDto) => o.enabled !== undefined)
   @IsBoolean()
   enabled?: boolean;
 
-  @ApiPropertyOptional({ description: 'Session id the instance is scoped to. Omit for all sessions.' })
+  // @IsOptional skips null as well as undefined, so null reaches the service, which stores it as the
+  // same null an unscoped create does.
+  @ApiPropertyOptional({
+    description: 'Session id to bind the instance to, or null for all sessions. Omit to leave the scope unchanged.',
+    nullable: true,
+    // `string | null` reduces to `Object` under emitDecoratorMetadata; declare the real type.
+    type: String,
+    minLength: 1,
+    maxLength: 256,
+  })
   @IsOptional()
   @IsString()
-  @IsNotEmpty({ message: 'sessionScope must not be empty (omit it for all sessions)' })
+  @IsNotEmpty({ message: 'sessionScope must not be empty (send null for all sessions)' })
   @MaxLength(256)
-  sessionScope?: string;
+  sessionScope?: string | null;
 
   @ApiPropertyOptional({ description: 'Per-instance config slice passed to the adapter.' })
   @IsOptional()

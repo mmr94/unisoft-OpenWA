@@ -7,9 +7,9 @@ import { createLogger } from '../../common/services/logger.service';
 import { resolveNonNegativeIntEnv } from '../../config/configuration';
 
 export interface PendingMessageReaperOptions {
-  // Sweep cadence. 0 disables the reaper (mirrors INGRESS_RECONCILE_INTERVAL_MS). A blank or
-  // otherwise unparseable value falls back to the default rather than disabling the sweep, so a
-  // mis-set variable can never silently turn the reaper off.
+  // Sweep cadence. 0 disables the reaper (mirrors INGRESS_RECONCILE_INTERVAL_MS). A blank value
+  // falls back to the default; boot validation refuses a negative or unparseable one, so a mis-set
+  // variable can never silently turn the reaper off.
   intervalMs: number;
   // An outgoing PENDING row only becomes reap-eligible once it is older than this — the live send
   // path gets the whole window to persist its own SENT/FAILED outcome first.
@@ -45,15 +45,17 @@ export interface PendingMessageReaperStats {
  * performs for every persisted outbound state — so a provider's copy reconciles to the terminal
  * state instead of staying stuck at the initial PENDING write.
  *
- * Mirrors IngressReconcilerService's lifecycle: a raw unref'd setInterval started on module init
- * (first sweep after one interval), cleared on destroy. Young PENDING rows (a send still in flight)
- * and non-outgoing rows are never touched.
+ * Same timer lifecycle as IngressReconcilerService: a raw unref'd setInterval started on module init
+ * (first sweep after one interval) and cleared on destroy. Destroy also stops a pass in flight and
+ * waits for it. Young PENDING rows (a send still in flight) and non-outgoing rows are never touched.
  */
 @Injectable()
 export class PendingMessageReaperService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = createLogger('PendingMessageReaperService');
   private timer?: ReturnType<typeof setInterval>;
-  private sweeping = false;
+  // The pass in flight, settled when it ends; doubles as the overlap guard.
+  private inFlight?: Promise<void>;
+  private stopping = false;
 
   constructor(
     @InjectRepository(Message, 'data') private readonly messages: Repository<Message>,
@@ -63,7 +65,7 @@ export class PendingMessageReaperService implements OnModuleInit, OnModuleDestro
   onModuleInit(): void {
     const opts = resolvePendingMessageReaperOptions();
     if (opts.intervalMs <= 0) {
-      this.logger.log('Pending message reaper disabled (MESSAGE_REAPER_INTERVAL_MS <= 0)');
+      this.logger.log('Pending message reaper disabled (MESSAGE_REAPER_INTERVAL_MS=0)');
       return;
     }
     this.timer = setInterval(() => {
@@ -74,8 +76,16 @@ export class PendingMessageReaperService implements OnModuleInit, OnModuleDestro
     this.timer.unref?.();
   }
 
-  onModuleDestroy(): void {
+  /**
+   * Clearing the interval only stops the NEXT pass. A pass already running would go on writing
+   * FAILED rows while plugins unregister their hooks and the DataSource closes, so its re-emitted
+   * `message:persisted` reaches no handler and the provider's copy stays PENDING for good (the
+   * reaper never revisits a FAILED row). Stop it at the next row and wait for the row in hand.
+   */
+  async onModuleDestroy(): Promise<void> {
+    this.stopping = true;
     if (this.timer) clearInterval(this.timer);
+    await this.inFlight;
   }
 
   /**
@@ -85,8 +95,9 @@ export class PendingMessageReaperService implements OnModuleInit, OnModuleDestro
    */
   async sweep(opts: PendingMessageReaperOptions, now: Date = new Date()): Promise<PendingMessageReaperStats> {
     const stats: PendingMessageReaperStats = { scanned: 0, reaped: 0, failed: 0 };
-    if (this.sweeping) return stats;
-    this.sweeping = true;
+    if (this.inFlight || this.stopping) return stats;
+    let settle!: () => void;
+    this.inFlight = new Promise(resolve => (settle = resolve));
     try {
       const cutoff = new Date(now.getTime() - opts.graceMs);
       const rows = await this.messages.find({
@@ -99,6 +110,7 @@ export class PendingMessageReaperService implements OnModuleInit, OnModuleDestro
         take: opts.batchSize,
       });
       for (const row of rows) {
+        if (this.stopping) break;
         stats.scanned++;
         try {
           if (await this.reapRow(row, now)) {
@@ -122,7 +134,8 @@ export class PendingMessageReaperService implements OnModuleInit, OnModuleDestro
       }
       return stats;
     } finally {
-      this.sweeping = false;
+      this.inFlight = undefined;
+      settle();
     }
   }
 

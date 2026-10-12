@@ -12,7 +12,7 @@
     "cancel": "취소",
     "delete": "삭제",
     "create": "생성",
-    "save": "Save",
+    "save": "저장",
     "close": "닫기",
     "showApiKey": "API 키 표시",
     "hideApiKey": "API 키 숨기기",
@@ -32,8 +32,11 @@
     "never": "없음",
     "justNow": "방금 전",
     "minAgo": "{{count}}분 전",
+    "minAgo_other": "{{count}}분 전",
     "hoursAgo": "{{count}}시간 전",
+    "hoursAgo_other": "{{count}}시간 전",
     "optional": "선택 사항",
+    "fieldTooLong": "최대 {{max}}자입니다(현재 {{count}}자).",
     "language": "언어",
     "back": "뒤로",
     "next": "다음",
@@ -88,6 +91,7 @@
     "noMessageYet": "아직 메시지 없음",
     "unreadBadge": "읽지 않은 메시지 {{count}}개",
     "unreadBadge_other": "읽지 않은 메시지 {{count}}개",
+    "markedUnread": "읽지 않음으로 표시됨",
     "loadingMessages": "메시지 불러오는 중...",
     "loadingOlderMessages": "이전 메시지 불러오는 중...",
     "loadOlderMessagesError": "이전 메시지를 불러오지 못했습니다. 위로 스크롤하여 다시 시도하세요.",
@@ -99,8 +103,26 @@
       "delete": "메시지 삭제"
     },
     "replyingTo": "{{name}}님에게 답장",
+    "messageType": {
+      "text": "텍스트",
+      "image": "이미지",
+      "video": "동영상",
+      "audio": "오디오",
+      "voice": "음성 메시지",
+      "document": "문서",
+      "sticker": "스티커",
+      "location": "위치",
+      "contact": "연락처",
+      "poll": "투표",
+      "call": "통화",
+      "revoked": "삭제된 메시지",
+      "order": "주문",
+      "product": "상품",
+      "masked": "가려진 메시지",
+      "unknown": "메시지",
+      "unknownType": "알 수 없는 유형"
+    },
     "you": "나",
-    "youPrefix": "나: ",
     "yesterday": "어제",
     "attachTitle": "파일 / 이미지 보내기",
     "emojiTitle": "이모지 선택",
@@ -121,7 +143,9 @@
       "group": "그룹",
       "channel": "채널",
       "status": "상태",
-      "broadcast": "브로드캐스트"
+      "broadcast": "브로드캐스트",
+      "individual": "개인",
+      "unknown": "알 수 없음"
     },
     "tab": {
       "chats": "채팅",
@@ -165,7 +189,8 @@
       "react": "메시지에 반응하지 못했습니다",
       "delete": "메시지를 삭제하지 못했습니다",
       "clickButton": "버튼 클릭에 실패했습니다",
-      "fileTooLarge": "파일이 너무 큽니다 (최대 18 MB)"
+      "fileTooLarge": "파일이 너무 큽니다 (최대 18 MB)",
+      "searchHitSessionNotReady": "이 메시지의 세션이 연결되어 있지 않습니다"
     },
     "loadMessagesError": "메시지를 불러올 수 없습니다. 서버 로그를 확인하세요.",
     "messageStatus": {
@@ -216,6 +241,7 @@
     "noSessions": "세션이 없습니다. 세션을 생성해 시작하세요.",
     "view": "보기",
     "disconnect": "연결 해제",
+    "disconnectFailed": "세션 연결을 해제할 수 없습니다",
     "errorPrefix": "오류: {{message}}",
     "loadError": "데이터를 불러오지 못했습니다",
     "charts": {
@@ -226,6 +252,7 @@
         "30d": "30일"
       },
       "overTime": "시간별 메시지 추이",
+      "overTimeUtcDays": "시간별 메시지 추이 (UTC 기준 날짜)",
       "byType": "유형별 메시지",
       "topChats": "인기 채팅",
       "sent": "보냄",
@@ -275,7 +302,8 @@
       "successTitle": "세션 생성 완료",
       "successDesc": "\"{{name}}\" 세션이 생성되었습니다",
       "errorTitle": "생성 실패",
-      "errorDefault": "세션을 생성하지 못했습니다"
+      "errorDefault": "세션을 생성하지 못했습니다",
+      "tooShort": "이름은 3자 이상이어야 합니다."
     },
     "delete": {
       "title": "삭제 확인",
@@ -312,25 +340,25 @@
       "autoRejectCallsHint": "수신 통화가 울리는 즉시 거절됩니다. call.received 웹훅은 그전에 그대로 전송됩니다. 다음 통화부터 적용되며 재시작이 필요하지 않습니다. Baileys 엔진에서만 동작합니다. whatsapp-web.js에서는 통화를 거절할 수 없습니다."
     },
     "proxy": {
-      "title": "Proxy Configuration",
-      "status": "Current",
-      "enabled": "Use proxy",
-      "url": "Proxy URL",
+      "title": "프록시 설정",
+      "status": "현재",
+      "enabled": "프록시 사용",
+      "url": "프록시 URL",
       "urlPlaceholder": "http://user:pass@proxy.example.com:8080",
-      "urlKeepPlaceholder": "Enter new URL to replace {{host}} (credentials not shown)",
+      "urlKeepPlaceholder": "{{host}}을(를) 대체할 새 URL을 입력하세요 (자격 증명은 표시되지 않음)",
       "configured": "{{host}} ({{type}})",
-      "noProxy": "No proxy configured",
-      "hasCredentials": "Credentials are stored but not shown. Enter a full URL to change them.",
-      "hint": "Changes apply on the next session start, not to a running connection. The proxy must be real and reachable — an unreachable value blocks QR delivery and start returns 504.",
-      "createHint": "Only needed when your network cannot reach WhatsApp directly. Must be a real, reachable proxy.",
-      "invalidUrl": "Enter a valid http, https, socks4, or socks5 proxy URL.",
-      "saveSuccessTitle": "Proxy Saved",
-      "saveSuccess": "Proxy settings saved. They apply on the next session start.",
-      "saveError": "Failed to save proxy settings"
+      "noProxy": "구성된 프록시 없음",
+      "hasCredentials": "자격 증명이 저장되어 있지만 표시되지 않습니다. 변경하려면 전체 URL을 입력하세요.",
+      "hint": "변경 사항은 실행 중인 연결이 아니라 다음 세션 시작 시 적용됩니다. 프록시는 실제로 존재하고 연결 가능해야 합니다. 연결할 수 없는 값이면 QR이 전달되지 않습니다. whatsapp-web.js에서는 시작 요청이 504를 반환하고, Baileys에서는 시작은 성공하지만 세션이 계속 재시도합니다.",
+      "createHint": "네트워크에서 WhatsApp에 직접 연결할 수 없을 때만 필요합니다. 실제로 연결 가능한 프록시여야 합니다.",
+      "invalidUrl": "유효한 http, https, socks4 또는 socks5 프록시 URL을 입력하세요.",
+      "saveSuccessTitle": "프록시 저장 완료",
+      "saveSuccess": "프록시 설정이 저장되었습니다. 다음 세션 시작 시 적용됩니다.",
+      "saveError": "프록시 설정을 저장하지 못했습니다"
     },
     "actions": {
       "view": "보기",
-      "proxy": "Proxy",
+      "proxy": "프록시",
       "start": "시작",
       "stop": "중지",
       "reconnect": "재연결",
@@ -346,7 +374,8 @@
       "actionRequiredTitle": "조치 필요",
       "actionRequiredDesc": "이 세션에 주의가 필요합니다. 할 일을 확인하려면 세션을 여세요.",
       "failedTitle": "세션 실패",
-      "failedDesc": "WhatsApp 세션을 시작하지 못했습니다. 세션을 열어 원인을 확인하세요."
+      "failedDesc": "WhatsApp 세션을 시작하지 못했습니다. 세션을 열어 원인을 확인하세요.",
+      "stopFailedTitle": "중지 실패"
     },
     "card": {
       "phone": "전화번호",
@@ -419,11 +448,13 @@
     "selectSession": "세션 선택...",
     "session": "세션",
     "events": "이벤트",
+    "noEvents": "이벤트를 하나 이상 선택하세요.",
     "available": "사용 가능한 이벤트",
     "saveChanges": "변경 사항 저장",
     "filters": {
       "title": "필터 (선택 사항)",
       "hint": "모든 조건이 일치할 때만 실행됩니다. 메시지 이벤트에 적용됩니다.",
+      "incomplete": "모든 필터 조건에 값을 지정하고, 조건은 최대 20개, 조건당 값은 최대 100개, 텍스트는 최대 1000자까지 사용하세요.",
       "badge": "필터 {{count}}개",
       "badge_other": "필터 {{count}}개",
       "addCondition": "조건 추가",
@@ -441,7 +472,7 @@
         "body": "메시지 본문",
         "type": "메시지 유형",
         "isGroup": "그룹 채팅 여부",
-        "kind": "Chat kind",
+        "kind": "채팅 유형",
         "fromMe": "내가 보낸 메시지",
         "hasMedia": "미디어 포함",
         "mentions": "멘션"
@@ -457,15 +488,16 @@
       "valueLabel": "필터 값"
     },
     "columns": {
-      "url": "URL",
       "events": "이벤트",
       "session": "세션",
-      "status": "상태",
-      "actions": "작업"
+      "status": "상태"
     },
     "empty": {
       "title": "설정된 웹훅이 없습니다",
-      "description": "실시간 이벤트 알림을 받으려면 웹훅을 추가하세요"
+      "description": "실시간 이벤트 알림을 받으려면 웹훅을 추가하세요",
+      "loadErrorTitle": "웹훅을 불러올 수 없습니다",
+      "forbiddenTitle": "웹훅에 접근할 수 없습니다",
+      "forbiddenDesc": "웹훅을 사용하려면 운영자 또는 관리자 역할의 API 키가 필요합니다."
     },
     "toasts": {
       "created": "웹훅이 생성되었습니다",
@@ -486,10 +518,55 @@
     "eventDescriptions": {
       "message.received": "메시지를 받았을 때",
       "message.sent": "메시지를 보냈을 때",
-      "session.connected": "세션이 연결되었을 때",
-      "session.disconnected": "세션 연결이 끊어졌을 때",
+      "message.ack": "메시지의 전달 또는 읽음 상태가 바뀌었을 때",
+      "message.failed": "보낸 메시지의 전달이 실패했을 때",
+      "message.revoked": "메시지가 모두에게서 삭제되었을 때",
+      "message.reaction": "반응이 추가, 변경 또는 삭제되었을 때",
+      "message.edited": "메시지가 수정되었을 때",
+      "session.status": "세션 상태가 바뀌었을 때",
       "session.qr": "QR 코드가 생성되었을 때",
+      "session.authenticated": "세션이 연결되어 준비되었을 때",
+      "session.disconnected": "세션 연결이 끊어졌을 때",
+      "session.reconnect_loop": "세션 재연결이 계속 실패할 때",
+      "session.restriction": "WhatsApp이 계정을 제한하거나 제한을 해제했을 때",
+      "presence.update": "구독한 채팅이 온라인이 되거나 입력 중이거나 오프라인이 되었을 때",
+      "group.join": "참여자가 그룹에 참여하거나 추가되었을 때",
+      "group.leave": "참여자가 그룹을 나가거나 내보내졌을 때",
+      "group.update": "그룹 이름, 설명 또는 설정이 바뀌었을 때",
+      "group.join_request": "이 세션이 관리하는 그룹에 누군가 참여를 요청했을 때",
+      "call.received": "수신 통화가 울리기 시작했을 때",
+      "call.accepted": "통화가 연결되었을 때",
+      "call.rejected": "통화가 거절되었을 때",
+      "call.missed": "통화에 응답하지 않았을 때",
+      "status.received": "연락처가 상태를 게시했을 때",
       "all": "모든 이벤트"
+    },
+    "auth": {
+      "title": "전송 인증",
+      "hint": "선택 사항입니다. 저장된 값은 저장 후 다시 표시되지 않습니다.",
+      "editHint": "저장된 시크릿과 헤더는 표시되지 않습니다. 유지하려면 이 섹션을 변경하지 마세요.",
+      "secret": "서명 시크릿",
+      "secretHint": "16~255자. 모든 전송에는 X-OpenWA-Signature 헤더에 HMAC-SHA256 서명이 포함됩니다.",
+      "secretKeepPlaceholder": "현재 시크릿을 유지하려면 비워 두세요",
+      "generateSecret": "생성",
+      "copySecret": "복사",
+      "secretCopied": "서명 시크릿이 복사되었습니다",
+      "removeSecret": "전송 서명 중지 (시크릿 제거)",
+      "headers": "사용자 지정 헤더",
+      "headerName": "헤더 이름",
+      "headerValue": "헤더 값",
+      "addHeader": "헤더 추가",
+      "removeHeader": "헤더 제거",
+      "replaceHeaders": "사용자 지정 헤더 교체",
+      "replaceHint": "이 행들이 저장된 모든 헤더를 대체합니다. 행이 없으면 저장된 헤더가 제거됩니다.",
+      "errors": {
+        "headerName": "헤더 이름에는 문자, 숫자, 하이픈만 사용할 수 있습니다.",
+        "headerValue": "헤더 값은 최대 1024자이며 제어 문자나 Latin-1 범위 밖의 문자를 사용할 수 없습니다.",
+        "headerReserved": "Content-Type, User-Agent, X-OpenWA-* 및 연결 헤더는 게이트웨이가 설정하므로 사용할 수 없습니다.",
+        "headerDuplicate": "각 헤더 이름은 한 번만 사용할 수 있습니다.",
+        "tooMany": "사용자 지정 헤더는 최대 50개까지 허용됩니다.",
+        "secretLength": "서명 시크릿은 16~255자여야 합니다."
+      }
     }
   },
   "templates": {
@@ -523,6 +600,7 @@
     },
     "empty": {
       "title": "저장된 템플릿이 없습니다",
+      "noMatch": "검색과 일치하는 템플릿이 없습니다.",
       "description": "자주 쓰는 답장이나 알림을 빠르게 보내려면 재사용 가능한 템플릿을 만드세요.",
       "noSessionsTitle": "사용 가능한 세션이 없습니다",
       "noSessionsDesc": "템플릿을 추가하기 전에 WhatsApp 세션을 만드세요.",
@@ -549,6 +627,7 @@
     "createdTitle": "API 키 생성 완료",
     "createdHint": "지금 이 키를 복사해 두세요. 다시 확인할 수 없습니다.",
     "namePlaceholder": "예: Production Key",
+    "nameTooShort": "3자 이상 입력하세요.",
     "rolesTitle": "역할 안내",
     "roles": {
       "admin": "관리자",
@@ -567,15 +646,20 @@
       "status": "상태",
       "lastUsed": "마지막 사용",
       "actions": "작업",
-      "sessions": "세션"
+      "sessions": "세션",
+      "restrictions": "제한"
     },
     "statuses": {
       "active": "활성",
-      "revoked": "폐기됨"
+      "revoked": "폐기됨",
+      "expired": "만료됨"
     },
     "empty": {
       "title": "생성된 API 키가 없습니다",
-      "description": "요청을 인증하려면 API 키를 생성하세요"
+      "description": "요청을 인증하려면 API 키를 생성하세요",
+      "loadErrorTitle": "API 키를 불러올 수 없습니다",
+      "forbiddenTitle": "API 키에 접근할 수 없습니다",
+      "forbiddenDesc": "API 키를 관리하려면 특정 세션으로 제한되지 않은 관리자 키가 필요합니다."
     },
     "confirm": {
       "deleteTitle": "API 키 삭제",
@@ -586,10 +670,9 @@
       "revoke": "폐기"
     },
     "actions": {
-      "copy": "복사",
       "revoke": "폐기",
       "delete": "삭제",
-      "editSessions": "세션 편집"
+      "edit": "접근 편집"
     },
     "sessions": {
       "label": "세션 접근",
@@ -597,10 +680,36 @@
       "all": "모든 세션",
       "empty": "아직 세션이 없습니다. 세션이 생기면 이 키는 모두에 접근할 수 있습니다.",
       "restricted": "{{count}}개 선택됨",
-      "editTitle": "세션 접근 편집",
       "save": "저장",
       "choose": "세션 선택",
       "leaveAll": "모든 세션에 두기"
+    },
+    "edit": {
+      "title": "키 접근 편집",
+      "signedIn": "이 대시보드는 이 키로 로그인되어 있습니다. 역할, IP 주소, 채팅 또는 만료를 변경하면 로그아웃될 수 있습니다."
+    },
+    "restrictions": {
+      "none": "없음",
+      "ips": "IP: {{count}}",
+      "chats": "채팅: {{count}}",
+      "expires": "{{date}}에 만료",
+      "expired": "{{date}}에 만료됨"
+    },
+    "ips": {
+      "label": "허용된 IP 주소 (선택)",
+      "hint": "한 줄에 IP 주소 또는 CIDR 범위 하나. 모든 주소를 허용하려면 비워 두세요.",
+      "invalid": "IPv4 주소 또는 CIDR 범위가 아닙니다: {{value}}"
+    },
+    "chats": {
+      "label": "채팅 접근 (선택)",
+      "hint": "한 줄에 채팅 하나: @g.us로 끝나는 그룹 ID, @c.us 또는 @lid로 끝나는 연락처 ID, 또는 전화번호. 모든 채팅을 허용하려면 비워 두세요. 채팅이 제한된 키는 해당 키에 열린 경로만 사용할 수 있으며, 이벤트 WebSocket과 MCP는 이를 거부합니다.",
+      "invalid": "채팅 ID 또는 전화번호가 아닙니다: {{value}}"
+    },
+    "expiry": {
+      "label": "만료 시각 (선택)",
+      "hint": "이 브라우저의 시간대 기준입니다. 만료되지 않는 키는 비워 두세요.",
+      "clear": "만료 제거",
+      "invalid": "9999년까지의 날짜와 시간을 모두 입력하거나, 만료되지 않는 키는 필드를 비우세요."
     }
   },
   "logs": {
@@ -628,7 +737,12 @@
       "filteredTitle": "이 페이지에 일치하는 항목이 없습니다",
       "filteredDescription": "검색은 현재 페이지만 필터링합니다. 지우거나 페이지를 이동하거나 서버 측 심각도 필터를 사용하세요.",
       "filteredServerDescription": "이 필터에 일치하는 로그가 없습니다. 검색 범위를 넓히려면 심각도 필터를 조정하세요."
-    }
+    },
+    "exportFailed": "감사 로그를 내보내지 못했습니다",
+    "exportTruncated": "내보내기에는 최신 항목 {{rows}}개만 포함됩니다. 이전 항목을 내보내려면 심각도 필터를 좁히세요.",
+    "exportThrottled": "게이트웨이가 감사 로그 조회를 제한하고 있어 내보내기에는 최신 항목 {{rows}}개만 포함됩니다. 1분 후 다시 내보내세요.",
+    "exportNoMatches": "검색과 일치하는 감사 로그 항목이 없어 아무것도 내보내지 않았습니다.",
+    "exportNoMatchesTruncated": "검사한 최신 항목 {{rows}}개 중 검색과 일치하는 항목이 없어 아무것도 내보내지 않았습니다. 이전 항목은 검색하지 않았습니다."
   },
   "messageTester": {
     "title": "메시지 테스터",
@@ -770,7 +884,7 @@
       "sslRejectUnauthorized": "SSL 인증서 확인",
       "sslRejectUnauthorizedDesc": "자체 서명되었거나 유효하지 않은 인증서를 거부합니다. 자체 서명 인증서를 사용하는 관리형 Postgres(Supabase, Heroku, Render, Railway)에서는 꺼 두세요.",
       "migrationsTitle": "데이터베이스 마이그레이션",
-      "migrationsStatus": "스키마는 TypeORM으로 자동 동기화됩니다",
+      "migrationsStatus": "대기 중인 마이그레이션은 시작 시 자동으로 적용됩니다",
       "migrationsHint": "마이그레이션은 자동으로 관리됩니다. 수동 마이그레이션은 CLI를 사용하세요."
     },
     "engine": {
@@ -793,7 +907,7 @@
     "redis": {
       "title": "Redis",
       "enable": "Redis 사용",
-      "enableDesc": "캐싱, 세션 저장, BullMQ 큐에 필요합니다",
+      "enableDesc": "캐싱, BullMQ 큐, 속도 제한 카운터, 멀티 노드 WebSocket 팬아웃에 사용됩니다",
       "useBuiltIn": "내장 Redis 컨테이너 사용",
       "builtInDesc": "OpenWA가 Redis 컨테이너를 관리합니다",
       "queueTitle": "BullMQ 큐 시스템 사용",
@@ -805,7 +919,7 @@
       "failed": "실패",
       "viewBullMq": "Bull MQ 대시보드 보기",
       "disabledTitle": "Redis 사용 안 함",
-      "disabledDesc": "캐싱, 세션 저장, BullMQ 메시지 큐를 사용하려면 Redis를 활성화하세요.",
+      "disabledDesc": "캐싱, BullMQ 메시지 큐, 속도 제한 카운터, 멀티 노드 WebSocket 팬아웃을 사용하려면 Redis를 활성화하세요.",
       "passwordOptional": "(선택 사항)",
       "bullMqUrlCopied": "Bull MQ 대시보드 URL이 복사되었습니다",
       "bullMqUrlHint": "ADMIN API 키로 열어 주세요 — 브라우저 탭은 인증할 수 없습니다."
@@ -840,12 +954,12 @@
       "storageWarning": "기존 미디어 파일은 새 스토리지 백엔드로 자동 이동되지 않으며 기존 위치에 그대로 남습니다.",
       "downloadBackup": "먼저 백업 다운로드",
       "backupTitle": "데이터 백업 및 복원",
-      "backupHint": "데이터베이스를 전환하기 전에 모든 데이터를 JSON으로 내보낸 후 전환이 끝나면 가져오세요. 백업에는 웹훅 시크릿과 프록시 자격 증명이 평문으로 포함되어 있으니 안전하게 보관하고 복원 후 삭제하세요.",
+      "backupHint": "데이터베이스를 전환하기 전에 모든 데이터를 JSON으로 내보낸 후 전환이 끝나면 가져오세요. 웹훅 서명 시크릿, 웹훅 사용자 지정 헤더, 프록시 자격 증명은 포함되지 않으므로 복원 후 다시 입력하세요. 통합 인스턴스의 시크릿과 설정은 평문으로 포함되니 파일을 안전하게 보관하고 복원 후 삭제하세요.",
       "export": "데이터 내보내기",
       "import": "데이터 가져오기",
       "exportFailed": "데이터를 내보내지 못했습니다",
-      "exportPartialTitle": "Backup is missing some media",
-      "exportPartial": "{{count}} attachment payload(s) exceeded the export media budget and were saved as placeholders. The messages restore; their media does not.",
+      "exportPartialTitle": "백업에 일부 미디어가 누락되었습니다",
+      "exportPartial": "첨부 파일 {{count}}개가 내보내기 미디어 한도를 초과하여 플레이스홀더로 저장되었습니다. 메시지는 복원되지만 해당 미디어는 복원되지 않습니다.",
       "importFailed": "데이터를 가져오지 못했습니다",
       "importOk": "데이터를 가져왔습니다",
       "importConfirm": "가져오기를 실행하면 현재 데이터가 백업본({{rows}}행)으로 완전히 대체됩니다. 되돌릴 수 없습니다. 계속할까요?",
@@ -865,13 +979,15 @@
       "checking": "서버 상태를 확인하는 중...",
       "dontClose": "이 창을 닫지 마세요",
       "successMsg": "서버가 다시 온라인 상태입니다! 페이지가 자동으로 새로고침됩니다.",
-      "errorMsg": "서버가 30초 동안 응답하지 않았습니다. Docker 로그를 확인하고 수동으로 재시작하세요.",
+      "errorMsg": "서버가 응답하지 않았습니다. Docker 로그를 확인하고 수동으로 재시작하세요.",
+      "outcomeUnknown": "서버가 응답하기 전에 프록시가 오류를 반환하여 재시작이 진행 중인지 알 수 없습니다. 1분 후 페이지를 새로고침하여 확인하세요.",
       "reload": "페이지 새로고침"
     },
     "toasts": {
       "saveFailed": "저장 실패"
     },
-    "statusLoadError": "현재 인프라 상태를 불러올 수 없습니다. 새로고침 후 다시 시도하세요."
+    "statusLoadError": "현재 인프라 상태를 불러올 수 없습니다. 새로고침 후 다시 시도하세요.",
+    "configLoadError": "저장된 설정을 불러올 수 없어 여기에서 편집할 수 없습니다. 새로고침 후 다시 시도하세요."
   },
   "plugins": {
     "title": "플러그인",
@@ -879,6 +995,19 @@
     "refresh": "새로고침",
     "builtIn": "내장",
     "noDescription": "설명 없음",
+    "statuses": {
+      "installed": "설치됨",
+      "enabled": "사용함",
+      "disabled": "사용 안 함",
+      "error": "오류"
+    },
+    "types": {
+      "engine": "엔진",
+      "storage": "스토리지",
+      "queue": "큐",
+      "auth": "인증",
+      "extension": "확장"
+    },
     "enable": "사용",
     "disable": "사용 안 함",
     "healthCheck": "상태 확인",
@@ -893,7 +1022,7 @@
     "config": {
       "title": "{{name}} 구성",
       "noOptions": "이 플러그인에 사용할 수 있는 구성 옵션이 없습니다",
-      "uiHandshakeError": "플러그인 설정 UI가 초기화되지 않았습니다. 사용 가능한 경우 아래 스키마 양식을 이용하세요.",
+      "uiHandshakeError": "플러그인 설정 UI가 초기화되지 않았습니다.",
       "save": "설정 저장",
       "addItem": "추가",
       "tabConfig": "설정",
@@ -924,7 +1053,7 @@
       "healthFail": "상태 확인 실패",
       "healthError": "상태 확인 오류",
       "savedTitle": "설정 저장 완료",
-      "savedDesc": "변경 사항을 적용하려면 서버를 재시작해야 합니다.",
+      "savedDesc": "변경 사항은 서버를 재시작하지 않아도 적용됩니다.",
       "saveFailed": "저장 실패",
       "installed": "플러그인이 설치되었습니다",
       "installFailed": "설치 실패",
@@ -953,7 +1082,6 @@
       "title": "인스턴스",
       "description": "이 연동을 위해 계정별 인스턴스를 프로비저닝하세요. 각 인스턴스는 고유한 서명 시크릿과 인그레스 URL을 가집니다.",
       "create": "인스턴스 생성",
-      "save": "Save",
       "empty": "아직 인스턴스가 없습니다. 인스턴스를 만들면 인그레스 URL과 시크릿을 받을 수 있습니다.",
       "loadError": "인스턴스를 불러오지 못했습니다.",
       "allSessions": "모든 세션",
@@ -977,7 +1105,8 @@
         "title": "인스턴스 생성 완료",
         "hint": "지금 시크릿을 복사해 두세요 — 한 번만 표시됩니다.",
         "secret": "서명 시크릿",
-        "ingressUrls": "인그레스 URL"
+        "ingressUrls": "인그레스 URL",
+        "verifyToken": "인증 토큰"
       },
       "regenerate": {
         "title": "시크릿 재생성",
@@ -1029,7 +1158,7 @@
   },
   "search": {
     "placeholder": "메시지 검색…",
-    "results": "결과 {{count}}개",
+    "loadMore": "더 보기 ({{total}}개 중 {{shown}}개)",
     "empty": "메시지를 찾을 수 없습니다.",
     "error": "검색에 실패했습니다. 다시 시도하세요.",
     "unavailable": "검색이 설정되어 있지 않습니다.",

@@ -4,7 +4,7 @@
   overflow-x: hidden;
 }
 
-.templates-page .templates-loading,
+.templates-page.templates-loading,
 .templates-page .templates-loading-inline,
 .templates-page .templates-empty-page,
 .templates-page .templates-empty-list {
@@ -13,7 +13,7 @@
   justify-content: center;
 }
 
-.templates-page .templates-loading {
+.templates-page.templates-loading {
   min-height: 400px;
 }
 
@@ -42,7 +42,7 @@
 .templates-page .templates-library {
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--border);
+  border-inline-end: 1px solid var(--border);
   background: var(--bg-light);
 }
 
@@ -114,6 +114,11 @@
   font-size: 0.875rem;
 }
 
+.templates-page .templates-search:focus-within {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+
 .templates-page .template-list {
   display: flex;
   flex: 1;
@@ -152,12 +157,16 @@
   border-radius: 8px;
   background: transparent;
   color: inherit;
-  text-align: left;
+  text-align: start;
 }
 
-.templates-page .template-list-item:hover {
+.templates-page .template-list-item:hover:where(:not(:disabled)) {
   border-color: var(--border);
   background: var(--bg-white);
+}
+
+.templates-page .template-list-item:disabled {
+  cursor: not-allowed;
 }
 
 .templates-page .template-list-item.selected {
@@ -187,7 +196,7 @@
 .templates-page .template-list-meta {
   overflow: hidden;
   color: var(--text-muted);
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-family: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, monospace;
   font-size: 0.6875rem;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -280,7 +289,7 @@
 .templates-page .template-preview {
   display: flex;
   flex-direction: column;
-  border-left: 1px solid var(--border);
+  border-inline-start: 1px solid var(--border);
   background: var(--bg-light);
 }
 
@@ -313,7 +322,7 @@
   border-radius: 8px;
   background: var(--bg-white);
   color: var(--text-primary);
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-family: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, monospace;
   font-size: 0.875rem;
   line-height: 1.6;
   white-space: pre-wrap;
@@ -340,7 +349,7 @@
 
 .templates-page .placeholder-list label > span {
   color: var(--primary-text);
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-family: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, monospace;
 }
 
 .templates-page .template-muted {
@@ -420,7 +429,7 @@
     display: grid;
     grid-template-columns: 1fr 320px;
     border-top: 1px solid var(--border);
-    border-left: 0;
+    border-inline-start: 0;
   }
 
   .templates-page .template-preview-header {
@@ -450,7 +459,7 @@
 
   .templates-page .templates-library {
     max-height: 360px;
-    border-right: 0;
+    border-inline-end: 0;
     border-bottom: 1px solid var(--border);
   }
 

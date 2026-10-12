@@ -1,6 +1,8 @@
+import { DECORATORS } from '@nestjs/swagger';
 import { validateSync } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
 import { SearchQueryDto } from './search-query.dto';
+import { SEARCH_OFFSET_MAX } from '../search.constants';
 
 describe('SearchQueryDto', () => {
   // Mirrors how the global ValidationPipe (transform:true + enableImplicitConversion) instantiates
@@ -44,6 +46,11 @@ describe('SearchQueryDto', () => {
     expect(validateSync(dto).some(e => e.property === 'offset')).toBe(true);
   });
 
+  it('rejects offset above SEARCH_OFFSET_MAX instead of letting the service clamp it to a repeated page', () => {
+    expect(validateSync(fromQuery({ q: 'hello', offset: '100001' })).some(e => e.property === 'offset')).toBe(true);
+    expect(validateSync(fromQuery({ q: 'hello', offset: '100000' }))).toHaveLength(0);
+  });
+
   it('rejects an invalid direction (@IsEnum(MessageDirection))', () => {
     const dto = fromQuery({ q: 'hello', direction: 'sideways' });
     expect(validateSync(dto).some(e => e.property === 'direction')).toBe(true);
@@ -62,5 +69,13 @@ describe('SearchQueryDto', () => {
   it('accepts a minimal valid query with only q', () => {
     const dto = fromQuery({ q: 'hello' });
     expect(validateSync(dto)).toHaveLength(0);
+  });
+
+  // @nestjs/swagger derives no bounds from @IsInt/@Min/@Max, so the decorator has to state them.
+  it('publishes limit and offset as bounded integers', () => {
+    const published = (key: string): unknown =>
+      Reflect.getMetadata(DECORATORS.API_MODEL_PROPERTIES, SearchQueryDto.prototype, key);
+    expect(published('limit')).toMatchObject({ type: 'integer', minimum: 1 });
+    expect(published('offset')).toMatchObject({ type: 'integer', minimum: 0, maximum: SEARCH_OFFSET_MAX });
   });
 });

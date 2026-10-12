@@ -125,6 +125,34 @@ describe('HookManager', () => {
     expect(res.data).toBe('original'); // but the errored mutation is not carried out on stop
   });
 
+  it('skips a result the caller cannot use, keeping an earlier handler rewrite', async () => {
+    const isMessage = (d: unknown) => typeof d === 'object' && d !== null && 'id' in d;
+    hm.register(
+      'redact',
+      'message:received',
+      async ctx => ({
+        continue: true,
+        data: { ...(ctx.data as object), body: '[redacted]' },
+      }),
+      10,
+    );
+    hm.register('bot', 'message:received', async () => ({ continue: true, data: null }), 100);
+
+    const guarded = await hm.execute<unknown>(
+      'message:received',
+      { id: 'm1', body: 'secret' },
+      {
+        source: 'test',
+        accept: isMessage,
+      },
+    );
+    expect(guarded.data).toEqual({ id: 'm1', body: '[redacted]' });
+
+    // Without `accept` any defined data is adopted, as before.
+    const unguarded = await hm.execute<unknown>('message:received', { id: 'm1', body: 'secret' }, { source: 'test' });
+    expect(unguarded.data).toBeNull();
+  });
+
   it('register/unregister/hasHooks/getHookCount track registrations', () => {
     expect(hm.hasHooks('session:created')).toBe(false);
     const id = hm.register('p', 'session:created', async ctx => ({ continue: true, data: ctx.data }));
@@ -155,10 +183,12 @@ describe('HookManager re-entrancy guard', () => {
 
   it('short-circuits a handler that re-fires the same event (no infinite recursion)', async () => {
     let calls = 0;
+    // Captured and asserted outside the handler: runHandlers isolates handler errors, so an expect
+    // thrown inside the handler would be logged and swallowed instead of failing the test.
+    let inner: HookResult | undefined;
     manager.register('p1', 'message:sending', async (ctx: HookContext): Promise<HookResult> => {
       calls += 1;
-      const inner = await manager.execute('message:sending', ctx.data, { source: 'test' });
-      expect(inner).toEqual({ continue: true, data: ctx.data });
+      inner = await manager.execute('message:sending', ctx.data, { source: 'test' });
       return { continue: true };
     });
 
@@ -166,6 +196,7 @@ describe('HookManager re-entrancy guard', () => {
 
     expect(calls).toBe(1);
     expect(result.continue).toBe(true);
+    expect(inner).toEqual({ continue: true, data: { n: 1 } });
   });
 
   it('does NOT block a handler that fires a DIFFERENT event', async () => {
@@ -186,6 +217,59 @@ describe('HookManager re-entrancy guard', () => {
   });
 });
 
+describe('HookManager priority', () => {
+  it('runs a non-numeric or non-finite priority at the default, keeping every other handler in order', async () => {
+    const hm = new HookManager();
+    const order: string[] = [];
+    const push = (name: string) => () => {
+      order.push(name);
+      return Promise.resolve({ continue: true });
+    };
+    hm.register('rewrite', 'message:sending', push('rewrite@50'), 50);
+    hm.register('junk', 'message:sending', push('junk'), 'high' as unknown as number);
+    hm.register('nan', 'message:sending', push('nan'), NaN);
+    hm.register('veto', 'message:sending', push('veto@10'), 10);
+
+    await hm.execute('message:sending', {}, { source: 't' });
+
+    expect(order).toEqual(['veto@10', 'rewrite@50', 'junk', 'nan']);
+  });
+
+  it('setPriority moves an existing registration and re-sorts its chain', async () => {
+    const hm = new HookManager();
+    const order: string[] = [];
+    hm.register('a', 'message:sent', () => (order.push('a'), Promise.resolve({ continue: true })), 100);
+    const id = hm.register('b', 'message:sent', () => (order.push('b'), Promise.resolve({ continue: true })), 200);
+
+    hm.setPriority(id, 1);
+    await hm.execute('message:sent', {}, { source: 't' });
+
+    expect(order).toEqual(['b', 'a']);
+  });
+
+  it('runs every handler once when one moves a later registration ahead of itself mid-chain', async () => {
+    const hm = new HookManager();
+    const order: string[] = [];
+    let cId = '';
+    hm.register('a', 'message:sent', () => (order.push('a'), Promise.resolve({ continue: true })), 10);
+    hm.register(
+      'b',
+      'message:sent',
+      () => {
+        order.push('b');
+        hm.setPriority(cId, 1);
+        return Promise.resolve({ continue: true });
+      },
+      20,
+    );
+    cId = hm.register('c', 'message:sent', () => (order.push('c'), Promise.resolve({ continue: true })), 30);
+
+    await hm.execute('message:sent', {}, { source: 't' });
+
+    expect(order).toEqual(['a', 'b', 'c']);
+  });
+});
+
 describe('HookManager.isInFlight + selective re-entrancy guard (conversation.send pattern)', () => {
   const SENDING: HookEvent[] = ['message:sending'];
 
@@ -200,6 +284,18 @@ describe('HookManager.isInFlight + selective re-entrancy guard (conversation.sen
     });
     expect(matching).toBe(true);
     expect(unrelated).toBe(false);
+  });
+
+  it('currentInFlight reports the whole chain a handler runs under (what a sandbox dispatch forwards)', async () => {
+    const hm = new HookManager();
+    let seen: HookEvent[] = [];
+    hm.register('p', 'message:sent', async () => {
+      seen = hm.currentInFlight();
+      return { continue: true };
+    });
+    expect(hm.currentInFlight()).toEqual([]);
+    await hm.runInFlight(SENDING, () => hm.execute('message:sent', {}, { source: 't' }));
+    expect(seen).toEqual(['message:sending', 'message:sent']);
   });
 
   it('a top-level guarded send still fires message:sending for unrelated observers; genuine re-entrancy suppresses it', async () => {

@@ -4,15 +4,16 @@ import "net/url"
 
 // ChatSummary is a chat-list entry.
 type ChatSummary struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	IsGroup     bool     `json:"isGroup"`
-	UnreadCount int      `json:"unreadCount"`
-	LastMessage string   `json:"lastMessage,omitempty"`
-	Timestamp   int64    `json:"timestamp"`
-	Kind        ChatKind `json:"kind"`
-	Archived    bool     `json:"archived"`
-	Pinned      bool     `json:"pinned"`
+	ID              string      `json:"id"`
+	Name            string      `json:"name"`
+	IsGroup         bool        `json:"isGroup"`
+	UnreadCount     int         `json:"unreadCount"`
+	LastMessage     string      `json:"lastMessage,omitempty"`
+	LastMessageType MessageType `json:"lastMessageType,omitempty"`
+	Timestamp       int64       `json:"timestamp"`
+	Kind            ChatKind    `json:"kind"`
+	Archived        bool        `json:"archived"`
+	Pinned          bool        `json:"pinned"`
 	// Muted reports whether the chat is muted right now, not the expiry behind it.
 	Muted bool `json:"muted"`
 	// MuteExpiration is the epoch milliseconds the mute ends, present only when muted; 0 means
@@ -40,8 +41,9 @@ type SubscribePresenceRequest struct {
 type MarkChatReadRequest struct {
 	ChatID string `json:"chatId"`
 	// MessageIDs are the messages to acknowledge (at most 100; an empty list is refused). Baileys
-	// acknowledges individual messages, so without this only the newest message the engine still
-	// holds in memory gets a receipt. Ignored by whatsapp-web.js, whose own sendSeen is chat-level.
+	// acknowledges individual messages, so without this only the newest received message the
+	// engine still holds in memory gets a receipt. Ignored by whatsapp-web.js, whose own sendSeen
+	// is chat-level.
 	//
 	// A POINTER because the three states differ on the wire and a plain slice cannot tell two of
 	// them apart: nil omits the key (acknowledge the newest), &[]string{} sends [] (the server

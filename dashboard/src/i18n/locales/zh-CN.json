@@ -12,7 +12,7 @@
     "cancel": "取消",
     "delete": "删除",
     "create": "创建",
-    "save": "Save",
+    "save": "保存",
     "close": "关闭",
     "showApiKey": "显示 API 密钥",
     "hideApiKey": "隐藏 API 密钥",
@@ -32,8 +32,11 @@
     "never": "从未",
     "justNow": "刚刚",
     "minAgo": "{{count}} 分钟前",
+    "minAgo_other": "{{count}} 分钟前",
     "hoursAgo": "{{count}} 小时前",
+    "hoursAgo_other": "{{count}} 小时前",
     "optional": "可选",
+    "fieldTooLong": "最多 {{max}} 个字符（当前 {{count}} 个）。",
     "language": "语言",
     "back": "返回",
     "next": "下一步",
@@ -60,7 +63,7 @@
     "sessions": "会话",
     "chats": "聊天",
     "webhooks": "Webhooks",
-    "templates": "Templates",
+    "templates": "模板",
     "apiKeys": "API 密钥",
     "messageTester": "消息测试器",
     "infrastructure": "基础设施",
@@ -88,6 +91,7 @@
     "noMessageYet": "暂无消息",
     "unreadBadge": "{{count}} 条未读消息",
     "unreadBadge_other": "{{count}} 条未读消息",
+    "markedUnread": "已标记为未读",
     "loadingMessages": "正在加载消息...",
     "loadingOlderMessages": "正在加载更早的消息...",
     "loadOlderMessagesError": "无法加载更早的消息。向上滚动重试。",
@@ -99,8 +103,26 @@
       "delete": "删除消息"
     },
     "replyingTo": "正在回复 {{name}}",
+    "messageType": {
+      "text": "文本",
+      "image": "图片",
+      "video": "视频",
+      "audio": "音频",
+      "voice": "语音消息",
+      "document": "文档",
+      "sticker": "贴纸",
+      "location": "位置",
+      "contact": "联系人",
+      "poll": "投票",
+      "call": "通话",
+      "revoked": "已删除的消息",
+      "order": "订单",
+      "product": "商品",
+      "masked": "已隐藏的消息",
+      "unknown": "消息",
+      "unknownType": "未知类型"
+    },
     "you": "你",
-    "youPrefix": "你：",
     "yesterday": "昨天",
     "attachTitle": "发送文件 / 图片",
     "emojiTitle": "选择表情",
@@ -121,7 +143,9 @@
       "group": "群组",
       "channel": "频道",
       "status": "状态",
-      "broadcast": "广播"
+      "broadcast": "广播",
+      "individual": "个人",
+      "unknown": "未知"
     },
     "tab": {
       "chats": "聊天",
@@ -165,7 +189,8 @@
       "react": "回应消息失败",
       "delete": "删除消息失败",
       "clickButton": "点击按钮失败",
-      "fileTooLarge": "文件过大（最大 18 MB）"
+      "fileTooLarge": "文件过大（最大 18 MB）",
+      "searchHitSessionNotReady": "此消息所属的会话未连接"
     },
     "loadMessagesError": "无法加载消息。请检查服务器日志。",
     "messageStatus": {
@@ -216,6 +241,7 @@
     "noSessions": "未找到会话。创建一个即可开始。",
     "view": "查看",
     "disconnect": "断开连接",
+    "disconnectFailed": "无法断开会话连接",
     "errorPrefix": "错误：{{message}}",
     "loadError": "加载数据失败",
     "charts": {
@@ -226,6 +252,7 @@
         "30d": "30天"
       },
       "overTime": "消息趋势",
+      "overTimeUtcDays": "消息趋势（按 UTC 日期）",
       "byType": "按类型分类的消息",
       "topChats": "热门聊天",
       "sent": "已发送",
@@ -275,7 +302,8 @@
       "successTitle": "会话已创建",
       "successDesc": "会话 \"{{name}}\" 已成功创建",
       "errorTitle": "创建失败",
-      "errorDefault": "创建会话失败"
+      "errorDefault": "创建会话失败",
+      "tooShort": "名称至少需要 3 个字符。"
     },
     "delete": {
       "title": "确认删除",
@@ -312,25 +340,25 @@
       "autoRejectCallsHint": "来电响铃后立即拒接。call.received webhook 仍会先行触发。下一通来电起生效，无需重启。仅限 Baileys 引擎：whatsapp-web.js 无法拒接来电。"
     },
     "proxy": {
-      "title": "Proxy Configuration",
-      "status": "Current",
-      "enabled": "Use proxy",
-      "url": "Proxy URL",
+      "title": "代理配置",
+      "status": "当前",
+      "enabled": "使用代理",
+      "url": "代理 URL",
       "urlPlaceholder": "http://user:pass@proxy.example.com:8080",
-      "urlKeepPlaceholder": "Enter new URL to replace {{host}} (credentials not shown)",
+      "urlKeepPlaceholder": "输入新的 URL 以替换 {{host}}（不显示凭据）",
       "configured": "{{host}} ({{type}})",
-      "noProxy": "No proxy configured",
-      "hasCredentials": "Credentials are stored but not shown. Enter a full URL to change them.",
-      "hint": "Changes apply on the next session start, not to a running connection. The proxy must be real and reachable — an unreachable value blocks QR delivery and start returns 504.",
-      "createHint": "Only needed when your network cannot reach WhatsApp directly. Must be a real, reachable proxy.",
-      "invalidUrl": "Enter a valid http, https, socks4, or socks5 proxy URL.",
-      "saveSuccessTitle": "Proxy Saved",
-      "saveSuccess": "Proxy settings saved. They apply on the next session start.",
-      "saveError": "Failed to save proxy settings"
+      "noProxy": "未配置代理",
+      "hasCredentials": "凭据已保存，但不会显示。输入完整的 URL 即可更改。",
+      "hint": "更改将在下次启动会话时生效，不会作用于正在运行的连接。代理必须真实且可访问：无法访问的代理会导致 QR 码无法送达。在 whatsapp-web.js 上启动请求将返回 504，在 Baileys 上启动会成功，但会话会持续重试。",
+      "createHint": "仅当你的网络无法直接访问 WhatsApp 时才需要。必须是真实且可访问的代理。",
+      "invalidUrl": "请输入有效的 http、https、socks4 或 socks5 代理 URL。",
+      "saveSuccessTitle": "代理已保存",
+      "saveSuccess": "代理设置已保存，将在下次启动会话时生效。",
+      "saveError": "保存代理设置失败"
     },
     "actions": {
       "view": "查看",
-      "proxy": "Proxy",
+      "proxy": "代理",
       "start": "启动",
       "stop": "停止",
       "reconnect": "重新连接",
@@ -346,7 +374,8 @@
       "actionRequiredTitle": "需要操作",
       "actionRequiredDesc": "此会话需要您的关注。打开会话以查看需要做什么。",
       "failedTitle": "会话失败",
-      "failedDesc": "WhatsApp 会话启动失败。打开该会话以查看原因。"
+      "failedDesc": "WhatsApp 会话启动失败。打开该会话以查看原因。",
+      "stopFailedTitle": "停止失败"
     },
     "card": {
       "phone": "电话",
@@ -419,11 +448,13 @@
     "selectSession": "选择会话...",
     "session": "会话",
     "events": "事件",
+    "noEvents": "请至少选择一个事件。",
     "available": "可用事件",
     "saveChanges": "保存更改",
     "filters": {
       "title": "筛选条件（可选）",
       "hint": "仅当所有条件都匹配时才触发。适用于消息事件。",
+      "incomplete": "请为每个筛选条件填写值，且条件最多 20 个、每个条件最多 100 个值、文本最多 1000 个字符。",
       "badge": "{{count}} 个筛选条件",
       "badge_other": "{{count}} 个筛选条件",
       "addCondition": "添加条件",
@@ -441,7 +472,7 @@
         "body": "消息正文",
         "type": "消息类型",
         "isGroup": "是群聊",
-        "kind": "Chat kind",
+        "kind": "聊天类型",
         "fromMe": "由我发送",
         "hasMedia": "包含媒体",
         "mentions": "提及"
@@ -457,15 +488,16 @@
       "valueLabel": "筛选值"
     },
     "columns": {
-      "url": "URL",
       "events": "事件",
       "session": "会话",
-      "status": "状态",
-      "actions": "操作"
+      "status": "状态"
     },
     "empty": {
       "title": "尚未配置 Webhook",
-      "description": "添加 Webhook 以接收实时事件通知"
+      "description": "添加 Webhook 以接收实时事件通知",
+      "loadErrorTitle": "无法加载 Webhook",
+      "forbiddenTitle": "无权访问 Webhook",
+      "forbiddenDesc": "Webhook 需要具有操作员或管理员角色的 API 密钥。"
     },
     "toasts": {
       "created": "Webhook 创建成功",
@@ -486,10 +518,55 @@
     "eventDescriptions": {
       "message.received": "收到消息时",
       "message.sent": "发送消息时",
-      "session.connected": "会话连接时",
-      "session.disconnected": "会话断开时",
+      "message.ack": "消息的送达或已读状态变化时",
+      "message.failed": "发出的消息投递失败时",
+      "message.revoked": "消息被撤回时",
+      "message.reaction": "添加、更改或移除回应时",
+      "message.edited": "消息被编辑时",
+      "session.status": "会话状态变化时",
       "session.qr": "生成 QR 码时",
+      "session.authenticated": "会话完成配对并就绪时",
+      "session.disconnected": "会话断开时",
+      "session.reconnect_loop": "会话反复重连失败时",
+      "session.restriction": "WhatsApp 限制账号或解除限制时",
+      "presence.update": "已订阅的聊天上线、正在输入或下线时",
+      "group.join": "有成员加入或被添加到群组时",
+      "group.leave": "有成员退出或被移出群组时",
+      "group.update": "群组名称、描述或设置变化时",
+      "group.join_request": "有人申请加入此会话管理的群组时",
+      "call.received": "来电开始响铃时",
+      "call.accepted": "来电被接听时",
+      "call.rejected": "来电被拒接时",
+      "call.missed": "来电未接听时",
+      "status.received": "联系人发布状态时",
       "all": "所有事件"
+    },
+    "auth": {
+      "title": "投递认证",
+      "hint": "可选。保存后，已存储的值不会再次显示。",
+      "editHint": "已存储的密钥和请求头永远不会显示。保持此部分不变即可保留它们。",
+      "secret": "签名密钥",
+      "secretHint": "16 到 255 个字符。每次投递都会在 X-OpenWA-Signature 请求头中携带 HMAC-SHA256 签名。",
+      "secretKeepPlaceholder": "留空以保留当前密钥",
+      "generateSecret": "生成",
+      "copySecret": "复制",
+      "secretCopied": "已复制签名密钥",
+      "removeSecret": "停止为投递签名（删除密钥）",
+      "headers": "自定义请求头",
+      "headerName": "请求头名称",
+      "headerValue": "请求头值",
+      "addHeader": "添加请求头",
+      "removeHeader": "移除请求头",
+      "replaceHeaders": "替换自定义请求头",
+      "replaceHint": "这些行将替换所有已存储的请求头。没有任何行时，将删除已存储的请求头。",
+      "errors": {
+        "headerName": "请求头名称只能包含字母、数字和连字符。",
+        "headerValue": "请求头值最多 1024 个字符，不能包含控制字符或 Latin-1 以外的字符。",
+        "headerReserved": "Content-Type、User-Agent、X-OpenWA-* 和连接类请求头由网关设置，不能使用。",
+        "headerDuplicate": "每个请求头名称只能使用一次。",
+        "tooMany": "最多允许 50 个自定义请求头。",
+        "secretLength": "签名密钥长度必须为 16 到 255 个字符。"
+      }
     }
   },
   "templates": {
@@ -523,6 +600,7 @@
     },
     "empty": {
       "title": "暂无已保存的模板",
+      "noMatch": "没有与搜索匹配的模板。",
       "description": "创建可复用的模板，加快处理常见回复和通知。",
       "noSessionsTitle": "暂无可用会话",
       "noSessionsDesc": "添加模板前请先创建 WhatsApp 会话。",
@@ -549,6 +627,7 @@
     "createdTitle": "API 密钥已创建",
     "createdHint": "请立即复制此密钥。之后将无法再次查看。",
     "namePlaceholder": "例如：Production Key",
+    "nameTooShort": "请至少输入 3 个字符。",
     "rolesTitle": "角色参考",
     "roles": {
       "admin": "管理员",
@@ -567,15 +646,20 @@
       "status": "状态",
       "lastUsed": "上次使用",
       "actions": "操作",
-      "sessions": "会话"
+      "sessions": "会话",
+      "restrictions": "限制"
     },
     "statuses": {
       "active": "活跃",
-      "revoked": "已撤销"
+      "revoked": "已撤销",
+      "expired": "已过期"
     },
     "empty": {
       "title": "尚未创建 API 密钥",
-      "description": "创建 API 密钥以认证你的请求"
+      "description": "创建 API 密钥以认证你的请求",
+      "loadErrorTitle": "无法加载 API 密钥",
+      "forbiddenTitle": "无权访问 API 密钥",
+      "forbiddenDesc": "管理 API 密钥需要一个不受特定会话限制的管理员密钥。"
     },
     "confirm": {
       "deleteTitle": "删除 API 密钥",
@@ -586,10 +670,9 @@
       "revoke": "撤销"
     },
     "actions": {
-      "copy": "复制",
       "revoke": "撤销",
       "delete": "删除",
-      "editSessions": "编辑会话"
+      "edit": "编辑访问权限"
     },
     "sessions": {
       "label": "会话访问",
@@ -597,10 +680,36 @@
       "all": "全部会话",
       "empty": "暂无会话。创建会话后，此密钥将可以访问全部会话。",
       "restricted": "已选 {{count}} 个",
-      "editTitle": "编辑会话访问",
       "save": "保存",
       "choose": "选择会话",
       "leaveAll": "保留为全部会话"
+    },
+    "edit": {
+      "title": "编辑密钥访问权限",
+      "signedIn": "此仪表板正使用该密钥登录。更改其角色、IP 地址、聊天或过期时间可能会使你退出登录。"
+    },
+    "restrictions": {
+      "none": "无",
+      "ips": "IP：{{count}}",
+      "chats": "聊天：{{count}}",
+      "expires": "{{date}} 过期",
+      "expired": "已于 {{date}} 过期"
+    },
+    "ips": {
+      "label": "允许的 IP 地址（可选）",
+      "hint": "每行一个 IP 地址或 CIDR 范围。留空则接受任意地址。",
+      "invalid": "不是 IPv4 地址或 CIDR 范围：{{value}}"
+    },
+    "chats": {
+      "label": "聊天访问（可选）",
+      "hint": "每行一个聊天：以 @g.us 结尾的群组 ID、以 @c.us 或 @lid 结尾的联系人 ID，或电话号码。留空则允许所有聊天。受聊天限制的密钥只能使用对此类密钥开放的路由；事件 WebSocket 和 MCP 会拒绝它。",
+      "invalid": "不是聊天 ID 或电话号码：{{value}}"
+    },
+    "expiry": {
+      "label": "过期时间（可选）",
+      "hint": "使用此浏览器的时区。留空则密钥永不过期。",
+      "clear": "移除过期时间",
+      "invalid": "请填写不晚于 9999 年的完整日期和时间，或清空此字段使密钥永不过期。"
     }
   },
   "logs": {
@@ -628,7 +737,12 @@
       "filteredTitle": "本页无匹配项",
       "filteredDescription": "搜索仅过滤当前页。请清除搜索、翻页，或使用严重级别筛选在服务端收窄。",
       "filteredServerDescription": "没有符合这些筛选条件的日志。请调整严重级别筛选以扩大搜索范围。"
-    }
+    },
+    "exportFailed": "无法导出审计日志",
+    "exportTruncated": "导出仅涵盖最新的 {{rows}} 条记录。请缩小严重级别筛选范围以导出更早的条目。",
+    "exportThrottled": "网关正在限制审计日志的读取频率，导出仅涵盖最新的 {{rows}} 条记录。请等待一分钟后重新导出。",
+    "exportNoMatches": "没有与搜索匹配的审计日志记录，因此未导出任何内容。",
+    "exportNoMatchesTruncated": "已扫描的最新 {{rows}} 条记录中没有与搜索匹配的条目，因此未导出任何内容。更早的条目未被搜索。"
   },
   "messageTester": {
     "title": "消息测试器",
@@ -770,7 +884,7 @@
       "sslRejectUnauthorized": "验证 SSL 证书",
       "sslRejectUnauthorizedDesc": "拒绝自签名或无效的证书。对于使用自签名证书的托管 Postgres（Supabase、Heroku、Render、Railway），请关闭此项。",
       "migrationsTitle": "数据库迁移",
-      "migrationsStatus": "架构会通过 TypeORM 自动同步",
+      "migrationsStatus": "待处理的迁移会在启动时自动应用",
       "migrationsHint": "迁移会自动管理。手动迁移请使用 CLI。"
     },
     "engine": {
@@ -793,7 +907,7 @@
     "redis": {
       "title": "Redis",
       "enable": "启用 Redis",
-      "enableDesc": "缓存、会话存储和 BullMQ 队列需要 Redis",
+      "enableDesc": "用于缓存、BullMQ 队列、限流计数器和多节点 WebSocket 分发",
       "useBuiltIn": "使用内置 Redis 容器",
       "builtInDesc": "OpenWA 将为你管理 Redis 容器",
       "queueTitle": "启用 BullMQ 队列系统",
@@ -805,7 +919,7 @@
       "failed": "失败",
       "viewBullMq": "查看 Bull MQ 仪表盘",
       "disabledTitle": "Redis 已禁用",
-      "disabledDesc": "启用 Redis 以使用缓存、会话存储和 BullMQ 消息队列。",
+      "disabledDesc": "启用 Redis 以使用缓存、BullMQ 消息队列、限流计数器和多节点 WebSocket 分发。",
       "passwordOptional": "（可选）",
       "bullMqUrlCopied": "已复制 Bull MQ 仪表板网址",
       "bullMqUrlHint": "请使用 ADMIN API 密钥打开 — 浏览器标签页无法进行身份验证。"
@@ -845,7 +959,8 @@
       "checking": "正在检查服务器状态...",
       "dontClose": "请不要关闭此窗口",
       "successMsg": "服务器已恢复在线！页面将自动重新加载。",
-      "errorMsg": "服务器在 30 秒后仍无响应。请检查 Docker 日志并手动重启。",
+      "errorMsg": "服务器无响应。请检查 Docker 日志并手动重启。",
+      "outcomeUnknown": "服务器响应前代理返回了错误，因此无法确定重启是否正在进行。请在一分钟后重新加载页面查看。",
       "reload": "重新加载页面"
     },
     "toasts": {
@@ -859,19 +974,20 @@
       "storageWarning": "现有的媒体文件不会自动迁移到新的存储后端；它们将保留在原位置。",
       "downloadBackup": "请先下载备份",
       "backupTitle": "数据备份与恢复",
-      "backupHint": "在切换数据库之前，将所有数据导出为 JSON，然后在切换后导入。备份中包含明文的 webhook 密钥和代理凭据 —— 请妥善保管，并在恢复完成后将其删除。",
+      "backupHint": "在切换数据库之前，将所有数据导出为 JSON，然后在切换后导入。备份不包含 webhook 签名密钥、webhook 自定义请求头和代理凭据，恢复后请重新填写。集成实例的密钥和设置以明文形式包含在内，请妥善保管文件，并在恢复完成后将其删除。",
       "export": "导出数据",
       "import": "导入数据",
       "exportFailed": "无法导出数据",
-      "exportPartialTitle": "Backup is missing some media",
-      "exportPartial": "{{count}} attachment payload(s) exceeded the export media budget and were saved as placeholders. The messages restore; their media does not.",
+      "exportPartialTitle": "备份缺少部分媒体",
+      "exportPartial": "{{count}} 个附件超出了导出的媒体容量上限，已保存为占位符。消息可以恢复，但其媒体无法恢复。",
       "importFailed": "无法导入数据",
       "importOk": "数据已导入",
       "importConfirm": "导入操作将用备份数据替换（REPLACE）当前所有数据（{{rows}} 行）。此操作无法撤销。是否继续？",
       "invalidFile": "该文件不是有效的 OpenWA 数据备份。",
       "importTooLarge": "备份超出请求大小限制。请在服务器上调高 BODY_SIZE_LIMIT 后重试。"
     },
-    "statusLoadError": "无法加载当前基础设施状态。请刷新重试。"
+    "statusLoadError": "无法加载当前基础设施状态。请刷新重试。",
+    "configLoadError": "无法加载已保存的配置，因此无法在此编辑。请刷新重试。"
   },
   "plugins": {
     "title": "插件",
@@ -879,6 +995,19 @@
     "refresh": "刷新",
     "builtIn": "内置",
     "noDescription": "没有可用描述",
+    "statuses": {
+      "installed": "已安装",
+      "enabled": "已启用",
+      "disabled": "已禁用",
+      "error": "错误"
+    },
+    "types": {
+      "engine": "引擎",
+      "storage": "存储",
+      "queue": "队列",
+      "auth": "认证",
+      "extension": "扩展"
+    },
     "enable": "启用",
     "disable": "禁用",
     "healthCheck": "健康检查",
@@ -893,7 +1022,7 @@
     "config": {
       "title": "配置 {{name}}",
       "noOptions": "此插件没有可用配置项",
-      "uiHandshakeError": "插件配置界面未初始化。如有可用的架构表单，请使用下方表单。",
+      "uiHandshakeError": "插件配置界面未初始化。",
       "save": "保存配置",
       "addItem": "添加",
       "tabConfig": "配置",
@@ -924,7 +1053,7 @@
       "healthFail": "健康检查失败",
       "healthError": "健康检查出错",
       "savedTitle": "配置已保存",
-      "savedDesc": "需要重启服务器以应用更改。",
+      "savedDesc": "更改无需重启服务器即可生效。",
       "saveFailed": "保存失败",
       "installed": "插件已安装",
       "installFailed": "安装失败",
@@ -953,7 +1082,6 @@
       "title": "实例",
       "description": "为此集成按账户配置实例。每个实例都有自己的签名密钥和接入 URL。",
       "create": "创建实例",
-      "save": "Save",
       "empty": "暂无实例。创建一个以获取接入 URL 和密钥。",
       "loadError": "加载实例失败。",
       "allSessions": "所有会话",
@@ -977,7 +1105,8 @@
         "title": "实例已创建",
         "hint": "请立即复制密钥——它只会显示一次。",
         "secret": "签名密钥",
-        "ingressUrls": "接入 URL"
+        "ingressUrls": "接入 URL",
+        "verifyToken": "验证令牌"
       },
       "regenerate": {
         "title": "重新生成密钥",
@@ -1029,7 +1158,7 @@
   },
   "search": {
     "placeholder": "搜索消息…",
-    "results": "{{count}} 条结果",
+    "loadMore": "显示更多（{{shown}}/{{total}}）",
     "empty": "未找到消息。",
     "error": "搜索失败。请重试。",
     "unavailable": "搜索未配置。",

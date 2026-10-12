@@ -34,19 +34,16 @@ export class StatusDto {
   })
   type!: string;
 
-  @ApiPropertyOptional({ description: 'Caption, for an image or video status.' })
+  @ApiPropertyOptional({ description: 'Text of a text status, or the caption of an image or video status.' })
   caption?: string;
 
-  @ApiPropertyOptional({ description: 'Media URL as the engine reported it.' })
-  mediaUrl?: string;
-
   @ApiPropertyOptional({
-    type: Object,
     description:
-      'Downloaded media bytes, present only when the engine fetched them and they fit the inbound ' +
-      'media cap. Absent is not an error — fetch the bytes from the media route instead.',
+      'Same-origin path to GET /sessions/{sessionId}/status/{statusId}/media, which needs X-API-Key like ' +
+      'any other route. Present only when the stored status kept its media.',
+    example: '/api/sessions/0a941dac-a965-45e7-b318-74ae8be134f0/status/ABCD1234/media',
   })
-  media?: object;
+  mediaUrl?: string;
 
   @ApiPropertyOptional({ description: 'Background colour of a text or voice status.', example: '#0a5c36' })
   backgroundColor?: string;

@@ -1,4 +1,5 @@
 import {
+  BadGatewayException,
   HttpException,
   Injectable,
   NotFoundException,
@@ -11,7 +12,18 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
-import { Repository, In, Not, IsNull, LessThan, DataSource, FindManyOptions, FindOptionsWhere } from 'typeorm';
+import {
+  Repository,
+  In,
+  Not,
+  IsNull,
+  LessThan,
+  LessThanOrEqual,
+  DataSource,
+  FindManyOptions,
+  FindOptionsWhere,
+  Raw,
+} from 'typeorm';
 import { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { setTimeout } from 'node:timers/promises';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
@@ -21,6 +33,7 @@ import {
   SessionConfigResponseDto,
   UpdateSessionConfigDto,
   SessionProxyResponseDto,
+  SessionResponseDto,
   UpdateSessionProxyDto,
   projectSessionProxy,
 } from './dto';
@@ -29,31 +42,29 @@ import { SessionLivenessWatchdog } from './session-liveness-watchdog.service';
 import { SessionErrorStore } from './session-error-store.service';
 import { SessionRestrictionStore } from './session-restriction-store.service';
 import { PresenceStore, type ChatPresence } from './presence-store.service';
-import { SessionEngineLifecycle, resolveReconnectConfig } from './session-engine-lifecycle.service';
+import {
+  SessionEngineLifecycle,
+  resolveMaxConcurrentSessions,
+  resolveReconnectConfig,
+} from './session-engine-lifecycle.service';
 import { SessionOwnershipService } from './session-ownership.service';
 import { paginate, ListOptions, resolveListWindow } from '../../common/utils/paginate';
-import { isUniqueViolation } from '../../common/utils/db-errors';
+import { isTransientDbError, isUniqueViolation } from '../../common/utils/db-errors';
 import { resolveFeatureFlags } from '../../config/feature-flags';
 import { IWhatsAppEngine, ChatSummary, ChatState } from '../../engine/interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
+import { ShutdownService } from '../../common/services/shutdown.service';
 import { HookManager } from '../../core/hooks';
+import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
+import { resolveJidCandidates } from '../../engine/identity/jid-candidates';
+import { Message } from '../message/entities/message.entity';
+import { ServerShuttingDownException, SessionStoppedException } from './session-engine-controls';
 // Type-only: the module binds this class to PLUGIN_SESSION_PORT with a `useExisting` alias, which
 // TypeScript does not check, so `implements` is what keeps the two in step.
 import type { PluginSessionPort } from '../../core/plugins/plugin-host-ports';
 
 /** Stagger before the single transient-launch retry; short - the claim is held while it waits. */
 const SESSION_START_RETRY_DELAY_MS = 2_000;
-
-/**
- * Driver codes meaning "locked, try again", not "your query is wrong".
- *
- * These are unreachable through the message regex below, which is why the code is read separately.
- * better-sqlite3 reports lock contention as `code: 'SQLITE_BUSY'` with the message `database is
- * locked`, and TypeORM's QueryFailedError copies the driver's own properties onto itself while
- * rewriting the message to `SqliteError: database is locked`. So the code survives the wrap and the
- * token never appears in any message: matching `SQLITE_BUSY` as text could not fire on either shape.
- */
-const TRANSIENT_DB_CODES = new Set(['SQLITE_BUSY', 'SQLITE_LOCKED']);
 
 /**
  * A launch failure worth one retry: infrastructure said "not now" (a 5xx, a transport death, a
@@ -70,14 +81,18 @@ function isTransientLaunchFailure(error: unknown): boolean {
   if (error instanceof EngineTransportError) return true;
   if (error instanceof HttpException) return false;
   // TypeORM QueryFailedError and driver errors carry no HttpException shape.
-  if (!(error instanceof Error)) return false;
-  const code: unknown = (error as { code?: unknown }).code;
-  if (typeof code === 'string' && TRANSIENT_DB_CODES.has(code)) return true;
-  return /connection|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|terminating connection/i.test(error.message);
+  return error instanceof Error && isTransientDbError(error);
 }
 
 /** Pause between sequential auto-start launches so a burst of Chromium boots does not spike the host. */
 export const AUTOSTART_THROTTLE_MS = 2_000;
+
+/**
+ * How long shutdown waits for the auto-start run once the engines are destroyed. Short: the webhook
+ * drain, worker close, usage flush, plugin phase, releaseAll and the HTTP and database close still have
+ * to fit the kill deadline (see shutdown-budget.ts).
+ */
+export const AUTOSTART_SHUTDOWN_WAIT_MS = 5_000;
 
 /** List window for {@link SessionService.findAll}, plus an optional exact session-name filter. */
 export interface SessionListOptions extends ListOptions {
@@ -126,10 +141,21 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * after it began from a mark left over by an earlier stop, which start() clears by design.
    */
   private readonly stopRequests = new Map<string, number>();
+  /**
+   * Starts past start()'s cap check, held until they return. That check counts them with the
+   * engine's slot holders, so two starts at the last free slot cannot both pass it while their claims
+   * are awaited. hasStartCapacity() does not: a held start whose claim then fails never used a slot.
+   * getActiveSessionIds() does, so the import pre-flight sees a start waiting on its claim or in its
+   * retry pause, when the engine holds no slot for it; every start is held for that reason, capped
+   * or not.
+   */
+  private readonly startReservations = new Map<string, number>();
 
   constructor(
     @InjectRepository(Session, 'data')
     private readonly sessionRepository: Repository<Session>,
+    @InjectRepository(Message, 'data')
+    private readonly messageRepository: Repository<Message>,
     @InjectDataSource('data')
     private readonly dataSource: DataSource,
     private readonly engineRegistry: EngineRegistry,
@@ -139,6 +165,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     private readonly presence: PresenceStore,
     private readonly hookManager: HookManager,
     private readonly engineLifecycle: SessionEngineLifecycle,
+    private readonly lidMappingStore: LidMappingStoreService,
     @Optional()
     private readonly configService?: ConfigService,
     // Trailing @Optional, like configService: the running app always provides it, while the
@@ -146,7 +173,19 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // behaves as unowned there, which is what a single-process deployment is anyway.
     @Optional()
     private readonly ownership?: SessionOwnershipService,
+    // The drain signal, set when shutdown begins and SHUTDOWN_DELAY_MS before onModuleDestroy. Same
+    // source the reconnect scheduler and the takeover sweep consult.
+    @Optional()
+    private readonly shutdownService?: ShutdownService,
   ) {}
+
+  /**
+   * True from the start of the shutdown drain. An engine launched during the drain would be torn
+   * down seconds later by onModuleDestroy, so starts are refused from here, not from teardown.
+   */
+  private get stopping(): boolean {
+    return this.shuttingDown || this.shutdownService?.isShuttingDown() === true;
+  }
 
   /**
    * On startup, mark as disconnected the sessions whose engines this process was running, since no
@@ -183,9 +222,19 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // Leaving ours running would put two engines on one WhatsApp account — the thing the claim
     // exists to prevent — so the engine goes down. stopOrphanEngines is the right verb: it tears
     // down locally and leaves the row alone, because the row is no longer ours to write.
-    // The teardown report is not consulted here: losing a claim is not a request anyone is waiting
-    // on, and stopOrphanEngines already logs what it could not stop.
-    this.ownership?.onLeaseLoss(async ids => void (await this.engineLifecycle.stopOrphanEngines(ids)));
+    // Nobody is waiting on this teardown, so an engine that could not be stopped (destroy and its
+    // forceDestroy escalation both failed) is reported here at error level: it is out of the Map, so
+    // force-kill cannot reach it, and a peer may run a second engine on the account until restart.
+    this.ownership?.onLeaseLoss(async ids => {
+      const { failed } = await this.engineLifecycle.stopOrphanEngines(ids);
+      if (failed.length > 0) {
+        this.logger.error(
+          'Engine teardown failed after lease loss; a peer may run a second engine on the same account until this process restarts',
+          undefined,
+          { sessionIds: failed, action: 'lease_loss_teardown_failed' },
+        );
+      }
+    });
     // Claims are only renewed while something still runs for them here, so a claim left behind by
     // an untracked teardown path lapses instead of pinning the session to this node forever.
     this.ownership?.setEngineLiveness(id => this.engineLifecycle.isEngineActive(id));
@@ -199,9 +248,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // hook has settled, and this loop's duration is unbounded: one engine initialization is at least
     // 60s (resolveEngineInitTimeoutMs) and there is a 2s throttle between sessions, so a host with
     // ten authenticated sessions kept the port CLOSED — not unhealthy, closed — for ten minutes.
-    // Every liveness probe in that window is a connection refusal, and no probe budget can cover a
-    // bound that scales with the session count: the chart's is ~50s and the Dockerfile HEALTHCHECK
-    // encodes the same expectation. Awaited on shutdown so a launch in flight is accounted for.
+    // Every probe in that window is a connection refusal, and no probe budget can cover a bound that
+    // scales with the session count: the chart's startupProbe budget (statefulset.yaml), which governs
+    // boot, is a fixed number of seconds, and the Dockerfile HEALTHCHECK encodes the same expectation.
+    // Awaited on shutdown so a launch in flight is accounted for.
     this.autoStartRun = this.autoStartSessions().catch((error: unknown) => {
       // Previously this rejected out of the hook and aborted boot, so a transient database error
       // during the session scan took the whole gateway down rather than the auto-start.
@@ -221,6 +271,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // Restricted to sessions this node may claim. Without it every replica scans the same rows and
     // races to launch the same engines, which is a WhatsApp account being opened twice, not merely
     // duplicated work.
+    // A session an operator stopped (desiredState 'stopped') stays down until an explicit start.
     const claimable = this.ownership?.claimableWhere() ?? [{}];
     const sessions = await this.sessionRepository.find({
       // HIBERNATED alongside DISCONNECTED: no engine survives a restart, so a hibernated row is
@@ -231,6 +282,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         ...clause,
         phone: Not(IsNull()),
         status: In([SessionStatus.DISCONNECTED, SessionStatus.HIBERNATED]),
+        desiredState: IsNull(),
       })),
     });
 
@@ -244,28 +296,65 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     for (let i = 0; i < sessions.length; i++) {
       // A shutdown landing mid-run must not launch anything further: onModuleDestroy tears down what
       // exists, and a browser launched after that point is never destroyed.
-      if (this.shuttingDown) {
+      if (this.stopping) {
         this.logger.log(`Auto-start stopped at ${i} of ${sessions.length} session(s): shutting down`, {
           action: 'auto_start_aborted',
         });
         return;
       }
+      // Every start past the cap is refused, so going on would only log one failure per row.
+      const max = resolveMaxConcurrentSessions(this.configService);
+      if (max !== null && !this.hasStartCapacity(max)) {
+        this.logger.log(
+          `Auto-start stopped at ${i} of ${sessions.length} session(s): MAX_CONCURRENT_SESSIONS reached`,
+          { action: 'auto_start_capacity_reached', max },
+        );
+        return;
+      }
       const session = sessions[i];
       try {
         await this.start(session.id);
+        // A launch shutdown tore down mid-init is refused with ServerShuttingDownException (caught
+        // below). One already past the engine's post-init checks resolves, but shutdown can still
+        // destroy its engine during the start's last row read or its claim bookkeeping, so
+        // nothing is left running.
+        if (this.shuttingDown && !this.isActive(session.id)) {
+          this.logger.log(`Auto-start abandoned for session ${session.name}: shutting down`, {
+            sessionId: session.id,
+            action: 'auto_start_aborted',
+          });
+          return;
+        }
         this.logger.log(`Auto-started session: ${session.name}`, {
           sessionId: session.id,
           action: 'auto_start_success',
         });
       } catch (error: unknown) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        this.logger.error(`Auto-start failed for session: ${session.name}`, errorMessage, {
-          sessionId: session.id,
-          action: 'auto_start_failed',
-        });
+        if (error instanceof SessionStoppedException) {
+          // Stopped after the scan read it; the start refused it, as it should.
+          this.logger.log(`Auto-start skipped for session ${session.name}: stopped by an operator`, {
+            sessionId: session.id,
+            action: 'auto_start_skipped',
+          });
+        } else if (error instanceof ServerShuttingDownException) {
+          // The launch in flight when shutdown began, refused so nothing outlives the teardown.
+          this.logger.log(`Auto-start abandoned for session ${session.name}: shutting down`, {
+            sessionId: session.id,
+            action: 'auto_start_aborted',
+          });
+          // Nothing later in the run would start either, and shutdown waits on this loop.
+          return;
+        } else {
+          const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+          this.logger.error(`Auto-start failed for session: ${session.name}`, errorMessage, {
+            sessionId: session.id,
+            action: 'auto_start_failed',
+          });
+        }
       }
       // Throttle between sequential Chromium launches; no need to wait after the last one.
-      if (i < sessions.length - 1) {
+      // Skipped once shutdown began: onModuleDestroy awaits this loop, and the check above ends it.
+      if (i < sessions.length - 1 && !this.stopping) {
         await setTimeout(AUTOSTART_THROTTLE_MS);
       }
     }
@@ -277,16 +366,31 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     this.shuttingDown = true;
     this.watchdog.stop();
     this.ownership?.stopHeartbeat();
-    // A SIGTERM during boot can land while the detached auto-start is mid-launch. Let that one
-    // settle — the flag above stops the loop taking another — so the engine it registers is torn
-    // down below instead of outliving the process as an orphaned browser. Bounded by the launch
-    // already in flight, never by the whole run.
-    await this.autoStartRun;
-    // Reconnect timers + engine teardown belong to the lifecycle owner.
+    // Reconnect timers + engine teardown belong to the lifecycle owner. Run before waiting on the
+    // detached auto-start: a launch it has in flight already registered its engine, so this destroys
+    // it and the run unwinds. Waiting first would let a stalled init (an unreachable WhatsApp Web, a
+    // proxy that never answers) hold the teardown until its init deadline, past the kill deadline.
     await this.engineLifecycle.shutdown();
+    // The lifecycle is closed now, so the run registers no further engine; awaited so its claim
+    // release and status writes land before releaseAll and the database close. Bounded: a
+    // whatsapp-web.js launch still starting Chromium has no browser handle yet, so the destroy
+    // closes nothing and that init runs until whatsapp-web.js settles it, at worst to the init
+    // deadline. Past the bound, its browser is left to Puppeteer's exit hook.
+    let timer: NodeJS.Timeout | undefined;
+    const settled = await Promise.race([
+      this.autoStartRun.then(() => true),
+      new Promise<false>(resolve => (timer = globalThis.setTimeout(resolve, AUTOSTART_SHUTDOWN_WAIT_MS, false))),
+    ]);
+    clearTimeout(timer);
+    if (!settled) {
+      this.logger.warn(`Auto-start still launching after ${AUTOSTART_SHUTDOWN_WAIT_MS}ms; shutting down without it`, {
+        action: 'auto_start_shutdown_timeout',
+      });
+    }
     // Released only after the engines are actually down, so a peer never claims a session this
-    // process is still holding open.
-    await this.ownership?.releaseAll();
+    // process is still holding open. A start still in flight may own a browser the teardown could
+    // not reach (one the bound above gave up on), so its claim is kept and lapses as after a hard kill.
+    await this.ownership?.releaseAll(this.startReservations.keys());
   }
 
   async create(dto: CreateSessionDto): Promise<Session> {
@@ -326,8 +430,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       action: 'create',
     });
 
-    // Execute hook after session created (outside transaction since hooks do external I/O)
-    await this.hookManager.execute('session:created', saved, {
+    // Execute hook after session created (outside transaction since hooks do external I/O). Plugins get
+    // the session as the REST API returns it, not the entity: the entity carries proxyUrl (credentials
+    // allowed) and the config blob, which no response ever exposes.
+    await this.hookManager.execute('session:created', SessionResponseDto.fromEntity(saved, this.isActive(saved.id)), {
       sessionId: saved.id,
       source: 'SessionService',
     });
@@ -415,24 +521,45 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * on the DTO rather than papered over by forcing a reconnect nobody asked for.
    */
   async updateConfig(id: string, dto: UpdateSessionConfigDto): Promise<SessionConfigResponseDto> {
-    const session = await this.findOne(id);
-    const config = { ...(session.config ?? {}) };
+    // Compare-and-swap on the stored text: the write lands only while the column still holds the blob
+    // this request merged into, so two overlapping PATCHes cannot both start from the same blob and
+    // have the later write drop the earlier one's keys. A request that lost the race reads again.
+    for (let attempt = 1; ; attempt++) {
+      // The raw text rather than the parsed entity, so the comparison is exact whatever wrote the row.
+      const row = await this.sessionRepository
+        .createQueryBuilder('session')
+        .select('session.config', 'config')
+        .where('session.id = :id', { id })
+        .getRawOne<{ config: string | null }>();
+      if (!row) {
+        throw new NotFoundException(`Session with id '${id}' not found`);
+      }
+      const stored = row.config;
+      const config = { ...((stored ? JSON.parse(stored) : null) as Record<string, unknown> | null) };
 
-    for (const key of ['autoRejectCalls', 'maxReconnectAttempts', 'reconnectBaseDelay'] as const) {
-      const value = dto[key];
-      if (value === undefined) continue;
-      if (value === null) {
-        delete config[key];
-      } else {
-        config[key] = value;
+      for (const key of ['autoRejectCalls', 'maxReconnectAttempts', 'reconnectBaseDelay'] as const) {
+        const value = dto[key];
+        if (value === undefined) continue;
+        if (value === null) {
+          delete config[key];
+        } else {
+          config[key] = value;
+        }
+      }
+
+      // update() with an explicit object rather than save() on an entity: only the config column is
+      // written, never the rest of the row from a snapshot taken before this await.
+      const { affected } = await this.sessionRepository.update(
+        { id, config: Raw(column => (stored === null ? `${column} IS NULL` : `${column} = :stored`), { stored }) },
+        { config: config as QueryDeepPartialEntity<Record<string, unknown>> },
+      );
+      if (affected !== 0) {
+        return this.projectConfig(config);
+      }
+      if (attempt >= 5) {
+        throw new ConflictException('Session config is being changed by other requests; retry');
       }
     }
-
-    // update() with an explicit object rather than save() on the loaded entity: the entity carries
-    // runtime-attached fields (lastError, restriction) that no column backs, and save() would try to
-    // write the whole row back from a snapshot taken before this await.
-    await this.sessionRepository.update(id, { config: config as QueryDeepPartialEntity<Record<string, unknown>> });
-    return this.projectConfig(config);
   }
 
   async getProxy(id: string): Promise<SessionProxyResponseDto> {
@@ -470,7 +597,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     this.markStopping(id);
     try {
       if (this.ownership) await this.assertNotHeldElsewhere(id);
-      await this.engineLifecycle.delete(id);
+      // A failed row read deleted nothing: the lifecycle drops the mark, and the count goes with it.
+      await this.engineLifecycle.delete(id, { onReadFailed: () => this.uncountStopRequest(id) });
       await this.ownership?.release(id);
       this.stopRequests.delete(id);
     } catch (error) {
@@ -527,7 +655,51 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     }
   }
 
-  async start(id: string): Promise<Session> {
+  /**
+   * `explicit` marks an operator's POST /start: only that clears a stop (desiredState), and only once
+   * the engine start is past its refusals. Boot auto-start and the takeover sweep never clear it, and
+   * the engine start refuses them a row still marked stopped when it reads it.
+   */
+  async start(id: string, { explicit = false }: { explicit?: boolean } = {}): Promise<Session> {
+    // Refused before the claim, the stop clear and the session:starting hook: none of them should run
+    // for a start the exiting process will not keep.
+    this.refuseIfShuttingDown();
+    // At the cap, refused before the claim: the engine's own cap check runs after it, and its
+    // refusal releases the claim to no node. A row nobody holds is never adopted by a peer, while a
+    // lapsed lease left where it is gets taken over by one with room. The engine check stays the
+    // authoritative one; this only keeps a refusal off the lease. A start that passes holds its slot
+    // until it returns, so a concurrent start cannot pass on the same free slot during the claim.
+    const max = resolveMaxConcurrentSessions(this.configService);
+    if (this.ownership && max !== null) {
+      const holders = this.startSlotsInUse();
+      holders.delete(id);
+      if (holders.size >= max) {
+        // Same answer the failed claim below would give, so the cap does not mask a 404 or a 409.
+        await this.findOne(id);
+        if (await this.ownership.isHeldByOtherNode(id)) {
+          throw new ConflictException(`Session ${id} is running on another node`);
+        }
+        throw new BadRequestException(`Maximum concurrent sessions reached (${max})`);
+      }
+    }
+    // Counted per start, so a duplicate start of the same id keeps the reservation after the first returns.
+    this.startReservations.set(id, (this.startReservations.get(id) ?? 0) + 1);
+    try {
+      return await this.claimAndStart(id, explicit);
+    } finally {
+      const left = (this.startReservations.get(id) ?? 1) - 1;
+      if (left > 0) this.startReservations.set(id, left);
+      else this.startReservations.delete(id);
+    }
+  }
+
+  private refuseIfShuttingDown(): void {
+    if (this.stopping) throw new ServerShuttingDownException();
+  }
+
+  private async claimAndStart(id: string, explicit: boolean): Promise<Session> {
+    // Read before the claim, so a stop that lands while the claim is pending counts against this start.
+    const stopRequestsBefore = this.stopRequests.get(id);
     // Claimed before the engine is launched, never after: launching first and discovering the
     // session belongs elsewhere would already have opened a second connection to the account.
     if (this.ownership && !(await this.ownership.claim(id))) {
@@ -538,8 +710,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     }
     let session: Session;
     try {
-      session = await this.startWithTransientRetry(id);
+      session = await this.startWithTransientRetry(id, explicit, stopRequestsBefore);
     } catch (error) {
+      await this.keepDownIfStoppedDuringStart(id, explicit, stopRequestsBefore);
       // A failed or refused start must not leave the claim pinned here — the heartbeat would renew
       // it and the session could never be started anywhere else. Released only when nothing is
       // actually alive locally: an "already starting/started" refusal means this node genuinely
@@ -547,6 +720,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       await this.releaseUnlessEngineActive(id);
       throw error;
     }
+    await this.keepDownIfStoppedDuringStart(id, explicit, stopRequestsBefore);
     // A start retired by a concurrent stop() resolves normally but leaves no engine, and that stop
     // skipped its release while this start still held the session. Hand the claim back here, or the
     // row keeps naming this node until the lease lapses and a peer adopts the stopped session.
@@ -566,10 +740,20 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * unbounded loop here would hold the concurrency slot hostage. HTTP-shaped refusals (409
    * not-ready, 4xx) are NOT transient - they propagate immediately.
    */
-  private async startWithTransientRetry(id: string): Promise<Session> {
-    const stopRequestsBefore = this.stopRequests.get(id);
+  private async startWithTransientRetry(
+    id: string,
+    explicit: boolean,
+    stopRequestsBefore: number | undefined,
+  ): Promise<Session> {
+    // A stop that finished during the claim answered 200 and left the claim to this start; the engine's own
+    // stop-mark check cannot tell its mark from a stale one, so the start is refused here.
+    if (this.stopRequests.get(id) !== stopRequestsBefore) {
+      throw new SessionStoppedException(`Session ${id} was stopped`);
+    }
+    // Shutdown may have begun while the claim was pending; the stop clear and the hook must not run.
+    this.refuseIfShuttingDown();
     try {
-      return await this.engineLifecycle.start(id);
+      return await this.engineLifecycle.start(id, { explicit });
     } catch (error) {
       if (!isTransientLaunchFailure(error)) throw error;
       this.logger.warn(`Transient launch failure for session ${id}; retrying once`, {
@@ -580,15 +764,44 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       await setTimeout(SESSION_START_RETRY_DELAY_MS);
       // Retrying would bring back a session that a stop() issued since this start began just took
       // down. A mark alone does not prove that: an earlier stop's mark survives until start() clears
-      // it, and a first attempt failing before that point would otherwise lose its retry.
-      if (this.stopRequests.get(id) !== stopRequestsBefore) throw error;
-      // The lease may have lapsed while the first attempt ran; the retry must keep holding the
-      // claim, never 409 on the session it already owns.
-      if (this.ownership && !(await this.ownership.claim(id))) {
-        await this.findOne(id);
-        throw new ConflictException(`Session ${id} is running on another node`);
+      // it, and a first attempt failing before that point would otherwise lose its retry. Answered
+      // as the stop it yielded to, like the check above: a 503 reads as retryable, and a client that
+      // replays the start would bring the session back.
+      if (this.stopRequests.get(id) !== stopRequestsBefore) {
+        throw new SessionStoppedException(`Session ${id} was stopped`);
       }
-      return this.engineLifecycle.start(id);
+      try {
+        // Shutdown may have released this node's claims during the delay; re-claiming would pin the row.
+        this.refuseIfShuttingDown();
+        // The lease may have lapsed while the first attempt ran; the retry must keep holding the
+        // claim, never 409 on the session it already owns.
+        if (this.ownership && !(await this.ownership.claim(id))) {
+          await this.findOne(id);
+          throw new ConflictException(`Session ${id} is running on another node`);
+        }
+        // Checked again: a stop that landed during the re-claim leaves the claim for claimAndStart's catch to release.
+        if (this.stopRequests.get(id) !== stopRequestsBefore) {
+          throw new SessionStoppedException(`Session ${id} was stopped`);
+        }
+        // And shutdown may have begun during the re-claim; the stop clear and the hook must not run.
+        this.refuseIfShuttingDown();
+        return await this.engineLifecycle.start(id, { explicit });
+      } catch (retryError) {
+        // The first attempt may have left FAILED, which the boot reset, auto-start and the takeover
+        // sweep all skip, and shutdown refused the retry that would have overwritten it. Handed back
+        // as DISCONNECTED so the next boot restores the session. Best-effort: the refusal is the answer.
+        // Fenced like the boot reset: a FAILED on a row a peer has since adopted is the peer's.
+        if (retryError instanceof ServerShuttingDownException) {
+          const claimable = this.ownership?.claimableWhere() ?? [{}];
+          await this.sessionRepository
+            .update(
+              claimable.map(clause => ({ ...clause, id, status: SessionStatus.FAILED })),
+              { status: SessionStatus.DISCONNECTED },
+            )
+            .catch(() => undefined);
+        }
+        throw retryError;
+      }
     }
   }
 
@@ -598,22 +811,35 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     let session: Session;
     try {
       if (this.ownership) await this.assertNotHeldElsewhere(id);
-      session = await this.engineLifecycle.stop(id);
+      // Recorded once the row read succeeds and BEFORE the teardown, so the 502
+      // SESSION_STOP_INCOMPLETE path keeps it too: a stopped session stays down across restarts and
+      // takeover until an explicit start. A failed write took nothing down, so the mark and count are
+      // undone as for a failed ownership read; a failed read took nothing down either, and the
+      // lifecycle has already dropped the mark, so only the count is undone.
+      session = await this.engineLifecycle.stop(id, {
+        afterRead: () =>
+          this.keepDown(id).catch((error: unknown) => {
+            this.engineLifecycle.clearStopping(id);
+            this.uncountStopRequest(id);
+            throw error;
+          }),
+        onReadFailed: () => this.uncountStopRequest(id),
+      });
     } catch (error) {
-      // Deliberately no release here, unlike logout()/forceKill(): this catch also carries the
-      // foreign-node 409, where the claim is the peer's and a blanket release would delete it. The
-      // local-502 path keeps the claim, and only claims with a live engine are renewed — it lapses
-      // at lease TTL instead of pinning the session here.
+      // Only the local 502 (SESSION_STOP_INCOMPLETE) releases: it evicted the engine and wrote
+      // DISCONNECTED, and a claim left to lapse still names this node, so a peer's takeover sweep
+      // would adopt the row and start the session the operator just stopped. A released claim is
+      // not adopted. The foreign-node 409 keeps its claim (it is the peer's), and so does a 404.
+      if (error instanceof BadGatewayException) await this.releaseAfterTeardown(id);
       this.discardStopMarkForMissingSession(id, error);
       throw error;
     }
     // Handed back on the way out so a peer can pick it up immediately rather than waiting for the
     // lease to lapse. Stop is the deliberate end of this process's ownership — but a start() that
-    // began before this stop and is still mid-launch owns the claim now, so the same
-    // engine-liveness guard the failure paths use applies here: releasing under an in-flight start
-    // would leave a live engine on an unclaimed row that no heartbeat renews and any peer may
-    // start a second time.
-    await this.releaseUnlessEngineActive(id);
+    // is still mid-launch or still waiting on its claim owns the claim now, so the same guard the
+    // failure paths use applies here: releasing under an in-flight start would leave a live engine
+    // on an unclaimed row that no heartbeat renews and any peer may start a second time.
+    await this.releaseAfterTeardown(id);
     return session;
   }
 
@@ -622,32 +848,84 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     try {
       const session = await this.engineLifecycle.logout(id);
       // Torn down locally on the 200 path — hand the claim back the way stop() does.
-      await this.releaseUnlessEngineActive(id);
+      await this.releaseAfterTeardown(id);
       return session;
     } catch (error) {
       // The 502-incomplete path tears the engine down, so its claim must not survive the call. A 400
       // "not started" refusal changed nothing and keeps whatever claim there is: release() also
       // clears a LAPSED foreign claim, which would take a crashed node's session out of takeover.
-      if (!(error instanceof BadRequestException)) await this.releaseUnlessEngineActive(id);
+      if (!(error instanceof BadRequestException)) await this.releaseAfterTeardown(id);
       throw error;
     }
   }
 
   async forceKill(id: string): Promise<Session> {
+    // Counted like stop(), so a start still waiting on its claim yields rather than relaunching, but
+    // only while there is an engine to kill: at once if one runs, so a start sent after the kill keeps
+    // its place, otherwise once the kill finds one. A kill that took nothing down (a 400, a 404 or a
+    // failed row read) is uncounted, so it cannot retire a start that is still waiting on its claim.
+    let counted = false;
+    const count = (): void => {
+      if (counted) return;
+      counted = true;
+      this.countStopRequest(id);
+    };
+    const uncount = (): void => {
+      if (!counted) return;
+      counted = false;
+      this.uncountStopRequest(id);
+    };
+    if (this.engines.get(id)) count();
     try {
-      const session = await this.engineLifecycle.forceKill(id);
-      await this.releaseUnlessEngineActive(id);
+      // The engine kill records the stop itself, once it has an engine to kill.
+      const session = await this.engineLifecycle.forceKill(id, { onReadFailed: uncount, onEngineFound: count });
+      await this.releaseAfterTeardown(id);
       return session;
     } catch (error) {
-      // Same 400 rule as logout().
-      if (!(error instanceof BadRequestException)) await this.releaseUnlessEngineActive(id);
+      // The 400 "not started" also keeps its claim as in logout(). The 502 did evict the engine: it
+      // stays counted and releases.
+      if (error instanceof BadRequestException) uncount();
+      if (!(error instanceof BadRequestException)) await this.releaseAfterTeardown(id);
       throw error;
     }
   }
 
+  /** Persist the operator's stop so boot auto-start and the takeover sweep leave the session down. */
+  private async keepDown(id: string): Promise<void> {
+    await this.sessionRepository.update(id, { desiredState: 'stopped' });
+  }
+
+  /**
+   * Re-record a stop an explicit start may have erased. The start clears the stop record with a
+   * write conditional on the row still reading 'stopped', and a stop's own write leaves that value
+   * unchanged, so a stop landing just before the clear was wiped from the row while its in-memory
+   * mark retired the start. The session was down, but the next boot would relaunch it. Any stop
+   * counted while the start ran and leaving no engine behind is the operator's last word. A failed
+   * write is logged rather than thrown: the start's own outcome still stands.
+   */
+  private async keepDownIfStoppedDuringStart(
+    id: string,
+    explicit: boolean,
+    stopRequestsBefore: number | undefined,
+  ): Promise<void> {
+    const stoppedMeanwhile = this.stopRequests.get(id) !== stopRequestsBefore;
+    if (!explicit || !stoppedMeanwhile || this.engineLifecycle.isEngineActive(id)) return;
+    await this.keepDown(id).catch((error: unknown) =>
+      this.logger.error(
+        'Failed to record a stop that landed during a start',
+        error instanceof Error ? error.message : String(error),
+        { sessionId: id, action: 'start_keep_down_failed' },
+      ),
+    );
+  }
+
   private markStopping(id: string): void {
-    this.stopRequests.set(id, (this.stopRequests.get(id) ?? 0) + 1);
+    this.countStopRequest(id);
     this.engineLifecycle.markStopping(id);
+  }
+
+  private countStopRequest(id: string): void {
+    this.stopRequests.set(id, (this.stopRequests.get(id) ?? 0) + 1);
   }
 
   /**
@@ -660,6 +938,17 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     const remaining = (this.stopRequests.get(id) ?? 0) - 1;
     if (remaining > 0) this.stopRequests.set(id, remaining);
     else this.stopRequests.delete(id);
+  }
+
+  /**
+   * The claim release for an operator teardown (stop, logout, force-kill). A start() of the same id
+   * that is still waiting on its claim owns it, though nothing runs here yet for the engine check to
+   * see: releasing would leave the engine it is about to launch on a row no node holds. That start
+   * hands the claim back itself if it yields or fails.
+   */
+  private async releaseAfterTeardown(id: string): Promise<void> {
+    if (this.startReservations.has(id)) return;
+    await this.releaseUnlessEngineActive(id);
   }
 
   /** Hand the claim back unless something still runs here (engine, in-flight start, pending reconnect). */
@@ -723,30 +1012,35 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     return this.engines.require(id);
   }
 
-  async getGroups(
-    id: string,
-    opts: ListOptions = {},
-  ): Promise<{ id: string; name: string; linkedParentJID?: string | null }[]> {
+  /** Every group for a session WITHOUT the response window, for callers that filter before paging. */
+  async listGroups(id: string): Promise<{ id: string; name: string; linkedParentJID?: string | null }[]> {
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
     const groups = await engine.getGroups();
-    const mapped = groups.map(g => ({
+    return groups.map(g => ({
       id: g.id,
       name: g.name,
       linkedParentJID: g.linkedParentJID,
     }));
-    return paginate(mapped, opts.limit, opts.offset);
   }
 
-  async getChats(id: string, opts: ListOptions = {}): Promise<ChatSummary[]> {
+  /**
+   * Every chat for a session, most-recent first, WITHOUT the response window. Callers that must
+   * filter before paging (a chat-restricted API key) use this, then paginate themselves: filtering
+   * after paginate() would hand back short or empty pages for an allowed chat past the window.
+   */
+  async listChats(id: string): Promise<ChatSummary[]> {
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    // Most-recent first, then bound the response window. Sorting before the cap means a capped
-    // response is the N newest chats (what clients show first) rather than an arbitrary slice.
-    const chats = [...(await engine.getChats())].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-    return paginate(chats, opts.limit, opts.offset);
+    // Most-recent first. Sorting before the cap means a capped response is the N newest chats (what
+    // clients show first) rather than an arbitrary slice.
+    return [...(await engine.getChats())].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  }
+
+  async getChats(id: string, opts: ListOptions = {}): Promise<ChatSummary[]> {
+    return paginate(await this.listChats(id), opts.limit, opts.offset);
   }
 
   /**
@@ -766,14 +1060,16 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   /**
-   * Publish the account's own global presence (appear online/offline). Connection-scoped: the
-   * setting resets on reconnect, so callers re-issue it after `session.status` reports one.
+   * Publish the account's own global presence (appear online/offline). A successful call is
+   * remembered for the life of this engine and re-applied once each time the connection opens.
+   * The intent is stored only after the publish succeeds, so a refusal (Baileys has no push name
+   * yet) does not get replayed as if the caller had been told it applied.
    */
   async setOnlinePresence(id: string, available: boolean): Promise<void> {
     await this.findOne(id);
     const engine = this.requireEngine(id);
-
-    return engine.setOnlinePresence(available);
+    await engine.setOnlinePresence(available);
+    this.presence.setOwnIntent(id, available);
   }
 
   /**
@@ -806,12 +1102,16 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   /**
    * Delete every message in a chat, keeping the chat itself. Resolves false when the engine could
    * not act — an unknown chat, or on Baileys a chat with no known history to key the change to.
+   * On success the gateway's stored copies of the chat's messages are removed too.
    */
   async clearChatMessages(id: string, chatId: string): Promise<boolean> {
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    return engine.clearChatMessages(chatId);
+    const cutoff = new Date();
+    const ok = await engine.clearChatMessages(chatId);
+    if (ok) await this.purgeStoredChat(id, chatId, cutoff);
+    return ok;
   }
 
   /**
@@ -849,18 +1149,68 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     return engine.pinChat(chatId, pin);
   }
 
+  /** Delete a chat. On success the gateway's stored copies of its messages are removed too. */
   async deleteChat(id: string, chatId: string): Promise<boolean> {
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    return engine.deleteChat(chatId);
+    const cutoff = new Date();
+    const ok = await engine.deleteChat(chatId);
+    if (ok) await this.purgeStoredChat(id, chatId, cutoff);
+    return ok;
+  }
+
+  /**
+   * Remove the stored rows of a chat the engine just cleared or deleted, under every id form of the
+   * same chat (the GET messages filter's rules), and emit `message:deleted` per row so search
+   * providers drop them. The FTS index follows through its delete trigger, archived media through
+   * the orphan sweep. Runs only after the engine succeeded; a failure here is logged, not thrown:
+   * WhatsApp already applied the change, and repeating the call finishes the purge.
+   *
+   * Only rows stored before the second `cutoff` (taken before the engine call) falls in go: a busy
+   * chat keeps receiving messages while the batches run, and those arrived after the clear and still
+   * exist on WhatsApp. The bound stops short of that second because SQLite stores createdAt as whole
+   * seconds and compares it as text against a millisecond parameter, so a row stored later in the
+   * same second would match. A pre-clear row from that second stays until a repeat call.
+   */
+  private async purgeStoredChat(sessionId: string, chatId: string, cutoff: Date): Promise<void> {
+    const BATCH = 500;
+    const bound = new Date(Math.floor(cutoff.getTime() / 1000) * 1000 - 1);
+    try {
+      const expanded = await resolveJidCandidates(chatId, {
+        resolveLid: lid => this.lidMappingStore.findPhoneForLid(lid),
+        lidsForPhone: phone => this.lidMappingStore.findLidsForPhone(phone),
+      });
+      const chatIds = [...new Set([chatId, ...expanded])];
+      for (;;) {
+        const rows = await this.messageRepository.find({
+          where: { sessionId, chatId: In(chatIds), createdAt: LessThanOrEqual(bound) },
+          select: { id: true, waMessageId: true, chatId: true, sessionId: true },
+          take: BATCH,
+        });
+        if (rows.length === 0) return;
+        await this.messageRepository.delete({ id: In(rows.map(row => row.id)) });
+        for (const message of rows) {
+          void this.hookManager
+            .execute('message:deleted', { sessionId, message }, { sessionId, source: 'SessionService' })
+            .catch(() => undefined);
+        }
+        if (rows.length < BATCH) return;
+      }
+    } catch (error) {
+      this.logger.error(
+        'Failed to remove stored messages of a cleared chat',
+        error instanceof Error ? error.message : String(error),
+        { sessionId, action: 'chat_local_purge_failed' },
+      );
+    }
   }
 
   async sendChatState(id: string, chatId: string, state: ChatState): Promise<void> {
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    await engine.sendChatState(chatId, state);
+    return engine.sendChatState(chatId, state);
   }
 
   /**
@@ -923,21 +1273,45 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   /**
+   * The response's `engineLoaded`: an engine in this process, or a live claim by a peer node. A list
+   * is answered by whichever node the request landed on, while the lifecycle routes are forwarded to
+   * the owner, so a session a peer runs must not read as stopped. The local precondition checks keep
+   * using {@link isActive}.
+   */
+  engineLoaded(session: Session): boolean {
+    return this.isActive(session.id) || !!this.ownership?.heldByOtherLiveNode(session);
+  }
+
+  /**
    * Ids of every session with a live engine — including ones mid-initialization (their engine is not
-   * in `engines` yet but will register when start() completes). The infra import pre-flight uses this
-   * to refuse a full-replace restore that would orphan a running engine.
+   * in `engines` yet but will register when start() completes) and ones waiting to relaunch after a
+   * failed reconnect (their timer registers one), plus starts still waiting on their claim or in their
+   * transient retry pause. The infra import pre-flight uses this to refuse a full-replace restore that
+   * would orphan a running engine.
    */
   getActiveSessionIds(): string[] {
-    return this.engines.activeIds();
+    return [...this.startSlotsInUse()];
+  }
+
+  /** Whether this node has a MAX_CONCURRENT_SESSIONS slot free, counted exactly as the engine's cap check counts it. */
+  hasStartCapacity(max: number): boolean {
+    return this.engineLifecycle.startSlotHolders().size < max;
+  }
+
+  private startSlotsInUse(): Set<string> {
+    return new Set([...this.engineLifecycle.startSlotHolders(), ...this.startReservations.keys()]);
   }
 
   /**
    * Stop engines for session ids whose DB row is about to be replaced by an infra import.
-   * Owned by the lifecycle service; see SessionEngineLifecycle.stopOrphanEngines().
+   * Owned by the lifecycle service; see SessionEngineLifecycle.stopOrphanEngines(). Counted as a
+   * stop too, so a start waiting on its claim or in its retry pause launches nothing: the engine's
+   * stop mark alone reads as stale to the start that follows.
    */
   async stopOrphanEngines(
     sessionIds: string[],
   ): Promise<{ stopped: string[]; notRunning: string[]; failed: string[] }> {
+    for (const id of sessionIds) this.countStopRequest(id);
     return this.engineLifecycle.stopOrphanEngines(sessionIds);
   }
 

@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 
 /** A conversion that ffmpeg refused, timed out on, or produced too much output for. */
 export class FfmpegConversionError extends Error {
@@ -15,6 +15,14 @@ export class FfmpegConversionError extends Error {
   }
 }
 
+/** ffmpeg could not be started at all: a host fault (missing binary, EAGAIN, EMFILE), not the input's. */
+export class FfmpegSpawnError extends FfmpegConversionError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FfmpegSpawnError';
+  }
+}
+
 export interface FfmpegRunOptions {
   /** Binary to execute. Resolved through PATH unless absolute. */
   ffmpegPath: string;
@@ -25,26 +33,84 @@ export interface FfmpegRunOptions {
 }
 
 /**
+ * Input demuxers conversion accepts, by ffmpeg name. A name matches any demuxer that registers it,
+ * so `mov` covers mp4, m4a and 3gp, `matroska` covers webm, and `mpeg` is MPEG-PS (.mpg, .vob).
+ * Every one of them reads its input and nothing else.
+ */
+export const INPUT_FORMATS = [
+  'mov',
+  'matroska',
+  'ogg',
+  'mp3',
+  'wav',
+  'w64',
+  'aac',
+  'ac3',
+  'eac3',
+  'flac',
+  'wv',
+  'au',
+  'amr',
+  'avi',
+  'mpeg',
+  'mpegts',
+  'asf',
+  'flv',
+  'caf',
+  'aiff',
+  'gif',
+  'h264',
+  'hevc',
+].join(',');
+
+/**
  * The arguments every conversion starts with, before any codec choice.
  *
- * `-protocol_whitelist file` is the load-bearing one. ffmpeg treats its input as a URL, and given an
- * `http://` one it will happily make the request — verified against this project's own image, where
- * it reached for the link-local metadata address. The input here is always a file this process just
- * wrote, so restricting ffmpeg to the file protocol costs nothing and removes the whole class:
- * neither the input path nor anything a crafted container might reference can become a request.
+ * `-protocol_whitelist file` is the load-bearing one for the network. ffmpeg treats its input as a URL,
+ * and given an `http://` one it will happily make the request (verified against this project's own
+ * image, where it reached for the link-local metadata address). The input here is always a file this
+ * process just wrote, so restricting ffmpeg to the file protocol costs nothing, and neither the input
+ * path nor anything a crafted container might reference can become a network request.
+ *
+ * The file protocol still reaches every local file, though, and some demuxers (playlists, manifests,
+ * concatenation scripts) open the files their input names. `-format_whitelist` restricts the input
+ * demuxers to the single-file media containers conversion supports, so the input is decoded as
+ * itself and never as a pointer to something else on disk.
  *
  * `-nostdin` stops a prompt (an existing output file, a missing codec) from blocking forever on a
  * stdin nobody is attached to, and `-y` means there is nothing to prompt about in the first place.
  */
-const BASE_ARGS = ['-hide_banner', '-nostdin', '-loglevel', 'error', '-y', '-protocol_whitelist', 'file'] as const;
+const BASE_ARGS = [
+  '-hide_banner',
+  '-nostdin',
+  '-loglevel',
+  'error',
+  '-y',
+  '-protocol_whitelist',
+  'file',
+  '-format_whitelist',
+  INPUT_FORMATS,
+] as const;
 
 /**
  * The full argument list for one conversion. Split out from the spawn so the security-relevant
  * shape — restricted protocols, no stdin, and the fact that the only paths present are ones this
  * process chose — can be asserted without running a process.
  */
-export function buildFfmpegArgs(inputPath: string, outputPath: string, encodeArgs: string[]): string[] {
-  return [...BASE_ARGS, '-i', inputPath, ...encodeArgs, outputPath];
+export function buildFfmpegArgs(
+  inputPath: string,
+  outputPath: string,
+  encodeArgs: string[],
+  maxOutputBytes: number,
+): string[] {
+  // `-fs` makes ffmpeg stop writing once the output reaches the limit, so a conversion cannot fill
+  // the temp directory (a RAM-backed tmpfs in the compose files) before the size check after exit.
+  // It is an output option, so it sits right before the output path. The limit is one byte above
+  // the cap: a cut-off file is then always over the cap and rejected, and a complete one at the cap
+  // still passes. ffmpeg refuses a -fs past a 64-bit integer, so a limit too large to matter is clamped
+  // rather than failing every conversion.
+  const fs = Math.min(maxOutputBytes, Number.MAX_SAFE_INTEGER - 1) + 1;
+  return [...BASE_ARGS, '-i', inputPath, ...encodeArgs, '-fs', String(fs), outputPath];
 }
 
 /**
@@ -63,9 +129,12 @@ export function voiceEncodeArgs(): string[] {
  *
  * Baseline H.264 with yuv420p is the combination that plays on every WhatsApp client, including the
  * older Android ones that reject High profile. `faststart` relocates the index to the front so the
- * receiver can begin playback before the whole file arrives. The scale filter bounds the long edge
- * at 1280 while `-2` keeps the other edge even, which H.264 requires — and `min()` means a smaller
- * video is never upscaled into a larger file than it started as.
+ * receiver can begin playback before the whole file arrives. The scale filter fits the frame inside
+ * 1280x720 (720x1280 for a portrait one), the largest box within the Baseline 3.1 frame-size limit
+ * whatever the aspect ratio, and keeps both edges even, which H.264 requires. `min()` means a
+ * smaller video is never upscaled into a larger file than it started as. Level 3.1 also caps the
+ * macroblock rate, which is 1280x720 at 30 fps, so `-fpsmax` lowers a faster source to 30 fps and
+ * leaves a slower one as it is.
  */
 export function videoEncodeArgs(): string[] {
   return [
@@ -78,7 +147,9 @@ export function videoEncodeArgs(): string[] {
     '-pix_fmt',
     'yuv420p',
     '-vf',
-    "scale='min(1280,iw)':-2",
+    "scale='min(iw,if(gte(iw,ih),1280,720))':'min(ih,if(gte(iw,ih),720,1280))':force_original_aspect_ratio=decrease:force_divisible_by=2",
+    '-fpsmax',
+    '30',
     '-c:a',
     'aac',
     '-b:a',
@@ -111,10 +182,20 @@ export async function runFfmpeg(
   const outputPath = join(dir, `out.${outputExtension}`);
   try {
     await writeFile(inputPath, input);
-    await execute(buildFfmpegArgs(inputPath, outputPath, encodeArgs), options);
+    try {
+      await execute(buildFfmpegArgs(inputPath, outputPath, encodeArgs, options.maxOutputBytes), options);
+    } catch (error) {
+      // ffmpeg names its input and output by the paths it was given. Those are this process's own temp
+      // files, so the directory is dropped and the reason names only `in.<ext>` or `out.<ext>`.
+      if (error instanceof FfmpegConversionError && error.detail) {
+        throw new FfmpegConversionError(error.message, error.detail.replaceAll(dir + sep, ''));
+      }
+      throw error;
+    }
 
     // Check the size on disk before reading, so an unexpectedly large result is refused instead of
-    // being pulled into memory first.
+    // being pulled into memory first. `-fs` stops ffmpeg at one byte over the cap and ffmpeg then
+    // exits 0, so this check is also what rejects that cut-off file.
     const { size } = await stat(outputPath);
     if (size > options.maxOutputBytes) {
       throw new FfmpegConversionError(
@@ -130,12 +211,38 @@ export async function runFfmpeg(
   }
 }
 
+/** Process groups of the ffmpeg runs still in flight, so they can be killed when the gateway exits. */
+const runningGroups = new Set<number>();
+
+/**
+ * SIGKILL every ffmpeg process group still running. Each run is detached into its own group, so a
+ * Ctrl-C or a signal to the gateway's group no longer reaches it, and its timeout dies with this
+ * process. Called from the media service's shutdown hook, which Nest runs before it re-raises a
+ * signal (the process then dies without emitting `exit`), and registered on `exit` for every path
+ * that ends in `process.exit`; `process.kill` is synchronous, so it still runs there.
+ */
+export function killRunningConversions(): void {
+  for (const pid of runningGroups) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+  }
+  runningGroups.clear();
+}
+process.on('exit', killRunningConversions);
+
 /** Spawn ffmpeg and resolve when it exits 0, else reject with whatever it wrote to stderr. */
 function execute(args: string[], options: FfmpegRunOptions): Promise<void> {
   return new Promise((resolve, reject) => {
     // An argument array, never a shell string: nothing here can be word-split or expanded, so a
     // filename with a space or a quote is data rather than syntax.
-    const child = spawn(options.ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    // `detached` puts the child at the head of its own process group, so the timeout can kill
+    // everything under it (see below).
+    const child = spawn(options.ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
+    const pid = child.pid;
+    if (pid !== undefined) runningGroups.add(pid);
 
     let stderr = '';
     let timedOut = false;
@@ -147,8 +254,21 @@ function execute(args: string[], options: FfmpegRunOptions): Promise<void> {
     const timer = setTimeout(() => {
       timedOut = true;
       // SIGKILL rather than SIGTERM: the case being defended against is a codec stuck in a loop,
-      // which is exactly the case that would ignore a polite signal.
-      child.kill('SIGKILL');
+      // which is exactly the case that would ignore a polite signal. The whole group, because a
+      // wrapper script that runs ffmpeg without `exec` leaves the real worker as a grandchild, and
+      // killing only the wrapper would free the concurrency slot while that worker keeps running.
+      try {
+        // A negative pid addresses the process group; no pid means the spawn failed and nothing runs.
+        if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        // The group is already gone, or the platform has no process groups: fall back to the child.
+        child.kill('SIGKILL');
+      }
+      // Let go of our end of the stderr pipe too. A descendant of the killed process (ffmpeg under a
+      // wrapper script) can still hold the inherited stderr, and the open pipe would keep this
+      // process alive until that descendant exits.
+      child.stderr.destroy();
+      if (pid !== undefined) runningGroups.delete(pid);
       // Reject as soon as the signal is sent rather than waiting for `close`. `close` fires when the
       // stdio pipes close, not when the process dies, so anything still holding the inherited stderr
       // keeps it pending — which would leave the timeout bounding nothing at all.
@@ -157,12 +277,14 @@ function execute(args: string[], options: FfmpegRunOptions): Promise<void> {
 
     child.on('error', err => {
       clearTimeout(timer);
+      if (pid !== undefined) runningGroups.delete(pid);
       // Spawn itself failed — almost always a missing binary, which is worth saying plainly.
-      reject(new FfmpegConversionError(`Could not run ffmpeg: ${err instanceof Error ? err.message : String(err)}`));
+      reject(new FfmpegSpawnError(`Could not run ffmpeg: ${err instanceof Error ? err.message : String(err)}`));
     });
 
     child.on('close', code => {
       clearTimeout(timer);
+      if (pid !== undefined) runningGroups.delete(pid);
       // Already rejected by the timer; a late close has nothing left to report.
       if (timedOut) return;
       if (code !== 0) {

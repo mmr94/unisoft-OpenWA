@@ -13,6 +13,7 @@
 export interface ChatListEntry {
   id: string;
   lastMessage?: string;
+  lastMessageType?: string;
   timestamp?: number;
   unreadCount?: number;
 }
@@ -63,9 +64,11 @@ export function applyIncomingToChatList<T extends ChatListEntry>(
   const updated = [...chats];
   const target = { ...updated[index] };
   target.lastMessage = msg.type === 'location' ? opts.locationLabel : msg.body;
+  target.lastMessageType = msg.type;
   target.timestamp = msg.timestamp;
   if (!msg.fromMe && opts.activeChatId !== target.id) {
-    target.unreadCount = (target.unreadCount || 0) + 1;
+    // A chat marked unread carries -1; the first message into it counts as 1, not 0.
+    target.unreadCount = Math.max(target.unreadCount ?? 0, 0) + 1;
   }
   updated.splice(index, 1);
   updated.unshift(target);
@@ -85,7 +88,7 @@ export function promoteChatWithSnippet<T extends ChatListEntry>(
   const index = chats.findIndex(c => c.id === chatId);
   if (index === -1) return chats;
   const updated = [...chats];
-  const target = { ...updated[index], lastMessage: snippet, timestamp };
+  const target = { ...updated[index], lastMessage: snippet, lastMessageType: undefined, timestamp };
   updated.splice(index, 1);
   updated.unshift(target);
   return updated;

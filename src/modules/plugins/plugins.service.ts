@@ -1,8 +1,15 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException, HttpException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ConflictException,
+  HttpException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
-import { PluginLoaderService, PluginStatus, resolvePluginEntryPath } from '../../core/plugins';
+import { PluginLoaderService, PluginStatus, PluginType, resolvePluginEntryPath } from '../../core/plugins';
 import { pluginUpdateBackupDirName, pluginUpdateStagingDirName } from '../../core/plugins';
 import type { PluginConfigSchema } from '../../core/plugins';
 import { PluginDto } from './dto/plugin.dto';
@@ -163,6 +170,21 @@ export class PluginsService {
       }
       this.pluginLoader.setOperatorEnabled(id, false);
       return { success: true, message: `Plugin ${id} is not loaded; it will not be enabled on boot` };
+    }
+
+    if (
+      plugin.manifest.type === PluginType.ENGINE &&
+      id === (this.configService.get<string>('engine.type') ?? 'whatsapp-web.js')
+    ) {
+      // The engine factory is pinned to engine.type and never reads plugin status, and boot re-enables
+      // that engine regardless: "disabling" it here reported success while sessions kept starting on
+      // it. Refuse it in the same shape enable uses for a non-active engine. Kept at this layer, not in
+      // the lifecycle, because shutdown and unload must still tear engines down. An engine that is not
+      // engine.type runs nothing, so it takes the ordinary path below.
+      return {
+        success: false,
+        message: `Engine "${id}" cannot be disabled at runtime. Set engine.type and restart to switch engines.`,
+      };
     }
 
     if (plugin.status !== PluginStatus.ENABLED) {
@@ -443,6 +465,9 @@ export class PluginsService {
     try {
       const parsed: unknown = JSON.parse(raw.toString('utf8'));
       if (!Array.isArray(parsed)) throw new Error('catalog is not a JSON array');
+      if (!parsed.every(e => typeof e === 'object' && e !== null && !Array.isArray(e))) {
+        throw new Error('catalog entries must be JSON objects');
+      }
       entries = parsed as CatalogEntry[];
     } catch (error) {
       throw new BadRequestException(
@@ -465,7 +490,9 @@ export class PluginsService {
    * reconciled at boot by the loader's interrupted-update recovery, which restores the backup when
    * the live dir is missing — an interrupted update can no longer make the plugin silently vanish.
    * If loading/enabling the new version fails, the backup is restored and reloaded, so a bad update
-   * never leaves the plugin broken.
+   * never leaves the plugin broken. An update of a plugin the operator switched on that is still
+   * applying once shutdown has begun is refused or rolled back the same way (with a 503), since the
+   * new version cannot be enabled to prove it works.
    */
   updatePackage(id: string, buffer: Buffer): Promise<PluginDto> {
     return this.serialize(id, () => this.updatePackageInner(id, buffer));
@@ -487,6 +514,23 @@ export class PluginsService {
     }
 
     const wasEnabled = plugin.status === PluginStatus.ENABLED;
+    // Shutdown refuses new enables, so an update of a plugin meant to run cannot prove the new version
+    // starts. It is refused with a 503 and the previous version stays, so the next boot restores that
+    // one from the persisted operator decision. wasEnabled alone is not enough: once teardown has
+    // disabled the plugin, it reads false while enabledByOperator stays true. A plugin the operator
+    // switched off, or one in ERROR (which is not running either way), is never enabled after an
+    // update, so its update still applies.
+    const meantToRun =
+      wasEnabled ||
+      (plugin.status !== PluginStatus.ERROR && this.pluginLoader.getRegistryEntry(id)?.enabledByOperator === true);
+    const refuseDuringShutdown = (): void => {
+      if (meantToRun && this.pluginLoader.isShuttingDown()) {
+        throw new ServiceUnavailableException(`Plugin ${id} was not updated: the gateway is shutting down`);
+      }
+    };
+    // Already shutting down (a slow download or a queued operation): refuse before touching disk or
+    // running any plugin code.
+    refuseDuringShutdown();
     // The tree the package was loaded from, which is the legacy plugins directory for a host that
     // has not migrated. Updating in the configured root instead renames a directory that is not
     // there, after unloadPlugin has already dropped the plugin from the runtime.
@@ -559,12 +603,20 @@ export class PluginsService {
     });
 
     try {
-      // ctx.storage files share the package directory under shipped defaults. Restore service-owned
-      // state from the backup unless the new package explicitly supplied that exact path. Copy (rather
-      // than move) so the rollback below still has a complete original directory.
+      // ctx.storage files share the package directory under shipped defaults. Restore state from the
+      // backup unless the new package explicitly supplied that exact path: encoded key-* files and the
+      // legacy <key>.json files the storage service still reads (every top-level *.json except the
+      // package's manifest.json/package.json). Copy (rather than move) so the rollback below still has
+      // a complete original directory.
       const packagePaths = new Set(entries.map(entry => entry.relPath));
       for (const entry of fs.readdirSync(backup, { withFileTypes: true })) {
-        if (!entry.isFile() || !/^key-[A-Za-z0-9_-]+\.json$/.test(entry.name) || packagePaths.has(entry.name)) {
+        if (
+          !entry.isFile() ||
+          !entry.name.endsWith('.json') ||
+          entry.name === 'manifest.json' ||
+          entry.name === 'package.json' ||
+          packagePaths.has(entry.name)
+        ) {
           continue;
         }
         const stateFile = path.join(dir, entry.name);
@@ -572,9 +624,10 @@ export class PluginsService {
         fs.chmodSync(stateFile, 0o600);
       }
       this.pluginLoader.loadPlugin(dir);
-      if (wasEnabled) {
-        await this.pluginLoader.enablePlugin(id);
-      }
+      // Shutdown may have begun while the old version was being stopped: roll back below rather than
+      // keep the new version untested with its backup deleted.
+      refuseDuringShutdown();
+      if (wasEnabled) await this.pluginLoader.enablePlugin(id);
       fs.rmSync(backup, { recursive: true, force: true });
       logger.log(`Plugin updated: ${id} → v${manifest.version}`, {
         pluginId: id,

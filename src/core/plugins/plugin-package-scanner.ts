@@ -304,9 +304,10 @@ export class PluginPackageScanner {
 
     // Boot-time validation is the SAME validation install runs (parsePluginPackage): a hand-placed
     // or crash-leftover directory must satisfy the install contract too — plain-object shape,
-    // required string fields, id format + reserved ids, extension-only type, and a `main` that
-    // cannot escape the plugin dir. Otherwise a manifest the installer would have rejected loads
-    // anyway and only fails (or worse, runs unexpected code) at enable time.
+    // required string fields, id format + reserved ids, extension-only type, a `main` that cannot
+    // escape the plugin dir, and no minOpenWAVersion floor above the running host. Otherwise a
+    // manifest the installer would have rejected loads anyway and only fails (or worse, runs
+    // unexpected code) at enable time.
     validatePluginManifest(manifest);
 
     // Anchor `main` inside THIS on-disk directory: the lexical check above is forward-slash only,
@@ -318,10 +319,9 @@ export class PluginPackageScanner {
       throw new Error(`Plugin ${manifest.id}: main file not found in the plugin directory: ${manifest.main}`);
     }
 
-    // Reject a malformed ingress declaration (SDK-major mismatch, missing webhook:ingress permission,
-    // duplicate/empty routes, non-positive toleranceSec) at load time instead of letting it silently
-    // load and become provisionable. No-op for plugins that declare no ingress. A route declaring
-    // signature.scheme 'none' is rejected unless the operator opted in via ALLOW_UNSIGNED_INGRESS=true.
+    // Reject a malformed ingress declaration (every check is listed on validateIngressManifest) at
+    // load time instead of letting it silently load and become provisionable. No-op for plugins that
+    // declare no ingress.
     validateIngressManifest(manifest, this.configService.get<boolean>('ingress.allowUnsigned', false));
 
     // Surface a loud warning for any ingress route that skips signature verification — a scheme:'none'

@@ -2,6 +2,7 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Template } from './entities/template.entity';
+import { Session } from '../session/entities/session.entity';
 import { CreateTemplateDto, UpdateTemplateDto } from './dto';
 import { createLogger } from '../../common/services/logger.service';
 import { isUniqueViolation } from '../../common/utils/db-errors';
@@ -13,9 +14,16 @@ export class TemplateService {
   constructor(
     @InjectRepository(Template, 'data')
     private readonly templateRepository: Repository<Template>,
+    @InjectRepository(Session, 'data')
+    private readonly sessionRepository: Repository<Session>,
   ) {}
 
   async create(sessionId: string, dto: CreateTemplateDto): Promise<Template> {
+    // The templates.sessionId FK turns a missing session into a driver error (500) at save time;
+    // check first so the caller gets a truthful 404.
+    if (!(await this.sessionRepository.exists({ where: { id: sessionId } }))) {
+      throw new NotFoundException(`Session with id '${sessionId}' not found`);
+    }
     const template = this.templateRepository.create({
       sessionId,
       name: dto.name,
@@ -44,7 +52,9 @@ export class TemplateService {
   }
 
   async findOne(sessionId: string, id: string): Promise<Template> {
-    const template = await this.templateRepository.findOne({ where: { id, sessionId } });
+    // PostgreSQL rejects a NUL in a bound text parameter (a 500), and ids are server-generated uuids, so
+    // none can match: answer 404 without querying. Covers the :id routes and resolve() by id.
+    const template = id.includes('\u0000') ? null : await this.templateRepository.findOne({ where: { id, sessionId } });
     if (!template) {
       throw new NotFoundException(`Template with id '${id}' not found`);
     }
@@ -63,6 +73,11 @@ export class TemplateService {
     }
 
     if (templateName) {
+      // PostgreSQL rejects a NUL in a bound text parameter (a 500), and the write DTOs refuse one, so no
+      // stored name can match: answer 404 without querying.
+      if (templateName.includes('\u0000')) {
+        throw new NotFoundException(`Template with name '${templateName}' not found`);
+      }
       // Order by createdAt ASC so resolution is deterministic if more than one row shares a name
       // (possible only on a DB predating the unique index); the migration keeps the earliest too.
       const template = await this.templateRepository.findOne({

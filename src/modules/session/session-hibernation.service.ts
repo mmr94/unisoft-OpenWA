@@ -168,7 +168,7 @@ export class SessionHibernationService implements OnApplicationBootstrap, OnModu
       if (this.shutdownService?.isShuttingDown()) return;
       try {
         const session = await this.sessionRepository.findOne({ where: { id: sessionId } });
-        if (!session || session.status !== SessionStatus.READY) continue;
+        if (!session || session.status !== SessionStatus.READY || session.desiredState === 'stopped') continue;
 
         const config = (session.config as HibernationConfig | null) ?? {};
         if (isTrue(config.keepAlive)) continue;
@@ -211,7 +211,7 @@ export class SessionHibernationService implements OnApplicationBootstrap, OnModu
     // stop() sets its own mark only after its first await, so an armed reconnect timer firing
     // in that window would launch a replacement engine this teardown then has to fight.
     this.engineLifecycle.markStopping(id);
-    const session = await this.engineLifecycle.stop(id, SessionStatus.HIBERNATED);
+    const session = await this.engineLifecycle.stop(id, {}, SessionStatus.HIBERNATED);
 
     this.logger.log(`Session hibernated: ${session.name}`, {
       sessionId: id,
@@ -262,7 +262,7 @@ export class SessionHibernationService implements OnApplicationBootstrap, OnModu
     // Only a hibernated session resumes here. A session an operator stopped, or one that was never
     // paired, must not be relaunched behind their back — the same rule ensureEngineReady enforces,
     // which the REST route would otherwise walk straight past. Use POST /start for those.
-    if (session.status !== SessionStatus.HIBERNATED) {
+    if (session.status !== SessionStatus.HIBERNATED || session.desiredState === 'stopped') {
       throw new BadRequestException(
         `Session '${id}' is not hibernated (status: ${session.status}). ` +
           'Use POST /sessions/{sessionId}/start to start a stopped session.',

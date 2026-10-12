@@ -1,4 +1,4 @@
-import { BadGatewayException, ServiceUnavailableException } from '@nestjs/common';
+import { BadGatewayException, ForbiddenException, ServiceUnavailableException } from '@nestjs/common';
 import { MessageDirection } from '../../message/entities/message.entity';
 import { PluginSearchProvider } from './plugin-search-provider';
 import type { PluginSearchTransport } from './plugin-search-provider';
@@ -25,7 +25,7 @@ describe('PluginSearchProvider', () => {
     const transport = fakeTransport({ dispatchSearch });
     const p = new PluginSearchProvider('p', 'P', transport, 7000);
 
-    await expect(p.search({ q: 'hi' })).resolves.toBe(results);
+    await expect(p.search({ q: 'hi' })).resolves.toEqual(results);
     expect(dispatchSearch).toHaveBeenCalledWith({ query: { q: 'hi' }, timeoutMs: 7000 });
   });
 
@@ -85,6 +85,31 @@ describe('PluginSearchProvider', () => {
     expect(res.provider).toBe('plugin:p');
   });
 
+  it.each(['empty', 'allowed', 'outside'])('refuses chat-restricted searches before RPC (%s page)', async page => {
+    const hits = page === 'empty' ? [] : [mkHit({ chatId: page === 'allowed' ? '111@c.us' : '999@g.us' })];
+    const results: SearchResults = { hits, total: 731, tookMs: 3, provider: 'plugin:p' };
+    const dispatchSearch = jest.fn().mockResolvedValue({ ok: true, results });
+    const p = new PluginSearchProvider('p', 'P', fakeTransport({ dispatchSearch }), 1000);
+
+    await expect(p.search({ q: 'hi', chatIds: ['111@c.us', '111@s.whatsapp.net'] })).rejects.toBeInstanceOf(
+      ForbiddenException,
+    );
+    expect(dispatchSearch).not.toHaveBeenCalled();
+  });
+
+  it('returns no hits for an empty compiled chat scope without dispatching to the plugin', async () => {
+    const dispatchSearch = jest.fn();
+    const transport = fakeTransport({ dispatchSearch });
+    const p = new PluginSearchProvider('p', 'P', transport, 1000);
+    await expect(p.search({ q: 'hi', chatIds: [], offset: 5 })).resolves.toEqual({
+      hits: [],
+      total: 0,
+      tookMs: 0,
+      provider: 'plugin:p',
+    });
+    expect(dispatchSearch).not.toHaveBeenCalled();
+  });
+
   it('preserves the plugin total when all hits are in-scope (pagination must still work)', async () => {
     // A well-behaved plugin returns a full page of in-scope hits with the true total spanning more pages.
     // Overwriting total with the page hit count would make "Load More" (hits.length < total) never fire,
@@ -125,6 +150,26 @@ describe('PluginSearchProvider', () => {
     const res = await p.search({ q: 'hi', sessionIds: [] });
     expect(res.hits.map(h => h.sessionId)).toEqual(['s1', 'sX']);
     expect(res.total).toBe(2);
+  });
+
+  it.each([
+    ['unscoped', undefined],
+    ['scoped', ['s1']],
+  ])('rounds a fractional tookMs, total and hit timestamp to integers (%s)', async (_label, sessionIds) => {
+    // The Go and Java SDKs decode these into integer fields; one fractional value failed the whole call.
+    const results: SearchResults = {
+      hits: [mkHit({ timestamp: 1700000000.75 })],
+      total: 3.9,
+      tookMs: 12.37,
+      provider: 'plugin:p',
+    };
+    const dispatchSearch = jest.fn().mockResolvedValue({ ok: true, results });
+    const p = new PluginSearchProvider('p', 'P', fakeTransport({ dispatchSearch }), 1000);
+
+    const res = await p.search({ q: 'hi', sessionIds });
+    expect(res.tookMs).toBe(12);
+    expect(res.total).toBe(3);
+    expect(res.hits[0].timestamp).toBe(1700000000);
   });
 
   describe('result shape validation (untrusted wire payload)', () => {
@@ -179,7 +224,7 @@ describe('PluginSearchProvider', () => {
         provider: 'plugin:p',
         cursor: 'next-page',
       };
-      await expect(providerReturning(results).search({ q: 'x' })).resolves.toBe(results);
+      await expect(providerReturning(results).search({ q: 'x' })).resolves.toEqual(results);
     });
   });
 });

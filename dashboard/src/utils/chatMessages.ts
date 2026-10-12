@@ -1,4 +1,5 @@
 import type { ChatMessage, EngineHistoryMessage, MessageType } from '../services/api';
+import { MENTION_CLOSE, MENTION_OPEN } from './messageFormatter.ts';
 
 export type { EngineHistoryMessage };
 
@@ -34,6 +35,7 @@ export function mapEngineHistoryMessage(h: EngineHistoryMessage): ChatMessage {
       }
       if (h.quotedMessage) metadata.quotedMessage = h.quotedMessage;
       if (h.call) metadata.call = h.call;
+      if (h.poll) metadata.poll = h.poll;
       return Object.keys(metadata).length > 0 ? metadata : undefined;
     })(),
   };
@@ -48,14 +50,20 @@ const msgTime = (m: ChatMessage): number =>
 // real delivery status survives. Deduped by the wweb.js serialized id (engine `id` == DB `waMessageId`).
 export function mergeChatMessages(db: ChatMessage[], history: ChatMessage[]): ChatMessage[] {
   const byId = new Map<string, ChatMessage>();
-  for (const m of history) byId.set(msgKey(m), m);
-  for (const m of db) {
+  for (const m of [...history, ...db]) {
     const key = msgKey(m);
     const hist = byId.get(key);
     // The DB copy wins (authoritative status) — but a legacy row has no stable sender id, so
     // salvage the engine-history copy's author or two same-named participants collapse into one
     // attribution run in the chat view.
-    byId.set(key, hist?.author && !m.author ? { ...m, author: hist.author } : m);
+    let merged = hist?.author && !m.author ? { ...m, author: hist.author } : m;
+    if (m.type === 'poll' && !m.metadata?.poll && hist?.metadata?.poll) {
+      merged = { ...merged, metadata: { ...merged.metadata, poll: hist.metadata.poll } };
+    }
+    if (m.type === 'revoked' || hist?.type === 'revoked') {
+      merged = { ...merged, type: 'revoked', body: '', metadata: undefined };
+    }
+    byId.set(key, merged);
   }
   const sorted = [...byId.values()].sort((a, b) => msgTime(a) - msgTime(b) || a.createdAt.localeCompare(b.createdAt));
   return capMediaPayloads(sorted);
@@ -66,7 +74,7 @@ export function mergeChatMessages(db: ChatMessage[], history: ChatMessage[]): Ch
  * React Query cache with staleTime: Infinity, so every image/video/voice note that arrives while
  * the chat is open would otherwise pin its full base64 string in heap for the whole session —
  * scrolling through a media-rich chat grows the tab unboundedly. Past the cap the OLDEST
- * payloads are stripped to the omitted marker ({data: undefined, omitted: true}), which renders
+ * payloads and archived previews are replaced by the omitted marker, which renders
  * the same 📎 placeholder as a history row fetched without media; the newest `keep` stay
  * renderable (thread + lightbox). Count-based (not byte-based): payloads are bounded upstream
  * by the backend's media size cap.
@@ -86,17 +94,23 @@ export const MEDIA_PAYLOAD_CACHE_LIMIT = 100;
  */
 export function capMediaPayloads(list: ChatMessageView[], keep = MEDIA_PAYLOAD_CACHE_LIMIT): ChatMessageView[] {
   let payloadCount = 0;
-  for (const m of list) if (m.metadata?.media?.data) payloadCount++;
+  const retainsMedia = (message: ChatMessageView): boolean => {
+    const media = message.metadata?.media;
+    return Boolean(
+      media?.data || (media?.archived && HISTORY_MEDIA_TYPES.has(message.type) && message.type !== 'document'),
+    );
+  };
+  for (const m of list) if (retainsMedia(m)) payloadCount++;
   if (payloadCount <= keep) return list;
 
   const next = list.slice();
   let toStrip = payloadCount - keep;
   for (let i = 0; i < next.length && toStrip > 0; i++) {
     const media = next[i].metadata?.media;
-    if (!media?.data) continue;
+    if (!media || !retainsMedia(next[i])) continue;
     next[i] = {
       ...next[i],
-      metadata: { ...next[i].metadata, media: { ...media, data: undefined, omitted: true } },
+      metadata: { ...next[i].metadata, media: { ...media, data: undefined, archived: undefined, omitted: true } },
     };
     toStrip--;
   }
@@ -111,6 +125,102 @@ export function capMediaPayloads(list: ChatMessageView[], keep = MEDIA_PAYLOAD_C
  */
 export const senderKey = (m: Pick<ChatMessage, 'author' | 'chatName'>): string | undefined => m.author ?? m.chatName;
 
+/**
+ * Maps a group participant's numeric id (the local part of their `author` JID, `:device` suffix
+ * stripped) to their resolved display name — built from every message in the thread that carries
+ * both. An @mention in a message body is just "@<digits>" (WhatsApp never sends a resolved name in
+ * the text itself), and those digits are the same id a mentioned participant's OWN messages carry
+ * as `author` — so any thread where the mentioned person has posted at least once already has
+ * everything needed to resolve the mention, with no separate contact lookup.
+ */
+export function buildMentionNameMap(messages: Pick<ChatMessage, 'author' | 'chatName'>[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const m of messages) {
+    if (!m.author || !m.chatName) continue;
+    const local = m.author.split('@')[0].split(':')[0];
+    // A push name is sender-controlled: strip the span delimiters so a name cannot close its own
+    // mention early and hand its tail back to Linkify and the format parser. Backticks go too:
+    // parseMessageBody peels code before it sees a mention span, so one in the name would pair
+    // with another backtick and split the span the same way.
+    const name = m.chatName.replace(MENTION_DELIMITERS, '').replace(/`/g, '').trim();
+    // Rows are ascending by time, so the last write is the participant's current push name.
+    if (name && !blankMentionName(name) && /^\d+$/.test(local)) map.set(local, name);
+  }
+  return map;
+}
+
+const MENTION_DELIMITERS = new RegExp(`[${MENTION_OPEN}${MENTION_CLOSE}]`, 'g');
+
+/**
+ * Drop any span delimiter already present in raw message text. Only resolveMentions may place one:
+ * parseMessageBody reads every MENTION_OPEN...MENTION_CLOSE pair as a mention, so a body that
+ * carries them itself would lose its formatting and links inside the pair.
+ */
+export const stripMentionDelimiters = (text: string): string => text.replace(MENTION_DELIMITERS, '');
+
+// Characters that render as nothing yet survive `.trim()`: format controls (zero-width space, soft
+// hyphen, word joiner, bidi marks), combining marks, the Hangul fillers and the blank braille
+// pattern. A push name made only of these would render as a bare "@".
+const INVISIBLE = /[\p{Cf}\p{M}\u115F\u1160\u3164\uFFA0\u2800]/gu;
+
+function blankMentionName(name: string): boolean {
+  return name.replace(INVISIBLE, '').trim() === '';
+}
+
+// The left boundary is the start of the text or whitespace, optionally followed by a run of opening
+// punctuation or format openers (`*_~`), so `*@digits*` resolves into a bold mention the way
+// WhatsApp renders it while a `_@digits` or `(@digits` inside a URL does not.
+const MENTION_TOKEN = /((?:^|\s)[([{"'*_~]*)@(\d{7,})/gu;
+
+// parseMessageBody peels code after this runs, so a mention inside a code span or block is left as
+// digits here: rewriting it would split the span and render its backticks literally.
+const CODE_SEGMENT = /(```[\s\S]*?```|`[^`]*`)/;
+
+/**
+ * Replace "@<digits>" mention tokens with "@<FirstName>" wherever the digits match a known
+ * participant (see buildMentionNameMap). An unmatched token is left exactly as WhatsApp sent it —
+ * the same fallback WhatsApp's own official clients show for a participant they can't resolve
+ * either, rather than guessing. First name only, matching WhatsApp's own mention convention (a
+ * bare "@FirstName Last Name" reads as the mention swallowing following prose).
+ *
+ * The resolved name is wrapped in MENTION_OPEN/MENTION_CLOSE (private-use-area delimiters
+ * messageFormatter.ts's parseMessageBody recognizes as a `mention` node), not spliced in as plain
+ * text: a push name is set freely by any WhatsApp user, and MessageBody renders that node as a
+ * real <bdi> element outside Linkify's ignoreTags-respected walk, so the name can never become a
+ * clickable link (character-stripping alone does not stop linkify-react auto-linking a bare word
+ * like "localhost").
+ *
+ * The left boundary only fires at the start of the text or after whitespace, optionally through
+ * a run of opening punctuation or format markers. It never fires after `/` or a word, so a URL
+ * with the same digits is left untouched, and digits inside a code span are never rewritten (this
+ * runs on the raw body, before parseMessageBody splits out code spans). Right after a closing
+ * backtick a bare "@digits" is left as it is, while an opener run such as `*@digits*` or
+ * `(@digits` still starts a mention: the span has already been split off, so it cannot break.
+ */
+export function resolveMentions(raw: string, names: Map<string, string>): string {
+  const text = stripMentionDelimiters(raw);
+  if (names.size === 0 || !text.includes('@')) return text;
+  return text
+    .split(CODE_SEGMENT)
+    .map((part, i) =>
+      i % 2
+        ? part
+        : part.replace(MENTION_TOKEN, (full: string, prefix: string, digits: string) => {
+            // A bare `^` only counts at the start of the whole text, not right after a closing
+            // backtick; `^` followed by an opener run does (see above).
+            if (i > 0 && prefix === '') return full;
+            // The first word that renders as something: a name like "\u3164 Bob" is not blank as a
+            // whole, but its first word alone would show as a bare "@".
+            const first = names
+              .get(digits)
+              ?.split(' ')
+              .find(word => !blankMentionName(word));
+            return first ? `${prefix}${MENTION_OPEN}@${first}${MENTION_CLOSE}` : full;
+          }),
+    )
+    .join('');
+}
+
 // ChatMessageView extends ChatMessage with the view-only fields the chat page renders.
 // Lifted from Chats.tsx so hooks/utils can share the same shape.
 export type MessageMedia = {
@@ -119,6 +229,11 @@ export type MessageMedia = {
   data?: string;
   omitted?: boolean;
   sizeBytes?: number;
+  /**
+   * Set alongside `omitted` when MESSAGE_INLINE_MEDIA=archive dropped the inline copy because the
+   * chat-media archive holds the bytes, the media route serves them, so the thread previews inline.
+   */
+  archived?: boolean;
 };
 
 export const getMediaSrc = (media?: MessageMedia): string => {
@@ -136,6 +251,7 @@ export interface ChatMessageView extends ChatMessage {
     reactions?: Record<string, string>;
     call?: { video: boolean; missed: boolean };
     buttons?: Array<{ id: string; text: string }>;
+    poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
   };
 }
 
@@ -149,6 +265,7 @@ export function liveMessageMetadata(msg: {
   quotedMessage?: { id: string; body: string };
   call?: { video: boolean; missed: boolean };
   buttons?: Array<{ id: string; text: string }>;
+  poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
   metadata?: ChatMessageView['metadata'];
 }): ChatMessageView['metadata'] {
   if (msg.metadata) return msg.metadata;
@@ -156,6 +273,7 @@ export function liveMessageMetadata(msg: {
   if (msg.media) metadata.media = msg.media;
   if (msg.quotedMessage) metadata.quotedMessage = msg.quotedMessage;
   if (msg.call) metadata.call = msg.call;
+  if (msg.poll) metadata.poll = msg.poll;
   if (msg.buttons?.length) metadata.buttons = msg.buttons;
   return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
@@ -227,6 +345,8 @@ function mergeMessageMetadata(
   if (call) merged.call = call;
   const buttons = incoming.buttons ?? existing.buttons;
   if (buttons?.length) merged.buttons = buttons;
+  const poll = incoming.poll ?? existing.poll;
+  if (poll) merged.poll = poll;
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
@@ -245,7 +365,10 @@ function mergeMessageMetadata(
  */
 export function mergeOrAppend(list: ChatMessageView[], incoming: ChatMessageView): ChatMessageView[] {
   const idx = list.findIndex(m => msgKey(m) === msgKey(incoming));
-  if (idx === -1) return capMediaPayloads([...list, incoming]);
+  if (idx === -1) {
+    const message = incoming.type === 'revoked' ? { ...incoming, body: '', metadata: undefined } : incoming;
+    return capMediaPayloads([...list, message]);
+  }
   const existing = list[idx];
   const next = list.slice();
   next[idx] = {
@@ -255,6 +378,9 @@ export function mergeOrAppend(list: ChatMessageView[], incoming: ChatMessageView
     status: mergeDeliveryStatus(existing.status, incoming.status) ?? incoming.status,
     metadata: mergeMessageMetadata(existing.metadata, incoming.metadata),
   };
+  if (existing.type === 'revoked' || incoming.type === 'revoked') {
+    next[idx] = { ...next[idx], type: 'revoked', body: '', metadata: undefined };
+  }
   return capMediaPayloads(next);
 }
 
@@ -342,7 +468,7 @@ export function applyMessageEdit(
 ): ChatMessageView[] {
   if (!event.messageId) return list;
   const idx = list.findIndex(byMessageId(event.messageId));
-  if (idx === -1) return list;
+  if (idx === -1 || list[idx].type === 'revoked') return list;
   const next = list.slice();
   next[idx] = { ...next[idx], body: event.body };
   return next;

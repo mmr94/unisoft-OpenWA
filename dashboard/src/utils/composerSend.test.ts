@@ -19,13 +19,17 @@ import { quotedIdOf, buildMediaSendPayload, buildOptimisticMetadata } from './co
 
 const REPLY = { id: 'local-1', waMessageId: 'true_628@c.us_3EB0', type: 'text', body: 'the original' };
 const ATTACHMENT = { base64: 'AAAA', mimetype: 'image/png', filename: 'a.png' };
+// Stands in for the composer's localized labeler.
+const label = (type: string) => `[${type === 'image' ? 'Image' : type}]`;
 
-test('quotedIdOf prefers the WhatsApp id over the local one', () => {
+test('quotedIdOf quotes by the WhatsApp id', () => {
   assert.equal(quotedIdOf(REPLY), 'true_628@c.us_3EB0');
 });
 
-test('quotedIdOf falls back to the local id before the echo assigns a WA id', () => {
-  assert.equal(quotedIdOf({ ...REPLY, waMessageId: undefined }), 'local-1');
+// A local temp_/sent_ id is not something the gateway can resolve: sending it as the quote fails the
+// send with a 404 instead of keeping the quote, so a message without a WA id is not quotable.
+test('quotedIdOf never falls back to the local id', () => {
+  assert.equal(quotedIdOf({ ...REPLY, waMessageId: undefined }), undefined);
 });
 
 test('quotedIdOf yields nothing when not replying', () => {
@@ -52,7 +56,7 @@ test('a media send that is not a reply carries no quote key at all', () => {
 });
 
 test('the optimistic bubble shows BOTH the media and the quote', () => {
-  const metadata = buildOptimisticMetadata(ATTACHMENT, REPLY);
+  const metadata = buildOptimisticMetadata(ATTACHMENT, REPLY, label);
 
   assert.equal(metadata?.media?.data, 'AAAA');
   assert.equal(metadata?.quotedMessage?.id, 'true_628@c.us_3EB0');
@@ -61,12 +65,12 @@ test('the optimistic bubble shows BOTH the media and the quote', () => {
 
 // A non-text quoted message has no useful body to preview, so the type stands in for it — the
 // behaviour the composer already had for text-only replies, preserved now that media can coexist.
-test('a quoted non-text message previews as its type', () => {
-  const metadata = buildOptimisticMetadata(null, { ...REPLY, type: 'image', body: '' });
+test('a quoted non-text message previews as its labelled type', () => {
+  const metadata = buildOptimisticMetadata(null, { ...REPLY, type: 'image', body: '' }, label);
 
-  assert.equal(metadata?.quotedMessage?.body, '[image]');
+  assert.equal(metadata?.quotedMessage?.body, '[Image]');
 });
 
 test('no attachment and no reply produces no metadata', () => {
-  assert.equal(buildOptimisticMetadata(null, null), undefined);
+  assert.equal(buildOptimisticMetadata(null, null, label), undefined);
 });

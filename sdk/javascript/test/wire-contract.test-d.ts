@@ -21,6 +21,7 @@ import type {
   ChannelMessageRecord,
   ChannelRecord,
   ChatHistoryMessage,
+  HealthReadyResponse,
   LabelRecord,
   StatusRecord,
 } from '../src/types.js';
@@ -34,14 +35,14 @@ interface WireLabel {
 
 /**
  * `Status` — `timestamp`/`expiresAt` are `Date` on the server and ISO strings once serialized.
- * `mediaUrl`/`backgroundColor`/`font` are declared by the engine interface but no adapter populates
- * them yet (wwjs `collectStatuses()` sets neither; Baileys throws `unsupported`), so they are
- * optional here for forward-compatibility rather than because a response carries them today.
+ * Reads come from the status store: `mediaUrl` is set only when the status media was stored (it
+ * points at `/api/sessions/:id/status/:statusId/media`), and `backgroundColor`/`font` only when the
+ * stored row carries them, so all three are optional.
  */
 interface WireStatus {
   id: string;
   contact: { id: string; name?: string; pushName?: string };
-  type: 'text' | 'image' | 'video';
+  type: 'text' | 'image' | 'video' | 'voice';
   caption?: string;
   mediaUrl?: string;
   backgroundColor?: string;
@@ -50,7 +51,7 @@ interface WireStatus {
   expiresAt: string;
 }
 
-/** `Channel` — `picture`/`createdAt` come from the Baileys `toChannel()` path; wwjs omits both. */
+/** `Channel` — `createdAt` comes from the Baileys `toChannel()` path; wwjs omits it. No engine fills `picture`. */
 interface WireChannel {
   id: string;
   name: string;
@@ -75,7 +76,7 @@ interface WireChannelMessage {
  * `IncomingMessage` — `messages.history()` hands back the engine array verbatim, so the wire shape is
  * that interface serialized. `backgroundColor`/`font` are set by the Baileys extended-text mapper but
  * are not reachable through this route (Baileys answers `getChatHistory` with `unsupported`); they are
- * declared for the same forward-compatibility reason as on `WireStatus`.
+ * declared for forward-compatibility.
  *
  * Scope, so nobody reads more into a green build than it carries: `Mirrors` compares TOP-LEVEL keys,
  * so drift inside `contact`, `call`, `media`, `quotedMessage` or `location` compiles clean. And like
@@ -138,6 +139,7 @@ interface WireChatHistoryMessage {
   font?: number;
   media?: { mimetype: string; filename?: string; data?: string; omitted?: boolean; sizeBytes?: number };
   quotedMessage?: { id: string; body: string };
+  poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
   location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
   order?: { orderId: string; token?: string };
   product?: { productId: string; title?: string; description?: string; businessOwnerJid?: string };
@@ -150,6 +152,15 @@ interface WireCatalog {
   description?: string;
   productCount: number;
   url: string;
+}
+
+/**
+ * `ReadinessResponseDto`: the 200 body of `GET /api/health/ready`. Each dependency is an object
+ * carrying its own `status`, not a bare string.
+ */
+interface WireReadiness {
+  status: string;
+  details: { mainDatabase: { status: 'up' | 'down' }; dataDatabase: { status: 'up' | 'down' } };
 }
 
 /**
@@ -172,5 +183,7 @@ const channel: Mirrors<WireChannel, ChannelRecord> = true;
 const channelMessage: Mirrors<WireChannelMessage, ChannelMessageRecord> = true;
 const catalog: Mirrors<WireCatalog, CatalogInfo> = true;
 const chatHistoryMessage: Mirrors<WireChatHistoryMessage, ChatHistoryMessage> = true;
+const poll: Mirrors<NonNullable<WireChatHistoryMessage['poll']>, NonNullable<ChatHistoryMessage['poll']>> = true;
+const readiness: Mirrors<WireReadiness, HealthReadyResponse> = true;
 
-export const contract = [label, status, channel, channelMessage, catalog, chatHistoryMessage];
+export const contract = [label, status, channel, channelMessage, catalog, chatHistoryMessage, poll, readiness];

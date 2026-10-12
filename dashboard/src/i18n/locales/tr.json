@@ -12,7 +12,7 @@
     "cancel": "İptal",
     "delete": "Sil",
     "create": "Oluştur",
-    "save": "Save",
+    "save": "Kaydet",
     "close": "Kapat",
     "showApiKey": "API anahtarını göster",
     "hideApiKey": "API anahtarını gizle",
@@ -32,8 +32,11 @@
     "never": "Hiçbir zaman",
     "justNow": "Az önce",
     "minAgo": "{{count}} dk önce",
+    "minAgo_other": "{{count}} dk önce",
     "hoursAgo": "{{count}} saat önce",
+    "hoursAgo_other": "{{count}} saat önce",
     "optional": "isteğe bağlı",
+    "fieldTooLong": "En fazla {{max}} karakter olabilir (şu an {{count}}).",
     "language": "Dil",
     "back": "Geri",
     "next": "İleri",
@@ -88,6 +91,7 @@
     "noMessageYet": "Henüz mesaj yok",
     "unreadBadge": "{{count}} okunmamış mesaj",
     "unreadBadge_other": "{{count}} okunmamış mesaj",
+    "markedUnread": "Okunmadı olarak işaretlendi",
     "loadingMessages": "Mesajlar yükleniyor...",
     "loadingOlderMessages": "Daha eski mesajlar yükleniyor...",
     "loadOlderMessagesError": "Daha eski mesajlar yüklenemedi. Tekrar denemek için yukarı kaydırın.",
@@ -99,8 +103,26 @@
       "delete": "Mesajı sil"
     },
     "replyingTo": "{{name}} kişisine yanıt veriliyor",
+    "messageType": {
+      "text": "Metin",
+      "image": "Görsel",
+      "video": "Video",
+      "audio": "Ses",
+      "voice": "Sesli mesaj",
+      "document": "Belge",
+      "sticker": "Çıkartma",
+      "location": "Konum",
+      "contact": "Kişi",
+      "poll": "Anket",
+      "call": "Arama",
+      "revoked": "Silinen mesaj",
+      "order": "Sipariş",
+      "product": "Ürün",
+      "masked": "Gizlenen mesaj",
+      "unknown": "Mesaj",
+      "unknownType": "Bilinmeyen tür"
+    },
     "you": "Siz",
-    "youPrefix": "Siz: ",
     "yesterday": "Dün",
     "attachTitle": "Dosya / görsel gönder",
     "emojiTitle": "Emoji seç",
@@ -121,7 +143,9 @@
       "group": "Grup",
       "channel": "Kanal",
       "status": "Durum",
-      "broadcast": "Toplu Mesaj Listesi"
+      "broadcast": "Toplu Mesaj Listesi",
+      "individual": "Bireysel",
+      "unknown": "Bilinmiyor"
     },
     "tab": {
       "chats": "Sohbetler",
@@ -165,7 +189,8 @@
       "react": "Mesaja tepki verilemedi",
       "delete": "Mesaj silinemedi",
       "clickButton": "Düğmeye tıklanamadı",
-      "fileTooLarge": "Dosya çok büyük (maks 18 MB)"
+      "fileTooLarge": "Dosya çok büyük (maks 18 MB)",
+      "searchHitSessionNotReady": "Bu mesajın oturumu bağlı değil"
     },
     "loadMessagesError": "Mesajlar yüklenemedi. Sunucu kayıtlarını kontrol edin.",
     "messageStatus": {
@@ -216,6 +241,7 @@
     "noSessions": "Oturum bulunamadı. Başlamak için bir tane oluşturun.",
     "view": "Görüntüle",
     "disconnect": "Bağlantıyı Kes",
+    "disconnectFailed": "Oturumun bağlantısı kesilemedi",
     "errorPrefix": "Hata: {{message}}",
     "loadError": "Veriler yüklenemedi",
     "charts": {
@@ -226,6 +252,7 @@
         "30d": "30g"
       },
       "overTime": "Zamana göre mesajlar",
+      "overTimeUtcDays": "Zamana göre mesajlar (günler UTC'ye göre)",
       "byType": "Türe göre mesajlar",
       "topChats": "En popüler sohbetler",
       "sent": "Gönderilen",
@@ -275,7 +302,8 @@
       "successTitle": "Oturum Oluşturuldu",
       "successDesc": "\"{{name}}\" oturumu başarıyla oluşturuldu",
       "errorTitle": "Oluşturma Başarısız",
-      "errorDefault": "Oturum oluşturulamadı"
+      "errorDefault": "Oturum oluşturulamadı",
+      "tooShort": "Ad en az 3 karakter olmalıdır."
     },
     "delete": {
       "title": "Silmeyi Onayla",
@@ -317,21 +345,21 @@
       "autoRejectCallsHint": "Gelen aramalar çaldığı anda reddedilir. call.received webhook'u yine de ilk olarak tetiklenir. Bir sonraki arama için geçerlidir, yeniden başlatma gerekmez. Yalnızca Baileys motorunda: whatsapp-web.js aramaları reddedemez."
     },
     "proxy": {
-      "title": "Proxy Configuration",
-      "status": "Current",
-      "enabled": "Use proxy",
-      "url": "Proxy URL",
+      "title": "Proxy Yapılandırması",
+      "status": "Mevcut",
+      "enabled": "Proxy kullan",
+      "url": "Proxy URL'si",
       "urlPlaceholder": "http://user:pass@proxy.example.com:8080",
-      "urlKeepPlaceholder": "Enter new URL to replace {{host}} (credentials not shown)",
+      "urlKeepPlaceholder": "{{host}} adresini değiştirmek için yeni bir URL girin (kimlik bilgileri gösterilmez)",
       "configured": "{{host}} ({{type}})",
-      "noProxy": "No proxy configured",
-      "hasCredentials": "Credentials are stored but not shown. Enter a full URL to change them.",
-      "hint": "Changes apply on the next session start, not to a running connection. The proxy must be real and reachable — an unreachable value blocks QR delivery and start returns 504.",
-      "createHint": "Only needed when your network cannot reach WhatsApp directly. Must be a real, reachable proxy.",
-      "invalidUrl": "Enter a valid http, https, socks4, or socks5 proxy URL.",
-      "saveSuccessTitle": "Proxy Saved",
-      "saveSuccess": "Proxy settings saved. They apply on the next session start.",
-      "saveError": "Failed to save proxy settings"
+      "noProxy": "Yapılandırılmış proxy yok",
+      "hasCredentials": "Kimlik bilgileri kayıtlı ancak gösterilmiyor. Değiştirmek için tam bir URL girin.",
+      "hint": "Değişiklikler çalışan bir bağlantıya değil, oturumun bir sonraki başlatılışında uygulanır. Proxy gerçek ve erişilebilir olmalıdır: erişilemeyen bir değer QR teslimini engeller. whatsapp-web.js'te başlatma 504 döndürür, Baileys'te başlatma başarılı olur ve oturum yeniden denemeye devam eder.",
+      "createHint": "Yalnızca ağınız WhatsApp'a doğrudan erişemiyorsa gereklidir. Gerçek ve erişilebilir bir proxy olmalıdır.",
+      "invalidUrl": "Geçerli bir http, https, socks4 veya socks5 proxy URL'si girin.",
+      "saveSuccessTitle": "Proxy Kaydedildi",
+      "saveSuccess": "Proxy ayarları kaydedildi. Oturumun bir sonraki başlatılışında uygulanır.",
+      "saveError": "Proxy ayarları kaydedilemedi"
     },
     "actions": {
       "view": "Görüntüle",
@@ -351,7 +379,8 @@
       "actionRequiredTitle": "İşlem gerekiyor",
       "actionRequiredDesc": "Bu oturumun ilgilenilmesi gerekiyor. Ne yapılması gerektiğini görmek için oturumu açın.",
       "failedTitle": "Oturum Başarısız",
-      "failedDesc": "WhatsApp oturumu başlatılamadı. Nedenini görmek için oturumu açın."
+      "failedDesc": "WhatsApp oturumu başlatılamadı. Nedenini görmek için oturumu açın.",
+      "stopFailedTitle": "Durdurma başarısız"
     },
     "card": {
       "phone": "Telefon",
@@ -419,11 +448,13 @@
     "selectSession": "Oturum seçin...",
     "session": "Oturum",
     "events": "Olaylar",
+    "noEvents": "En az bir olay seçin.",
     "available": "Kullanılabilir Olaylar",
     "saveChanges": "Değişiklikleri Kaydet",
     "filters": {
       "title": "Filtreler (isteğe bağlı)",
       "hint": "Yalnızca tüm koşullar eşleştiğinde tetiklenir. Mesaj olayları için geçerlidir.",
+      "incomplete": "Her filtre koşuluna bir değer verin ve en fazla 20 koşul, koşul başına 100 değer ve 1000 karakter metin kullanın.",
       "badge": "{{count}} filtre",
       "badge_other": "{{count}} filtre",
       "addCondition": "Koşul ekle",
@@ -441,7 +472,7 @@
         "body": "Mesaj içeriği",
         "type": "Mesaj türü",
         "isGroup": "Grup sohbeti mi",
-        "kind": "Chat kind",
+        "kind": "Sohbet türü",
         "fromMe": "Benim tarafımdan gönderildi",
         "hasMedia": "Medya içeriyor",
         "mentions": "Bahsetmeler"
@@ -457,15 +488,16 @@
       "valueLabel": "Filtre değeri"
     },
     "columns": {
-      "url": "URL",
       "events": "Olaylar",
       "session": "Oturum",
-      "status": "Durum",
-      "actions": "İşlemler"
+      "status": "Durum"
     },
     "empty": {
       "title": "Yapılandırılmış webhook yok",
-      "description": "Gerçek zamanlı olay bildirimleri almak için bir webhook ekleyin"
+      "description": "Gerçek zamanlı olay bildirimleri almak için bir webhook ekleyin",
+      "loadErrorTitle": "Webhook'lar yüklenemedi",
+      "forbiddenTitle": "Webhook'lara erişim yok",
+      "forbiddenDesc": "Webhook'lar, operatör veya yönetici rolüne sahip bir API anahtarı gerektirir."
     },
     "toasts": {
       "created": "Webhook başarıyla oluşturuldu",
@@ -486,10 +518,55 @@
     "eventDescriptions": {
       "message.received": "Bir mesaj alındığında",
       "message.sent": "Bir mesaj gönderildiğinde",
-      "session.connected": "Bir oturum bağlandığında",
-      "session.disconnected": "Bir oturumun bağlantısı kesildiğinde",
+      "message.ack": "Bir mesajın teslim veya okunma durumu değiştiğinde",
+      "message.failed": "Giden bir mesaj teslim edilemediğinde",
+      "message.revoked": "Bir mesaj herkesten silindiğinde",
+      "message.reaction": "Bir tepki eklendiğinde, değiştirildiğinde veya kaldırıldığında",
+      "message.edited": "Bir mesaj düzenlendiğinde",
+      "session.status": "Bir oturumun durumu değiştiğinde",
       "session.qr": "QR kodu oluşturulduğunda",
+      "session.authenticated": "Bir oturum eşlendiğinde ve hazır olduğunda",
+      "session.disconnected": "Bir oturumun bağlantısı kesildiğinde",
+      "session.reconnect_loop": "Bir oturum yeniden bağlanmayı sürekli başaramadığında",
+      "session.restriction": "WhatsApp hesabı kısıtladığında veya bir kısıtlamayı kaldırdığında",
+      "presence.update": "Abone olunan bir sohbet çevrimiçi olduğunda, yazdığında veya çevrimdışı olduğunda",
+      "group.join": "Katılımcılar bir gruba katıldığında veya eklendiğinde",
+      "group.leave": "Katılımcılar bir gruptan ayrıldığında veya çıkarıldığında",
+      "group.update": "Bir grubun adı, açıklaması veya ayarları değiştiğinde",
+      "group.join_request": "Birisi bu oturumun yönettiği bir gruba katılmak istediğinde",
+      "call.received": "Gelen bir arama çalmaya başladığında",
+      "call.accepted": "Bir arama yanıtlandığında",
+      "call.rejected": "Bir arama reddedildiğinde",
+      "call.missed": "Bir arama yanıtsız kaldığında",
+      "status.received": "Bir kişi durum paylaştığında",
       "all": "Tüm olaylar"
+    },
+    "auth": {
+      "title": "Teslimat kimlik doğrulaması",
+      "hint": "İsteğe bağlı. Kaydedilen değerler bir daha gösterilmez.",
+      "editHint": "Kayıtlı gizli anahtar ve başlıklar hiçbir zaman gösterilmez. Korumak için bu bölüme dokunmayın.",
+      "secret": "İmzalama gizli anahtarı",
+      "secretHint": "16 ile 255 karakter arası. Her teslimat, X-OpenWA-Signature başlığında bir HMAC-SHA256 imzası taşır.",
+      "secretKeepPlaceholder": "Mevcut gizli anahtarı korumak için boş bırakın",
+      "generateSecret": "Oluştur",
+      "copySecret": "Kopyala",
+      "secretCopied": "İmzalama gizli anahtarı kopyalandı",
+      "removeSecret": "Teslimatları imzalamayı durdur (gizli anahtarı kaldır)",
+      "headers": "Özel başlıklar",
+      "headerName": "Başlık adı",
+      "headerValue": "Başlık değeri",
+      "addHeader": "Başlık ekle",
+      "removeHeader": "Başlığı kaldır",
+      "replaceHeaders": "Özel başlıkları değiştir",
+      "replaceHint": "Bu satırlar kayıtlı tüm başlıkların yerini alır. Satır yoksa kayıtlı başlıklar kaldırılır.",
+      "errors": {
+        "headerName": "Başlık adları yalnızca harf, rakam ve kısa çizgi içerebilir.",
+        "headerValue": "Başlık değerleri en fazla 1024 karakter olabilir; kontrol karakterleri ve Latin-1 dışındaki karakterler kullanılamaz.",
+        "headerReserved": "Content-Type, User-Agent, X-OpenWA-* ve bağlantı başlıkları ağ geçidi tarafından ayarlanır ve kullanılamaz.",
+        "headerDuplicate": "Her başlık adı yalnızca bir kez kullanılabilir.",
+        "tooMany": "En fazla 50 özel başlığa izin verilir.",
+        "secretLength": "İmzalama gizli anahtarı 16 ile 255 karakter arasında olmalıdır."
+      }
     }
   },
   "templates": {
@@ -523,6 +600,7 @@
     },
     "empty": {
       "title": "Kayıtlı şablon yok",
+      "noMatch": "Aramanızla eşleşen şablon yok.",
       "description": "Sık kullanılan yanıtları ve bildirimleri hızlandırmak için yeniden kullanılabilir bir şablon oluşturun.",
       "noSessionsTitle": "Kullanılabilir oturum yok",
       "noSessionsDesc": "Şablon eklemeden önce bir WhatsApp oturumu oluşturun.",
@@ -549,6 +627,7 @@
     "createdTitle": "API Anahtarı Oluşturuldu",
     "createdHint": "Bu anahtarı şimdi kopyalayın. Bir daha göremeyeceksiniz.",
     "namePlaceholder": "ör. Prodüksiyon Anahtarı",
+    "nameTooShort": "En az 3 karakter kullanın.",
     "rolesTitle": "Roller Referansı",
     "roles": {
       "admin": "Yönetici (Admin)",
@@ -567,15 +646,20 @@
       "status": "Durum",
       "lastUsed": "Son Kullanım",
       "actions": "İşlemler",
-      "sessions": "Oturumlar"
+      "sessions": "Oturumlar",
+      "restrictions": "Kısıtlamalar"
     },
     "statuses": {
       "active": "Aktif",
-      "revoked": "Geçersiz Kılındı"
+      "revoked": "Geçersiz Kılındı",
+      "expired": "Süresi doldu"
     },
     "empty": {
       "title": "Oluşturulmuş API anahtarı yok",
-      "description": "İsteklerinizin kimliğini doğrulamak için bir API anahtarı oluşturun"
+      "description": "İsteklerinizin kimliğini doğrulamak için bir API anahtarı oluşturun",
+      "loadErrorTitle": "API anahtarları yüklenemedi",
+      "forbiddenTitle": "API anahtarlarına erişim yok",
+      "forbiddenDesc": "API anahtarlarını yönetmek, belirli oturumlarla sınırlı olmayan bir yönetici anahtarı gerektirir."
     },
     "confirm": {
       "deleteTitle": "API Anahtarını Sil",
@@ -586,10 +670,9 @@
       "revoke": "Geçersiz Kıl"
     },
     "actions": {
-      "copy": "Kopyala",
       "revoke": "Geçersiz Kıl",
       "delete": "Sil",
-      "editSessions": "Oturumları düzenle"
+      "edit": "Erişimi düzenle"
     },
     "sessions": {
       "label": "Oturum erişimi",
@@ -597,10 +680,36 @@
       "all": "Tüm oturumlar",
       "empty": "Henüz oturum yok. Oturumlar oluşunca bu anahtar hepsine erişebilir.",
       "restricted": "{{count}} seçildi",
-      "editTitle": "Oturum erişimini düzenle",
       "save": "Kaydet",
       "choose": "Oturumları seç",
       "leaveAll": "Tüm oturumlar için bırak"
+    },
+    "edit": {
+      "title": "Anahtar erişimini düzenle",
+      "signedIn": "Bu panel bu anahtarla oturum açtı. Rolünü, IP adreslerini, sohbetlerini veya son kullanma tarihini değiştirmek oturumunuzu kapatabilir."
+    },
+    "restrictions": {
+      "none": "Yok",
+      "ips": "IP'ler: {{count}}",
+      "chats": "Sohbetler: {{count}}",
+      "expires": "Son kullanma: {{date}}",
+      "expired": "Süresi doldu: {{date}}"
+    },
+    "ips": {
+      "label": "İzin verilen IP adresleri (isteğe bağlı)",
+      "hint": "Her satıra bir IP adresi veya CIDR aralığı. Tüm adresleri kabul etmek için boş bırakın.",
+      "invalid": "IPv4 adresi veya CIDR aralığı değil: {{value}}"
+    },
+    "chats": {
+      "label": "Sohbet erişimi (isteğe bağlı)",
+      "hint": "Her satıra bir sohbet: @g.us ile biten bir grup kimliği, @c.us veya @lid ile biten bir kişi kimliği ya da bir telefon numarası. Tüm sohbetler için boş bırakın. Sohbetle sınırlı bir anahtar yalnızca bu tür anahtarlara açık yolları kullanabilir; olay WebSocket'i ve MCP onu reddeder.",
+      "invalid": "Sohbet kimliği veya telefon numarası değil: {{value}}"
+    },
+    "expiry": {
+      "label": "Son kullanma tarihi (isteğe bağlı)",
+      "hint": "Bu tarayıcının saat diliminde. Süresi hiç dolmayan bir anahtar için boş bırakın.",
+      "clear": "Son kullanma tarihini kaldır",
+      "invalid": "9999 yılını geçmeyen eksiksiz bir tarih ve saat girin ya da süresi hiç dolmayan bir anahtar için alanı temizleyin."
     }
   },
   "logs": {
@@ -628,7 +737,12 @@
       "filteredTitle": "Bu sayfada eşleşme yok",
       "filteredDescription": "Arama yalnızca geçerli sayfayı filtreler. Temizleyin, sayfalar arasında gezinin veya sunucu tarafında önem filtresini kullanın.",
       "filteredServerDescription": "Bu filtrelerle eşleşen log yok. Aramayı genişletmek için önem filtresini ayarlayın."
-    }
+    },
+    "exportFailed": "Denetim kaydı dışa aktarılamadı",
+    "exportTruncated": "Dışa aktarma yalnızca en yeni {{rows}} kaydı kapsar. Daha eski kayıtları dışa aktarmak için önem filtresini daraltın.",
+    "exportThrottled": "Ağ geçidi denetim günlüğü okumalarını sınırladığı için dışa aktarma yalnızca en yeni {{rows}} kaydı kapsar. Bir dakika bekleyip yeniden dışa aktarın.",
+    "exportNoMatches": "Aramayla eşleşen denetim kaydı yok, bu yüzden hiçbir şey dışa aktarılmadı.",
+    "exportNoMatchesTruncated": "Taranan en yeni {{rows}} kaydın hiçbiri aramayla eşleşmiyor, bu yüzden hiçbir şey dışa aktarılmadı. Daha eski kayıtlar taranmadı."
   },
   "messageTester": {
     "title": "Mesaj Test Aracı",
@@ -770,7 +884,7 @@
       "sslRejectUnauthorized": "SSL Sertifikasını Doğrula",
       "sslRejectUnauthorizedDesc": "Kendinden imzalı veya geçersiz sertifikaları reddeder. Kendinden imzalı sertifikalara sahip yönetilen Postgres için kapatın (Supabase, Heroku, Render, Railway).",
       "migrationsTitle": "Veritabanı Geçişleri (Migrations)",
-      "migrationsStatus": "Şema, TypeORM ile otomatik olarak senkronize edilir",
+      "migrationsStatus": "Bekleyen geçişler başlangıçta otomatik olarak uygulanır",
       "migrationsHint": "Geçişler otomatik olarak yönetilir. Manuel geçişler için CLI kullanın."
     },
     "engine": {
@@ -793,7 +907,7 @@
     "redis": {
       "title": "Redis",
       "enable": "Redis'i Etkinleştir",
-      "enableDesc": "Önbelleğe alma, oturum depolama ve BullMQ kuyrukları için gereklidir",
+      "enableDesc": "Önbelleğe alma, BullMQ kuyrukları, hız sınırı sayaçları ve çok düğümlü WebSocket dağıtımı için kullanılır",
       "useBuiltIn": "Dahili Redis Konteynerini Kullan",
       "builtInDesc": "OpenWA sizin için bir Redis konteynerini yönetecektir",
       "queueTitle": "BullMQ Kuyruk Sistemini Etkinleştir",
@@ -805,7 +919,7 @@
       "failed": "Başarısız",
       "viewBullMq": "Bull MQ Kontrol Panelini Görüntüle",
       "disabledTitle": "Redis Devre Dışı",
-      "disabledDesc": "Önbelleğe alma, oturum depolama ve BullMQ mesaj kuyrukları için Redis'i etkinleştirin.",
+      "disabledDesc": "Önbelleğe alma, BullMQ mesaj kuyrukları, hız sınırı sayaçları ve çok düğümlü WebSocket dağıtımı için Redis'i etkinleştirin.",
       "passwordOptional": "(isteğe bağlı)",
       "bullMqUrlCopied": "Bull MQ kontrol paneli URL'si kopyalandı",
       "bullMqUrlHint": "Bir ADMIN API anahtarıyla açın — normal bir tarayıcı sekmesi kimlik doğrulaması yapamaz."
@@ -840,7 +954,7 @@
       "storageWarning": "Mevcut medya dosyaları yeni depolama arka ucuna otomatik olarak taşınmaz; eski konumda kalırlar.",
       "downloadBackup": "Önce yedeği indirin",
       "backupTitle": "Veri yedekleme ve geri yükleme",
-      "backupHint": "Veritabanlarını değiştirmeden önce tüm verileri JSON olarak dışa aktarın, ardından değişiklikten sonra içe aktarın. Yedekleme; webhook gizli anahtarlarını ve proxy kimlik bilgilerini düz metin olarak içerir — güvenli bir şekilde saklayın ve geri yükledikten sonra silin.",
+      "backupHint": "Veritabanlarını değiştirmeden önce tüm verileri JSON olarak dışa aktarın, ardından değişiklikten sonra içe aktarın. Webhook imzalama gizli anahtarları, özel webhook başlıkları ve proxy kimlik bilgileri dahil edilmez; geri yükledikten sonra bunları yeniden girin. Entegrasyon örneklerinin gizli anahtarları ve ayarları düz metin olarak dahil edilir; dosyayı güvenli bir şekilde saklayın ve geri yükledikten sonra silin.",
       "export": "Verileri dışa aktar",
       "import": "Verileri içe aktar",
       "exportFailed": "Veriler dışa aktarılamadı",
@@ -865,13 +979,15 @@
       "checking": "Sunucu durumu kontrol ediliyor...",
       "dontClose": "Lütfen bu pencereyi kapatmayın",
       "successMsg": "Sunucu tekrar çevrimiçi! Sayfa otomatik olarak yeniden yüklenecektir.",
-      "errorMsg": "Sunucu 30 saniye sonra yanıt vermedi. Lütfen Docker kayıtlarını kontrol edin ve manuel olarak yeniden başlatın.",
+      "errorMsg": "Sunucu yanıt vermedi. Lütfen Docker kayıtlarını kontrol edin ve manuel olarak yeniden başlatın.",
+      "outcomeUnknown": "Sunucu yanıt vermeden önce proxy bir hata döndürdü, bu nedenle yeniden başlatmanın sürüp sürmediği bilinmiyor. Kontrol etmek için bir dakika sonra sayfayı yeniden yükleyin.",
       "reload": "Sayfayı Yeniden Yükle"
     },
     "toasts": {
       "saveFailed": "Kaydetme Başarısız"
     },
-    "statusLoadError": "Mevcut altyapı durumu yüklenemedi. Yeniden denemek için sayfayı yenileyin."
+    "statusLoadError": "Mevcut altyapı durumu yüklenemedi. Yeniden denemek için sayfayı yenileyin.",
+    "configLoadError": "Kayıtlı yapılandırma yüklenemedi, bu yüzden burada düzenlenemiyor. Yeniden denemek için sayfayı yenileyin."
   },
   "plugins": {
     "title": "Eklentiler",
@@ -879,6 +995,19 @@
     "refresh": "Yenile",
     "builtIn": "Dahili",
     "noDescription": "Açıklama bulunmuyor",
+    "statuses": {
+      "installed": "Yüklü",
+      "enabled": "Etkin",
+      "disabled": "Devre Dışı",
+      "error": "Hata"
+    },
+    "types": {
+      "engine": "Motor",
+      "storage": "Depolama",
+      "queue": "Kuyruk",
+      "auth": "Kimlik Doğrulama",
+      "extension": "Uzantı"
+    },
     "enable": "Etkinleştir",
     "disable": "Devre Dışı Bırak",
     "healthCheck": "Sağlık Kontrolü",
@@ -893,7 +1022,7 @@
     "config": {
       "title": "{{name}} Yapılandır",
       "noOptions": "Bu eklenti için yapılandırma seçeneği bulunmuyor",
-      "uiHandshakeError": "Eklenti yapılandırma arayüzü başlatılamadı. Varsa aşağıdaki şema formunu kullanın.",
+      "uiHandshakeError": "Eklenti yapılandırma arayüzü başlatılamadı.",
       "save": "Yapılandırmayı Kaydet",
       "addItem": "Ekle",
       "tabConfig": "Yapılandırma",
@@ -924,7 +1053,7 @@
       "healthFail": "Sağlık Kontrolü Başarısız",
       "healthError": "Sağlık Kontrolü Hatası",
       "savedTitle": "Yapılandırma Kaydedildi",
-      "savedDesc": "Değişikliklerin uygulanması için sunucunun yeniden başlatılması gerekir.",
+      "savedDesc": "Değişiklikler sunucu yeniden başlatılmadan geçerli olur.",
       "saveFailed": "Kaydetme Başarısız",
       "installed": "Eklenti yüklendi",
       "installFailed": "Yükleme başarısız",
@@ -953,7 +1082,6 @@
       "title": "Örnekler (Instances)",
       "description": "Bu entegrasyon için hesap başına örnekler tanımlayın. Her örneğin kendi imzalama gizli anahtarı ve giriş URL'si vardır.",
       "create": "Örnek oluştur",
-      "save": "Save",
       "empty": "Henüz örnek yok. Giriş URL'si ve gizli anahtar almak için bir tane oluşturun.",
       "loadError": "Örnekler yüklenemedi.",
       "allSessions": "Tüm oturumlar",
@@ -977,7 +1105,8 @@
         "title": "Örnek oluşturuldu",
         "hint": "Gizli anahtarı şimdi kopyalayın — yalnızca bir kez gösterilir.",
         "secret": "İmzalama gizli anahtarı",
-        "ingressUrls": "Giriş URL'leri"
+        "ingressUrls": "Giriş URL'leri",
+        "verifyToken": "Doğrulama belirteci"
       },
       "regenerate": {
         "title": "Gizli anahtarı yeniden oluştur",
@@ -1029,7 +1158,7 @@
   },
   "search": {
     "placeholder": "Mesajlarda ara…",
-    "results": "{{count}} sonuç",
+    "loadMore": "Daha fazla göster ({{total}} içinden {{shown}})",
     "empty": "Mesaj bulunamadı.",
     "error": "Arama başarısız oldu. Tekrar deneyin.",
     "unavailable": "Arama yapılandırılmamış.",

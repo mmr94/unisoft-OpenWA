@@ -187,6 +187,11 @@ describe('mapWwebjsMessageType (engine type-token -> neutral MessageType boundar
     ['poll_creation', 'poll'],
     ['order', 'order'],
     ['product', 'product'],
+    // A tapped button, list row or template button: WA Web carries the chosen option's text in the
+    // body, and Baileys reports the same replies as text (#562).
+    ['buttons_response', 'text'],
+    ['list_response', 'text'],
+    ['template_button_reply', 'text'],
     ['e2e_notification', 'unknown'], // any unmapped wwebjs type
   ])('maps wwebjs type %s -> %s', (raw, expected) => {
     expect(mapWwebjsMessageType(raw)).toBe(expected);
@@ -273,5 +278,26 @@ describe('mapContactFields', () => {
     it('omits name/pushName when absent and never includes extended fields', () => {
       expect(mapContactFields({ number: '584145200715', isBusiness: true })).toEqual({});
     });
+  });
+});
+
+describe('poll choice metadata', () => {
+  it.each([
+    [' Park ', 'Beach'],
+    [{ name: ' Park ' }, { name: 'Beach' }],
+  ])('preserves choices from the library representation', (...pollOptions) => {
+    const mapped = buildIncomingMessageBase({
+      id: { _serialized: 'P1' },
+      from: 'a@c.us',
+      to: 'me',
+      body: 'Where?',
+      type: 'poll_creation',
+      timestamp: 100,
+      fromMe: false,
+      pollName: 'Where?',
+      pollOptions,
+      allowMultipleAnswers: true,
+    });
+    expect(mapped.poll).toEqual({ name: 'Where?', options: [' Park ', 'Beach'], allowMultipleAnswers: true });
   });
 });

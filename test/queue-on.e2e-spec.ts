@@ -21,7 +21,10 @@ process.env.REDIS_PORT = String(REDIS_PORT);
 // Jest registers suites synchronously at file load and has no runtime skip, so the Redis
 // availability probe has to settle synchronously too: spawn a throwaway node one-liner that
 // TCP-connects with a hard deadline (spawnSync kills it past the timeout margin). Unreachable →
-// describe.skip below: an explicit green skip instead of a red boot.
+// describe.skip below on a developer box: an explicit green skip instead of a red boot. On GitHub
+// Actions every workflow that runs this suite provides Redis, so an unreachable one is drift (a
+// removed service, a renamed env var) and fails the suite instead of reporting green on tests it
+// never ran. Keyed on GITHUB_ACTIONS rather than CI, which a local shell may export without Redis.
 const probeRedis = (host: string, port: number, timeoutMs: number): boolean => {
   const script =
     `const s = require('net').connect(${port}, ${JSON.stringify(host)});` +
@@ -32,6 +35,12 @@ const probeRedis = (host: string, port: number, timeoutMs: number): boolean => {
 };
 
 const REDIS_AVAILABLE = probeRedis(REDIS_HOST, REDIS_PORT, 1000);
+if (!REDIS_AVAILABLE && process.env.GITHUB_ACTIONS === 'true') {
+  throw new Error(
+    `queue-on e2e: no Redis at ${REDIS_HOST}:${REDIS_PORT} under GitHub Actions (set REDIS_HOST/REDIS_PORT or ` +
+      'QUEUE_TEST_REDIS_HOST/QUEUE_TEST_REDIS_PORT); refusing to skip',
+  );
+}
 const describeQueueOn = REDIS_AVAILABLE ? describe : describe.skip;
 
 import { createHmac, randomBytes } from 'node:crypto';
@@ -53,6 +62,7 @@ import { applyGlobalValidation } from '../src/config/app-validation';
 import { PluginLoaderService } from '../src/core/plugins/plugin-loader.service';
 import { PluginInstance } from '../src/modules/integration/entities/plugin-instance.entity';
 import { IngressEvent } from '../src/modules/integration/entities/ingress-event.entity';
+import { sanitizeIngressJobId } from '../src/modules/integration/ingress-enqueue.service';
 import { QUEUE_NAMES } from '../src/modules/queue/queue-names';
 import { IngressJobData } from '../src/modules/queue/processors/ingress.processor';
 import { AuthService } from '../src/modules/auth/auth.service';
@@ -70,9 +80,9 @@ import { WebhookService } from '../src/modules/webhook/webhook.service';
  *     ingress-queue provider did not resolve) stays silent — the broken wiring it guards against
  *     (IntegrationModule not importing QueueModule) would crash this suite's beforeAll;
  *   - a signed ingress delivery fast-acks 202 with its job persisted in `ingress-queue`
- *     (jobId = deliveryId, awaited before the ack — deterministic proof the enqueue path ran, since
- *     the inline fallback never touches the queue), and the IngressProcessor worker then performs
- *     the dispatch;
+ *     (its jobId derived from the deliveryId, awaited before the ack — deterministic proof the
+ *     enqueue path ran, since the inline fallback never touches the queue), and the IngressProcessor
+ *     worker then performs the dispatch;
  *   - WebhookService.dispatch() enqueues onto `webhook-queue` (the queue.add spy fires before
  *     dispatch() resolves — the direct-delivery fallback never calls it) and the WebhookProcessor
  *     worker POSTs to a live local receiver.
@@ -81,7 +91,7 @@ import { WebhookService } from '../src/modules/webhook/webhook.service';
  * (or `docker compose --profile redis up -d redis`); point elsewhere with
  * QUEUE_TEST_REDIS_HOST/QUEUE_TEST_REDIS_PORT. CI runs it against the redis service of the Test job.
  * With no Redis reachable the whole suite self-skips (see REDIS_AVAILABLE above), so a bare
- * `npm run test:e2e` on a Redis-less box stays green.
+ * `npm run test:e2e` on a Redis-less box stays green; on GitHub Actions it fails instead.
  */
 describeQueueOn('Queued dispatch paths (e2e, QUEUE_ENABLED=true)', () => {
   let app: INestApplication<App>;
@@ -227,8 +237,8 @@ describeQueueOn('Queued dispatch paths (e2e, QUEUE_ENABLED=true)', () => {
   });
 
   it('enqueues the ingress delivery and the worker dispatches it', async () => {
-    // Unique per run: the enqueue sets jobId = deliveryId and BullMQ dedups a repeated jobId while
-    // the previous job still lingers (auto-evicted, 1h window) — a fixed id would make a fast local
+    // Unique per run: the enqueue derives the jobId from deliveryId and BullMQ dedups a repeated jobId
+    // while the previous job still lingers (auto-evicted, 1h window) — a fixed id would make a fast local
     // rerun enqueue nothing and time out below.
     const deliveryId = `queue-on-${Date.now()}`;
     const res = await request(app.getHttpServer())
@@ -241,7 +251,8 @@ describeQueueOn('Queued dispatch paths (e2e, QUEUE_ENABLED=true)', () => {
     expect(res.status).toBe(202);
     // The no-`response` route awaits the enqueue before the ack, so the job MUST already exist; the
     // inline fallback never touches the queue, making this the queued-vs-inline discriminator.
-    const job = await ingressQueue.getJob(deliveryId);
+    // The job id is the delivery id hashed with its plugin/instance namespace, as the enqueue mints it.
+    const job = await ingressQueue.getJob(sanitizeIngressJobId(deliveryId, 'chatwoot\u0000acct1'));
     expect(job).toBeDefined();
     // The enqueue outcome was recorded on the event row (queued counts as reached-the-dispatch-tier).
     const event = await eventRepo.findOneByOrFail({ providerDeliveryId: deliveryId });

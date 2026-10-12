@@ -1,9 +1,90 @@
 import { StreamableFile } from '@nestjs/common';
 import { RESPONSE_PASSTHROUGH_METADATA } from '@nestjs/common/constants';
+import { Test } from '@nestjs/testing';
+import request from 'supertest';
+import type { Server } from 'http';
 import { MessageController } from './message.controller';
-import type { MessageService } from './message.service';
-import type { BulkMessageService } from './bulk-message.service';
+import { MessageService } from './message.service';
+import { BulkMessageService } from './bulk-message.service';
+import { ChatScopeService } from '../auth/chat-scope.service';
+import { SendIdempotencyService } from './idempotency/send-idempotency.service';
+import { CHAT_SCOPED_KEY } from '../auth/decorators/auth.decorators';
+import type { ApiKey } from '../auth/entities/api-key.entity';
+import type { SendBulkMessageDto } from './dto/bulk-message.dto';
 import type { Response } from 'express';
+
+describe('MessageController - message-time selection', () => {
+  const getMessages = jest.fn().mockResolvedValue({ messages: [], total: 0, unknownTimestampTotal: 0 });
+  const controller = new MessageController(
+    { getMessages } as unknown as MessageService,
+    {} as unknown as BulkMessageService,
+    new ChatScopeService(),
+  );
+  beforeEach(() => getMessages.mockClear());
+
+  it('passes new HTTP options into the existing bounded list', async () => {
+    await controller.getMessages(
+      's1',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'false',
+      undefined,
+      '1000000.5',
+      '2000000',
+      'incoming',
+      'timestamp',
+    );
+    expect(getMessages).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({
+        since: 1000000.5,
+        until: 2000000,
+        direction: 'incoming',
+        orderBy: 'timestamp',
+        inlineMedia: false,
+      }),
+    );
+  });
+  it('rejects invalid selection before accessing storage', async () => {
+    await expect(
+      controller.getMessages(
+        's1',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        '2000',
+        '1000',
+      ),
+    ).rejects.toThrow('since');
+    expect(getMessages).not.toHaveBeenCalled();
+  });
+  it('keeps chat-restricted reads fenced even for new filters', async () => {
+    await expect(
+      controller.getMessages(
+        's1',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { allowedChats: ['1@c.us'] } as ApiKey,
+        '1000',
+        '2000',
+        'incoming',
+        'timestamp',
+      ),
+    ).rejects.toThrow();
+    expect(getMessages).not.toHaveBeenCalled();
+  });
+});
 
 /**
  * `getChatMedia` serves third-party bytes from the API origin. The route shape, the roles and the
@@ -16,6 +97,7 @@ describe('MessageController — stored media download', () => {
   const controller = new MessageController(
     { getChatMedia } as unknown as MessageService,
     {} as unknown as BulkMessageService,
+    new ChatScopeService(),
   );
 
   /**
@@ -74,6 +156,7 @@ describe('MessageController - inlineMedia is opt-out', () => {
   const controller = new MessageController(
     { getMessages } as unknown as MessageService,
     {} as unknown as BulkMessageService,
+    new ChatScopeService(),
   );
 
   const inlineMediaFor = async (raw?: string): Promise<boolean> => {
@@ -110,5 +193,108 @@ describe('MessageController - inlineMedia is opt-out', () => {
   it('passes a real cursor through, trimmed', async () => {
     expect(await afterFor('db-42')).toBe('db-42');
     expect(await afterFor('  db-42  ')).toBe('db-42');
+  });
+});
+
+/**
+ * A key restricted to selected chats reads stored history only for a chat it names: the guard fences
+ * the ?chatId= it sends, and the handler refuses the same key when it names none, which the service
+ * would otherwise read as every chat in the session.
+ */
+describe('MessageController - stored history for a chat-restricted key', () => {
+  const getMessages = jest.fn().mockResolvedValue({ messages: [], total: 0 });
+  const controller = new MessageController(
+    { getMessages } as unknown as MessageService,
+    {} as unknown as BulkMessageService,
+    new ChatScopeService(),
+  );
+  const restricted = { allowedChats: ['1@c.us'] } as ApiKey;
+  const list = (chatId: string | undefined, apiKey?: ApiKey) =>
+    controller.getMessages('s1', chatId, undefined, undefined, undefined, undefined, undefined, apiKey);
+
+  beforeEach(() => getMessages.mockClear());
+
+  it('is fenced', () => {
+    expect(
+      Reflect.getMetadata(
+        CHAT_SCOPED_KEY,
+        Object.getOwnPropertyDescriptor(MessageController.prototype, 'getMessages')!.value as object,
+      ),
+    ).toBe('fenced');
+  });
+
+  it.each([undefined, ''])('refuses a restricted key with chatId %p before reading', async chatId => {
+    await expect(list(chatId, restricted)).rejects.toThrow('chatId is required for a key restricted to selected chats');
+    expect(getMessages).not.toHaveBeenCalled();
+  });
+
+  it('reads the named chat for a restricted key, passing chatId through as sent', async () => {
+    await list('1@c.us', restricted);
+    expect(getMessages).toHaveBeenCalledWith('s1', expect.objectContaining({ chatId: '1@c.us' }));
+  });
+
+  it('leaves an unrestricted key free to list every chat', async () => {
+    await list(undefined, { allowedChats: null } as ApiKey);
+    expect(getMessages).toHaveBeenCalledWith('s1', expect.objectContaining({ chatId: undefined }));
+  });
+});
+
+/**
+ * A caller may pick its own batchId. 'history' shares the two-segment shape of ':chatId/history',
+ * and an id with a reserved character must survive the statusUrl handed back on creation.
+ */
+describe('MessageController - caller-supplied batch ids', () => {
+  const bulk = {
+    getBatchStatus: jest.fn().mockResolvedValue({ batchId: 'history', status: 'processing' }),
+    createBatch: jest.fn().mockResolvedValue({ batchId: 'run/1?x', status: 'pending', messages: [] }),
+  };
+  const messages = { getChatHistory: jest.fn().mockResolvedValue([]) };
+
+  it("routes GET batch/history to the batch status, not the history of chat 'batch'", async () => {
+    const moduleRef = await Test.createTestingModule({
+      controllers: [MessageController],
+      providers: [
+        { provide: MessageService, useValue: messages },
+        { provide: BulkMessageService, useValue: bulk },
+        ChatScopeService,
+        // The send routes carry SendIdempotencyInterceptor; this test sends no Idempotency-Key.
+        { provide: SendIdempotencyService, useValue: {} },
+      ],
+    }).compile();
+    const app = moduleRef.createNestApplication();
+    await app.init();
+    try {
+      await request(app.getHttpServer() as Server)
+        .get('/sessions/s1/messages/batch/history')
+        .expect(200);
+      expect(bulk.getBatchStatus).toHaveBeenCalledWith('s1', 'history');
+      expect(messages.getChatHistory).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('percent-encodes the batch id in the returned statusUrl', async () => {
+    const controller = new MessageController(
+      messages as unknown as MessageService,
+      bulk as unknown as BulkMessageService,
+      new ChatScopeService(),
+    );
+
+    const res = await controller.sendBulk('s1', {} as SendBulkMessageDto);
+
+    expect(res.statusUrl).toBe('/api/sessions/s1/messages/batch/run%2F1%3Fx');
+  });
+});
+
+// MessageService.getEngine() answers 400 for a session with no live engine; clients generated from
+// the OpenAPI contract need it declared on the read routes too.
+describe('MessageController OpenAPI error responses', () => {
+  it.each(['getChatHistory', 'getReactions'])('%s declares 400', method => {
+    const responses = Reflect.getMetadata(
+      'swagger/apiResponse',
+      Object.getOwnPropertyDescriptor(MessageController.prototype, method)!.value as object,
+    ) as Record<string, unknown>;
+    expect(Object.keys(responses)).toContain('400');
   });
 });

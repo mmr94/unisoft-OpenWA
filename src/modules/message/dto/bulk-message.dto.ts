@@ -54,7 +54,7 @@ class BulkMediaDto {
   ptt?: boolean;
 }
 
-class BulkMessageContentDto {
+export class BulkMessageContentDto {
   @ApiPropertyOptional({ description: 'Text content for text messages', maxLength: MESSAGE_TEXT_MAX_LENGTH })
   @IsOptional()
   @IsString()
@@ -97,7 +97,13 @@ class BulkMessageContentDto {
   // Applies to the text body and to a media caption alike, matching the single-send routes. Every
   // item in a batch names its own list: a batch fans out to many chats, and a WID is only taggable
   // in a chat the participant is in.
-  @ApiPropertyOptional({ description: MENTIONS_DESCRIPTION, example: ['628123456789@c.us'], type: [String] })
+  @ApiPropertyOptional({
+    description: MENTIONS_DESCRIPTION,
+    example: ['628123456789@c.us'],
+    type: [String],
+    maxItems: MENTIONS_MAX,
+    items: { type: 'string', maxLength: MENTION_WID_MAX_LENGTH },
+  })
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(MENTIONS_MAX)
@@ -154,6 +160,9 @@ class BulkMessageOptionsDto {
   stopOnError?: boolean;
 }
 
+/** Max recipients in one bulk request. The guard applies the same cap BEFORE its per-chat lookups. */
+export const BULK_MESSAGES_MAX = 100;
+
 export class SendBulkMessageDto {
   @ApiPropertyOptional({ description: 'Custom batch ID (auto-generated if not provided)' })
   @IsOptional()
@@ -164,9 +173,10 @@ export class SendBulkMessageDto {
     description:
       'Array of messages (max 100 per request; exact duplicate entries are collapsed — first occurrence wins)',
     type: [BulkMessageItemDto],
+    maxItems: BULK_MESSAGES_MAX,
   })
   @IsArray()
-  @ArrayMaxSize(100)
+  @ArrayMaxSize(BULK_MESSAGES_MAX)
   @ValidateNested({ each: true })
   @Type(() => BulkMessageItemDto)
   messages!: BulkMessageItemDto[];

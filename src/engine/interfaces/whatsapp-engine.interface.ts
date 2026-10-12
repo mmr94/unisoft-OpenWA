@@ -114,7 +114,12 @@ export interface IncomingMessage {
    *  in the raw payload. 0 or undefined = no disappearing timer.
    *  Known values: 86400 (24h), 604800 (7d), 7776000 (90d). */
   ephemeralDuration?: number;
-  /** For group messages, the WID of the participant who actually sent it (`from` is the group JID there). */
+  /**
+   * For group, status and broadcast-list messages, the WID of the sender, where `from` is the group or
+   * `status@broadcast`. A broadcast-list message the account received is filed under the sender's own
+   * chat on Baileys, as WhatsApp lists it, so there `chatId` and `from` name the sender and `author`
+   * repeats it.
+   */
   author?: string;
   /** WIDs @mentioned in the message (empty/absent when none). Surfaced for command targeting. */
   mentionedIds?: string[];
@@ -182,6 +187,7 @@ export interface IncomingMessage {
   backgroundColor?: string;
   /** Styling of a text status/story: the WhatsApp font index. Only set by engines that expose it. */
   font?: number;
+  poll?: PollDetails;
   media?: {
     mimetype: string;
     filename?: string;
@@ -383,6 +389,13 @@ export interface LocationInput extends Quotable {
   address?: string;
 }
 
+/** Poll choices as received from the engine, without vote counts. */
+export interface PollDetails {
+  name: string;
+  options: string[];
+  allowMultipleAnswers: boolean;
+}
+
 export interface PollInput extends Quotable {
   /** Poll question / title. */
   name: string;
@@ -507,9 +520,12 @@ export interface Product {
   id: string;
   name: string;
   description?: string;
-  price: number;
-  currency: string;
-  priceFormatted: string;
+  /** Absent when the catalog item carries no price. */
+  price?: number;
+  /** Absent when the catalog item carries no currency. */
+  currency?: string;
+  /** Present only when price is. */
+  priceFormatted?: string;
   imageUrl?: string;
   url: string;
   isAvailable: boolean;
@@ -545,6 +561,8 @@ export interface ChatSummary {
   unreadCount: number;
   timestamp: number;
   lastMessage?: string;
+  /** Engine-neutral type of the last message, when available. */
+  lastMessageType?: MessageType;
   /** Archived state, as set via `POST /sessions/{sessionId}/chats/archive`. */
   archived: boolean;
   /** Pinned state, as set via `POST /sessions/{sessionId}/chats/pin`. */
@@ -649,7 +667,7 @@ export interface ReactionEvent {
  *    surfaced), `groups.update` (subject/desc/announce/restrict), `groups.upsert` (this
  *    session added to or joining a group; participantIds is the session's own id) and `group.join-request`
  *    (action 'created' only — the wwebjs event has no revoke/reject counterpart, so only
- *    the shared signal is surfaced; rc13 itself emits the event only for non-admin-add
+ *    the shared signal is surfaced; rc14 itself emits the event only for non-admin-add
  *    requests — the direct self-request stub 144 is unhandled upstream, marked TODO at
  *    Utils/process-message.js:569 — so an invite-link self-request may not fire on Baileys).
  * All ids are in the neutral dialect (`@g.us` / `@c.us`; a lid stays `<id>@lid` when the
@@ -778,20 +796,57 @@ export interface CallOutcomeEvent {
   timestamp: number;
 }
 
+/**
+ * A message's place in its session from the moment it arrives until its row is written (see
+ * `EngineEventCallbacks.admitInbound`). The engine hands it back with the message it emits.
+ */
+export interface InboundTicket {
+  /**
+   * Room for one downloaded payload: true once granted, false when the message asked for none, or
+   * when no room came free in time (the media then goes out with the omitted marker, undownloaded).
+   * Call it right before the download, never earlier: the grant is held until the row is written.
+   */
+  reserve: () => boolean | Promise<boolean>;
+  /** Keep the room until `p` settles too: work on the payload that may outlive the emit. */
+  holdUntil: (p: Promise<unknown>) => void;
+  /** The message will not be emitted: release its turn and its room. A no-op after the emit. */
+  drop: () => void;
+  /**
+   * Whether the session recorded a delete for everyone of this message while holding it, so emitting
+   * it stores the row cleared and announces nothing. False for a revoke the session never saw.
+   */
+  readonly revoked: boolean;
+}
+
 export interface EngineEventCallbacks {
   onQRCode?: (qr: string) => void;
   onReady?: (phone: string, pushName: string) => void;
-  onMessage?: (message: IncomingMessage) => void;
+  /**
+   * Set only where a downloaded payload outlives the emit (PostgreSQL writes asynchronously). The
+   * engine calls it synchronously as each live message arrives, in arrival order, and passes the
+   * ticket to the emit, or drops it when the message is not emitted. `needsRoom` says whether the
+   * message will download media; `status` marks a status post. Undefined when the engine is stale.
+   */
+  admitInbound?: (arrival: {
+    id: string;
+    chatId: string;
+    needsRoom: boolean;
+    status: boolean;
+  }) => InboundTicket | undefined;
+  onMessage?: (message: IncomingMessage, ticket?: InboundTicket) => void;
   /**
    * Fired for messages the account itself created (outgoing) — including sends composed on a
    * linked phone, which the `message`/`onMessage` event never delivers. Used to emit `message.sent`.
    */
-  onMessageCreate?: (message: IncomingMessage) => void;
+  onMessageCreate?: (message: IncomingMessage, ticket?: InboundTicket) => void;
   /**
    * Fired when the delivery status of an outgoing message advances. The adapter maps its native
    * delivery signal to the neutral `DeliveryStatus`, so consumers never see engine-specific codes.
+   * `chatId` is the conversation the acked message belongs to, canonicalized the same way the
+   * inbound mappers canonicalize `IncomingMessage.chatId`; undefined when the engine's update
+   * carries no chat, and the emitted payload then omits the field rather than guess.
    */
-  onMessageAck?: (messageId: string, status: DeliveryStatus) => void;
+  onMessageAck?: (messageId: string, status: DeliveryStatus, chatId?: string) => void;
   onMessageRevoked?: (message: RevokedMessage) => void;
   onMessageReaction?: (event: ReactionEvent) => void;
   onMessageEdited?: (message: EditedMessage) => void;
@@ -810,8 +865,9 @@ export interface EngineEventCallbacks {
   /**
    * Bulk historical messages from an engine's initial sync (e.g. Baileys `messaging-history.set`).
    * They predate the live session, so consumers persist them for the chat view but must not dispatch.
+   * An async consumer may return stored revocations to keep previews cleared across resyncs.
    */
-  onHistoryMessages?: (messages: IncomingMessage[]) => void;
+  onHistoryMessages?: (messages: IncomingMessage[]) => void | Promise<IncomingMessage[] | void>;
   onDisconnected?: (reason: string) => void;
   /**
    * Fired each time the engine schedules an INTERNAL reconnect attempt: a drop it retries on its own
@@ -819,10 +875,13 @@ export interface EngineEventCallbacks {
    * the credentials are still good. Purely informational, so a consumer must not tear anything down on
    * it; the engine keeps owning the retry.
    *
-   * `attempt` is the 1-based number of the attempt being scheduled, and it resets once the connection
-   * is back, a QR is scanned or a QR window runs out (or after a long enough healthy stretch), so
-   * attempt 1 always opens a fresh episode. The close that ends an unscanned QR window is not a reconnect
-   * and is never reported; any other close while a QR waits is.
+   * `attempt` is the 1-based number of the attempt being scheduled. An engine may carry it across a
+   * short-lived connection, so a link that drops right after opening keeps climbing the backoff; it
+   * resets on a scan, when a QR window runs out, or once no drop has occurred for the engine's
+   * stability window. An episode can therefore start at attempt > 1 after a brief READY, so a
+   * consumer should treat the first attempt after a READY, not only attempt 1, as a new episode.
+   * The close that ends an unscanned QR window is not a reconnect and is never reported; any other
+   * close while a QR waits is.
    * `nextDelayMs` is how long the engine waits before making it. Together they are what a consumer
    * needs to tell a one-second blip from a session that has been down for an hour, which the status
    * alone cannot: the engine reports INITIALIZING for the whole episode, exactly as it does for a
@@ -1087,13 +1146,14 @@ export interface MessageOperationsCapability {
  */
 export interface ChatHistoryCapability {
   /**
-   * Read a chat's recent messages, newest first. When `includeMedia` downloads blobs, an optional
-   * `mediaMaxBytes` tightens the declared-size pre-gate below the global MEDIA_DOWNLOAD_MAX_BYTES —
+   * Read a chat's most recent `limit` messages, returned oldest first (ascending timestamp). When
+   * `includeMedia` downloads blobs, an optional `mediaMaxBytes` tightens the declared-size pre-gate
+   * below the global MEDIA_DOWNLOAD_MAX_BYTES —
    * the status seed uses it to skip downloads the store would discard as over-cap anyway.
-   * Inlined media is additionally bounded in aggregate (CHAT_HISTORY_MEDIA_BUDGET_BYTES): once the
-   * running base64 total crosses the budget, later media messages carry the `omitted` marker instead
-   * of a download. An optional `signal` (e.g. client disconnect) stops the read loop early; the
-   * messages collected so far are returned.
+   * Inlined media is additionally bounded in aggregate (CHAT_HISTORY_MEDIA_BUDGET_BYTES), spent in
+   * that same order: once the running base64 total crosses the budget, the newer media messages
+   * carry the `omitted` marker instead of a download. An optional `signal` (e.g. client disconnect)
+   * stops the read loop early; the messages collected so far are returned.
    */
   getChatHistory(
     chatId: string,
@@ -1126,9 +1186,11 @@ export interface ContactCapability {
   getNumberId(number: string): Promise<string | null>;
 
   /**
-   * Best-effort resolution of a contact id to a phone number (MSISDN digits), or `null` when the
-   * engine cannot map it (e.g. a privacy `@lid` the account has never seen). The contact id is the
-   * engine's native scheme; the adapter decides how to resolve it.
+   * Best-effort resolution of a contact id to a phone number (MSISDN digits). `null` is a definitive
+   * "no phone for this id"; a lookup that could not decide (a failed page read, or a lid no cache,
+   * table or key store maps) rejects instead, so a caller that stores the answer never overwrites a
+   * known mapping with a null. The contact id is the engine's native scheme; the adapter decides how
+   * to resolve it.
    */
   resolveContactPhone(contactId: string): Promise<string | null>;
 
@@ -1488,9 +1550,17 @@ export interface PresenceCapability {
    * A linked device that announces itself online routes notifications away from the phone, so a
    * headless bot that never goes offline suppresses the phone's own alerts — which is why this is
    * NOT best-effort, unlike sendChatState: the caller asked for a specific visibility, and a
-   * swallowed failure would leave the account silently online. The setting belongs to the
-   * connection and resets on reconnect (Baileys re-announces per its `markOnlineOnConnect`
-   * socket option), so callers re-issue it after a reconnect.
+   * swallowed failure would leave the account silently online. Chat-state updates are a separate
+   * wire operation (`<chatstate>` / `sendStateTyping`) and do not publish this.
+   *
+   * The call itself is one-shot. The gateway remembers a successful one for the life of the running
+   * engine and re-applies it once each time that connection opens: Baileys announces itself on
+   * connect per `markOnlineOnConnect` (`available` by default), which would otherwise replace the
+   * caller's choice on a transient reconnect. Replacing the engine drops the preference: stop,
+   * restart, reconnect recovery, a watchdog recycle, or a takeover by another node.
+   *
+   * On Baileys this throws when the account push name is not set yet. `sendPresenceUpdate`
+   * resolves without sending in that case (`no name present, ignoring presence update request`).
    */
   setOnlinePresence(available: boolean): Promise<void>;
 

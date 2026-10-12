@@ -4,6 +4,8 @@ import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { MessageSquare, Send, Webhook, Activity, Loader2 } from 'lucide-react';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
+import { useRole } from '../hooks/useRole';
+import { useToast } from '../hooks/useToast';
 import {
   useSessionsQuery,
   useSessionStatsQuery,
@@ -12,38 +14,54 @@ import {
   useStatsOverviewQuery,
 } from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
+import { isSessionStarted } from '../utils/sessionActions';
 import './Dashboard.css';
 
-// recharts is heavy (~150kB gzip); load the analytics section on demand so it never bloats the
-// main/login bundle and only ships when the dashboard actually renders.
+// recharts is heavy (~116 kB gzip); load the analytics section on demand so it never bloats the
+// main/login bundle, and only for an unscoped admin key: /stats/messages refuses every other key.
 const DashboardCharts = lazy(() => import('../components/DashboardCharts').then(m => ({ default: m.DashboardCharts })));
 
 export function Dashboard() {
   const { t } = useTranslation();
   useDocumentTitle(t('dashboard.title'));
   const navigate = useNavigate();
-  const { data: sessions = [], isLoading: loadingSessions, error: sessionsError } = useSessionsQuery();
+  const { canWrite, isAdmin, scoped } = useRole();
+  // The cross-session statistics also refuse a session-scoped key, whatever its role.
+  const canReadStats = isAdmin && !scoped;
+  const toast = useToast();
+  const {
+    data: sessions = [],
+    isLoading: loadingSessions,
+    error: sessionsError,
+    isLoadingError: sessionsNeverLoaded,
+  } = useSessionsQuery();
   const { data: stats } = useSessionStatsQuery();
-  const { data: webhooks, isError: webhooksFailed } = useWebhooksQuery();
-  // /stats/overview is ADMIN-only; for a non-admin key it 403s → overview stays undefined and the
-  // message cards fall back to '—' without breaking the (un-gated) session cards.
-  const { data: overview } = useStatsOverviewQuery();
+  // GET /webhooks is OPERATOR-only and /stats/overview ADMIN-only. A key without the role is not sent
+  // them, since the gateway audits every refusal as a failed authentication; their cards show the
+  // unavailable placeholder.
+  const { data: webhooks } = useWebhooksQuery(canWrite);
+  const { data: overview } = useStatsOverviewQuery(canReadStats);
   const stopMutation = useStopSessionMutation();
   const unavailable = '—';
   const messagesToday = overview ? overview.messages.today.sent + overview.messages.today.received : unavailable;
   const totalMessages = overview ? overview.messages.sent + overview.messages.received : unavailable;
   const loading = loadingSessions;
-  const error =
-    sessionsError instanceof Error ? sessionsError.message : sessionsError ? t('dashboard.loadError') : null;
-  // GET /webhooks is OPERATOR-only, so a viewer key always fails it: a failed read is not zero webhooks.
+  // Only a read that never succeeded replaces the page: a failed background refetch keeps its cached
+  // data (as the webhook card below does), so the last good view stays on screen.
+  const error = sessionsNeverLoaded
+    ? sessionsError instanceof Error
+      ? sessionsError.message
+      : t('dashboard.loadError')
+    : null;
+  // A viewer is not sent the webhook read, and a pending or failed read is not zero webhooks either.
   // A failed background refetch keeps the cached list, which still counts.
-  const webhookCount = webhooksFailed && !webhooks ? unavailable : (webhooks ?? []).length;
+  const webhookCount = !canWrite || !webhooks ? unavailable : webhooks.length;
 
   const handleDisconnect = async (id: string) => {
     try {
       await stopMutation.mutateAsync(id);
     } catch (err) {
-      console.error('Failed to disconnect:', err);
+      toast.error(t('dashboard.disconnectFailed'), err instanceof Error ? err.message : undefined);
     }
   };
 
@@ -122,9 +140,11 @@ export function Dashboard() {
         ))}
       </div>
 
-      <Suspense fallback={null}>
-        <DashboardCharts />
-      </Suspense>
+      {canReadStats && (
+        <Suspense fallback={null}>
+          <DashboardCharts />
+        </Suspense>
+      )}
 
       <section className="sessions-section">
         <div className="section-header">
@@ -162,7 +182,8 @@ export function Dashboard() {
                   <button className="btn-sm" onClick={() => navigate('/sessions')}>
                     {t('dashboard.view')}
                   </button>
-                  {['ready', 'initializing', 'qr_ready'].includes(session.status) && (
+                  {/* Stopping a session is an operator write; a read-only key would only collect a 403. */}
+                  {canWrite && isSessionStarted(session) && (
                     <button className="btn-sm danger" onClick={() => handleDisconnect(session.id)}>
                       {t('dashboard.disconnect')}
                     </button>

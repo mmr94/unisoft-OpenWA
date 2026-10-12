@@ -37,11 +37,18 @@ const SESSION_SCOPE_KEYS = [
   'apiKeys.sessions.all',
   'apiKeys.sessions.empty',
   'apiKeys.sessions.restricted',
-  'apiKeys.sessions.editTitle',
   'apiKeys.sessions.save',
   'apiKeys.sessions.choose',
   'apiKeys.sessions.leaveAll',
-  'apiKeys.actions.editSessions',
+  'apiKeys.actions.edit',
+  'apiKeys.edit.title',
+  'apiKeys.edit.signedIn',
+  'apiKeys.columns.restrictions',
+  'apiKeys.restrictions.ips',
+  'apiKeys.restrictions.chats',
+  'apiKeys.ips.label',
+  'apiKeys.chats.label',
+  'apiKeys.expiry.label',
 ];
 
 const NEW_PLUGIN_KEYS = [
@@ -78,9 +85,27 @@ test('chats.channels.subscribers: count=1 renders singular, count>1 renders plur
   assert.equal(i18n.t('chats.channels.subscribers', { count: 4 }), '4 subscribers');
 });
 
+test('common.minAgo and common.hoursAgo agree with the count', () => {
+  assert.equal(i18n.t('common.hoursAgo', { count: 1 }), '1 hour ago');
+  assert.equal(i18n.t('common.hoursAgo', { count: 2 }), '2 hours ago');
+  assert.equal(i18n.t('common.hoursAgo', { lng: 'fr', count: 1 }), 'Il y a 1 heure');
+  assert.equal(i18n.t('common.hoursAgo', { lng: 'fr', count: 3 }), 'Il y a 3 heures');
+  assert.equal(i18n.t('common.hoursAgo', { lng: 'he', count: 2 }), 'לפני שעתיים');
+  // 'पहले' governs the oblique case, so Hindi keeps 'घंटे' for one hour too.
+  assert.equal(i18n.t('common.hoursAgo', { lng: 'hi', count: 1 }), '1 घंटे पहले');
+  assert.equal(i18n.t('common.minAgo', { lng: 'te', count: 5 }), '5 నిమిషాల క్రితం');
+  assert.equal(i18n.t('common.minAgo', { lng: 'ar', count: 3 }), 'منذ 3 دقائق');
+});
+
 test('count badges resolve to a non-key, interpolated string in every locale', () => {
   for (const lng of LOCALE_IDS) {
-    for (const key of ['webhooks.filters.badge', 'chats.unreadBadge', 'chats.channels.subscribers']) {
+    for (const key of [
+      'webhooks.filters.badge',
+      'chats.unreadBadge',
+      'chats.channels.subscribers',
+      'common.minAgo',
+      'common.hoursAgo',
+    ]) {
       for (const count of [1, 2]) {
         const value = i18n.t(key, { lng, count });
         assert.ok(value && !value.startsWith(key), `${lng} ${key} count=${count} did not resolve (got "${value}")`);
@@ -98,6 +123,11 @@ test('Hebrew dual + Arabic plural categories resolve for the filter badge', () =
   assert.equal(i18n.t('webhooks.filters.badge', { lng: 'he', count: 2 }), 'שני מסננים');
   assert.equal(i18n.t('webhooks.filters.badge', { lng: 'he', count: 5 }), '5 מסננים');
   assert.equal(i18n.t('webhooks.filters.badge', { lng: 'ar', count: 3 }), '3 عوامل تصفية');
+});
+
+test('Arabic takes the singular noun from 100 up and the plural from 3 to 10', () => {
+  assert.equal(i18n.t('chats.status.itemCount', { lng: 'ar', count: 100 }), '100 تحديث');
+  assert.equal(i18n.t('chats.status.itemCount', { lng: 'ar', count: 3 }), '3 تحديثات');
 });
 
 test('every session-scope API key string resolves in every locale', () => {
@@ -130,6 +160,31 @@ test('new plugins.* keys carry the expected English copy', () => {
   assert.equal(i18n.t('plugins.installModal.tabUpload'), 'Upload .zip');
   assert.equal(i18n.t('plugins.catalog.installed'), 'Installed');
   assert.equal(i18n.t('plugins.toasts.updateFailed'), 'Update failed');
+});
+
+// Mirrors the `status` and `type` unions on `Plugin` in services/api.ts. The plugin card renders
+// both through these keys; a missing one falls back to the raw English value.
+const PLUGIN_STATUSES = ['installed', 'enabled', 'disabled', 'error'];
+const PLUGIN_TYPES = ['engine', 'storage', 'queue', 'auth', 'extension'];
+
+test('every plugin status and type label resolves in every locale', () => {
+  for (const lng of LOCALE_IDS) {
+    for (const [group, values] of [
+      ['statuses', PLUGIN_STATUSES],
+      ['types', PLUGIN_TYPES],
+    ] as const) {
+      for (const value of values) {
+        const key = `plugins.${group}.${value}`;
+        const label = i18n.t(key, { lng });
+        assert.ok(
+          label && label !== key && label !== value,
+          `${lng}: ${key} missing, card would render raw "${value}"`,
+        );
+      }
+    }
+  }
+  assert.equal(i18n.t('plugins.statuses.installed'), 'Installed');
+  assert.equal(i18n.t('plugins.types.extension'), 'Extension');
 });
 
 test('sessionStatus.failed and sessionStatus.authenticating resolve in every locale', () => {
@@ -200,6 +255,18 @@ test('English unlink success/incomplete copy does not claim handset Linked-Devic
   // which is accurate — only the SUCCESS copy must not assert it as observed.
   const incomplete = i18n.t('sessions.unlink.incomplete', { lng: 'en' });
   assert.ok(/incomplete/i.test(incomplete), `incomplete copy lost the "incomplete" framing: "${incomplete}"`);
+});
+
+// The data export drops webhook secrets and headers and strips proxy userinfo, but carries
+// integration instance secrets as-is (src/modules/infra/export-tables.ts). The hint must say which.
+test('English backup hint says which credentials the export leaves out and which it carries', () => {
+  const hint = i18n.t('infrastructure.migration.backupHint', { lng: 'en' });
+  assert.ok(!/contains webhook secrets/i.test(hint), `hint claims webhook secrets are exported: "${hint}"`);
+  assert.ok(/webhook signing secrets[^.]*not included/i.test(hint), `hint lost the webhook omission: "${hint}"`);
+  assert.ok(
+    /integration instance secrets[^.]*included in plaintext/i.test(hint),
+    `hint lost the plaintext note: "${hint}"`,
+  );
 });
 
 test('English start teardown-pending copy is a retryable warning, not an error', () => {
@@ -287,10 +354,89 @@ test('no locale catalogue is imported statically, anywhere in the dashboard sour
   assert.deepEqual(offenders, [], 'a static locale import is back — those languages are on the critical path again');
 });
 
+// The parity gate compares the other catalogues with en.json and never reads the source, and a
+// component test that builds its expected label with t() passes on the raw key too. So a literal key
+// that no catalogue has would render to the operator as the key itself. Template-literal and variable
+// keys are out of reach of this scan.
+const LITERAL_KEY = /\bt\(\s*['"]([a-zA-Z][\w-]*(?:\.[\w-]+)+)['"]|i18nKey=['"]([\w.-]+)['"]/g;
+
+test('every literal t() and i18nKey key in the dashboard source resolves in every locale', () => {
+  const keys = new Set(
+    readdirSync(SRC_DIR, { recursive: true, withFileTypes: true })
+      .filter(entry => entry.isFile() && /\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name))
+      .flatMap(entry => [...readFileSync(join(entry.parentPath, entry.name), 'utf8').matchAll(LITERAL_KEY)])
+      .map(m => m[1] ?? m[2]),
+  );
+  assert.ok(keys.size > 500, `only ${keys.size} literal keys found, the scan pattern has drifted`);
+  const missing = LOCALE_IDS.flatMap(lng =>
+    [...keys]
+      .filter(key => !i18n.exists(key, { lng }) && !i18n.exists(`${key}_other`, { lng }))
+      .map(key => `${lng}: ${key}`),
+  );
+  assert.deepEqual(missing, [], 'these keys would render as the raw key');
+});
+
 // rtlLanguages is deliberately a SUBSET (only he/ar today), so it is checked for validity, not parity:
 // an id here that is not a shipped locale would set dir="rtl" for a language that cannot be selected.
 test('rtlLanguages only names shipped locales', () => {
   const rtl = localeIdsIn(section('export const rtlLanguages:'));
   assert.ok(rtl.length > 0, 'rtlLanguages parsed as empty — the anchor or the pattern has drifted');
   for (const id of rtl) assert.ok(LOCALE_IDS.includes(id), `rtlLanguages names "${id}", which has no locale file`);
+});
+
+// The parity checker flags a value identical to English only from 20 characters up, so a short label
+// left in English passes it. These pin the ones that sit next to translated text on a translated screen.
+const NON_EN_LOCALES = LOCALE_IDS.filter(id => id !== 'en');
+
+test('the proxy modal Save button is translated in every locale', () => {
+  for (const lng of NON_EN_LOCALES) {
+    assert.notEqual(i18n.t('common.save', { lng }), 'Save', `${lng} common.save is still English`);
+  }
+});
+
+test('the session proxy button uses the same script as the modal title it opens', () => {
+  const latin = /[A-Za-z]/;
+  for (const lng of LOCALE_IDS) {
+    // Latin-script locales, and he, whose title writes "proxy" too, keep the Latin term.
+    if (latin.test(i18n.t('sessions.proxy.title', { lng }))) continue;
+    const label = i18n.t('sessions.actions.proxy', { lng });
+    assert.ok(!latin.test(label), `${lng} sessions.actions.proxy is "${label}", the modal title is translated`);
+  }
+});
+
+test('the webhook filter chat-kind field is translated in every locale', () => {
+  for (const lng of NON_EN_LOCALES) {
+    const label = i18n.t('webhooks.filters.fields.kind', { lng });
+    assert.notEqual(label, 'Chat kind', `${lng} webhooks.filters.fields.kind is still English`);
+  }
+});
+
+test('the Templates nav item reads the same as the page it opens in every locale', () => {
+  for (const lng of LOCALE_IDS) {
+    assert.equal(i18n.t('nav.templates', { lng }), i18n.t('templates.title', { lng }), `${lng} nav.templates`);
+  }
+});
+
+// Both databases apply their pending migrations at startup unless *_SYNCHRONIZE=true opts into
+// TypeORM synchronize, so the Infrastructure card must not name synchronize as the default.
+test('English migrations status describes migrations, not schema synchronize', () => {
+  const status = i18n.t('infrastructure.database.migrationsStatus', { lng: 'en' });
+  assert.doesNotMatch(status, /synchroni[sz]/i, `status names synchronize: "${status}"`);
+  assert.match(status, /migrations/i, `status lost the migrations wording: "${status}"`);
+});
+
+// Session auth state lives on disk or in the database; Redis only backs the cache, the queues, the
+// rate-limit counters and the multi-node WebSocket fan-out.
+test('English Redis copy does not claim Redis stores sessions', () => {
+  for (const key of ['infrastructure.redis.enableDesc', 'infrastructure.redis.disabledDesc']) {
+    const copy = i18n.t(key, { lng: 'en' });
+    assert.doesNotMatch(copy, /session/i, `${key} claims session storage: "${copy}"`);
+  }
+});
+
+// Plugin config, session activation and per-session overrides all apply live; a restart the toast
+// asks for would only drop every WhatsApp session for nothing.
+test('English plugin save toast does not ask for a server restart', () => {
+  const desc = i18n.t('plugins.toasts.savedDesc', { lng: 'en' });
+  assert.doesNotMatch(desc, /restart required/i, `toast asks for a restart: "${desc}"`);
 });

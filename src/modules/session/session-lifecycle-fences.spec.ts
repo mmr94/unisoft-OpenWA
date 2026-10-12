@@ -1,7 +1,7 @@
 import { ConflictException } from '@nestjs/common';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
-import { SessionLifecycleFences } from './session-lifecycle-fences';
+import { ENGINE_TEARDOWN_TIMEOUT_MS, SessionLifecycleFences } from './session-lifecycle-fences';
 
 /**
  * Direct invariant coverage for the credential-teardown / initial-status fences. Until now these
@@ -43,6 +43,23 @@ describe('SessionLifecycleFences', () => {
       );
     });
 
+    it('gives up on N hung engines at one ENGINE_TEARDOWN_TIMEOUT_MS, not N of them (the shutdown budget counts it once)', async () => {
+      jest.useFakeTimers();
+      try {
+        const { fences } = makeFences();
+        const hung = () => engine({ destroy: jest.fn(() => new Promise<void>(() => undefined)) });
+        const all = Promise.all([1, 2, 3, 4].map(n => fences.destroyEngineSafely(`s${n}`, hung())));
+        let settled = false;
+        void all.then(() => (settled = true));
+        await jest.advanceTimersByTimeAsync(ENGINE_TEARDOWN_TIMEOUT_MS - 1);
+        expect(settled).toBe(false);
+        await jest.advanceTimersByTimeAsync(1);
+        await expect(all).resolves.toEqual([false, false, false, false]);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     it('tracks the RAW logout promise under the session NAME before racing the deadline', async () => {
       const { fences, pendingTeardowns } = makeFences();
       let settle!: () => void;
@@ -79,6 +96,32 @@ describe('SessionLifecycleFences', () => {
       expect(pendingTeardowns.has('main')).toBe(false);
     });
 
+    it('keeps the entry while the older teardown is still pending after the newer one settles', async () => {
+      const { fences, pendingTeardowns } = makeFences();
+      let settleFirst!: () => void;
+      const first = new Promise<void>(resolve => (settleFirst = resolve));
+      fences.trackPendingCredentialTeardown('main', first);
+
+      let settleSecond!: () => void;
+      const second = new Promise<void>(resolve => (settleSecond = resolve));
+      fences.trackPendingCredentialTeardown('main', second);
+
+      // The NEWER teardown settling first is the order an overwriting entry gets wrong: it would drop
+      // the name while the older teardown's rm is still pending.
+      settleSecond();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(pendingTeardowns.has('main')).toBe(true);
+
+      settleFirst();
+      await pendingTeardowns.get('main');
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(pendingTeardowns.has('main')).toBe(false);
+    });
+
     it('never rejects the tracked entry even when the raw teardown rejects', async () => {
       const { fences, pendingTeardowns } = makeFences();
       fences.trackPendingCredentialTeardown('main', Promise.reject(new Error('rm failed')));
@@ -107,11 +150,11 @@ describe('SessionLifecycleFences', () => {
         fences.trackPendingCredentialTeardown('main', new Promise<void>(() => undefined));
         const waiting = fences.awaitPendingTeardown('main');
         jest.advanceTimersByTime(10_001);
+        await expect(waiting).rejects.toBeInstanceOf(ConflictException);
         await expect(waiting).rejects.toMatchObject({
           status: 409,
           response: { code: 'SESSION_NAME_TEARDOWN_PENDING' },
         });
-        expect(ConflictException).toBeDefined();
         // Fail closed: the entry survives so a retry after settlement can proceed.
         expect(pendingTeardowns.has('main')).toBe(true);
       } finally {
@@ -152,6 +195,23 @@ describe('SessionLifecycleFences', () => {
       await waiting;
       expect(settled).toBe(true);
     });
+
+    it('proceeds when the write rejects, without leaving its deadline timer armed', async () => {
+      // A rejected write has settled, which is all the fence waits for; start() reports the failure.
+      jest.useFakeTimers();
+      try {
+        const { fences, pendingInitialStatuses } = makeFences();
+        const engineA = engine();
+        const failed = Promise.reject(new Error('db down'));
+        failed.catch(() => undefined);
+        pendingInitialStatuses.set('s1', { engine: engineA, promise: failed });
+
+        await expect(fences.awaitInitialStatus('s1', engineA)).resolves.toBeUndefined();
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
   });
 
   describe('evictAndForceDestroy', () => {
@@ -169,6 +229,23 @@ describe('SessionLifecycleFences', () => {
       await Promise.resolve();
       expect(forceDestroy).toHaveBeenCalledTimes(1);
       expect(destroy).not.toHaveBeenCalled();
+    });
+
+    it('leaves a replacement engine registered and still force-destroys the stale one', async () => {
+      const { fences, engines } = makeFences();
+      const staleKill = jest.fn().mockResolvedValue(undefined);
+      const liveKill = jest.fn().mockResolvedValue(undefined);
+      const stale = engine({ forceDestroy: staleKill });
+      const live = engine({ forceDestroy: liveKill });
+      engines.set('s1', live);
+
+      fences.evictAndForceDestroy('s1', stale);
+
+      expect(engines.get('s1')).toBe(live);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(staleKill).toHaveBeenCalledTimes(1);
+      expect(liveKill).not.toHaveBeenCalled();
     });
   });
 });

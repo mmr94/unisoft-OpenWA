@@ -1,6 +1,6 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { LidMapping } from './lid-mapping.entity';
 import { userPart } from './wa-id';
 import { createLogger } from '../../common/services/logger.service';
@@ -8,8 +8,22 @@ import { resolveNonNegativeIntEnv } from '../../config/configuration';
 
 // Default cap on the in-memory lid->phone mirror. Every other long-lived map in the engine surface is
 // bounded (the per-session lidPhoneCache is 5000); the LID mirror was the lone exception. A miss falls
-// back to engine re-resolution, so the cap trades a re-resolution for bounded memory, never data loss.
+// back to engine re-resolution (a reverse lookup reads the table), so the cap trades a re-resolution for
+// bounded memory, never data loss.
 export const LID_MAPPING_CACHE_DEFAULT = 5000;
+
+/**
+ * SQLite binds at most 32766 variables in one statement (Postgres 65535), so an `IN (...)` over a
+ * large allowlist is chunked. Small enough to stay well inside both, large enough that a realistic
+ * allowlist is one round trip.
+ */
+const LID_QUERY_CHUNK = 500;
+
+function chunk<T>(items: T[], size = LID_QUERY_CHUNK): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
 
 /**
  * Narrow read/write port over the `lid -> phone` table. The Baileys session store depends on this (sync
@@ -31,6 +45,10 @@ export interface LidMappingStore {
   resolveLid(jid: string): string | null;
   /** Sync reverse lookup: the lids currently mapped to this phone (used by the message from-filter). */
   lidsForPhone(phone: string): string[];
+  /** The phone the table holds for a lid JID, read from the database; null when none is stored. */
+  findPhoneForLid?(jid: string): Promise<string | null>;
+  /** The lids the table maps to these phone digits, read from the database. */
+  findLidsForPhone?(phone: string): Promise<string[]>;
   /** Write-through, last-write-wins: update the cache + persist. A `null` phone records a negative result. */
   remember(lid: string, phone: string | null, sessionId?: string): Promise<void>;
 }
@@ -45,8 +63,10 @@ export interface LidMappingStore {
  * contact-heavy account does not accumulate one entry per distinct LID ever seen into a slow memory leak.
  * A cache miss is warmed from the table in the background (rows past the preload cap stay resolvable)
  * and otherwise falls back to engine re-resolution (the table remains the source of truth), so eviction
- * only costs a re-resolution, never data loss. The reverse map is reconciled on each eviction so it does
- * not retain entries for LIDs no longer in the forward cache.
+ * only costs a re-resolution, never data loss. The reverse map has no such warm path (nothing looks a
+ * lid up by phone), so a phone-keyed filter uses {@link findLidsForPhone}, which reads the table. The
+ * reverse map is reconciled on each eviction so it does not retain entries for LIDs no longer in the
+ * forward cache.
  */
 @Injectable()
 export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
@@ -77,8 +97,14 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
    * maps synchronously and writes the table afterwards, so between the two a table read answers "no
    * row" about a mapping that is about to exist. The forward map cannot stand in for this: the LRU
    * can evict the entry inside that same window, leaving it indistinguishable from never-learned.
+   * Counted per lid, so the first of two overlapping writes settling does not clear the second.
    */
-  private readonly unsettledWrites = new Set<string>();
+  private readonly unsettledWrites = new Map<string, number>();
+  /**
+   * Lids a write started for while their table read was in flight. That read may have run before the
+   * write committed, so whatever it answers predates the mapping this process now holds.
+   */
+  private readonly racedLookups = new Set<string>();
   // 0 = unbounded (legacy behaviour). Every other long-lived map in the engine surface is bounded, so
   // the default is finite; the env override exists for operators who explicitly want the old behaviour.
   private readonly maxCachedLids: number;
@@ -102,6 +128,9 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
    * fail the import — resolution falls back to engine re-resolution until the table is readable.
    */
   async reload(): Promise<void> {
+    // Dropped before the read too: a restore may have replaced the table, so if the read fails, a lid
+    // not cached must read through rather than trust a stale absence.
+    this.absentFromTable.clear();
     try {
       // Deterministic preload: an unordered find() followed by LRU eviction keeps an ARBITRARY
       // subset once the table exceeds the cap. Order by last-write and take at most the cap, so
@@ -115,7 +144,9 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
       this.phoneToLids.clear();
       // A reload re-reads the table, so every recorded absence is a fresh question again.
       this.absentFromTable.clear();
-      for (const row of rows) {
+      // Oldest first, so the newest row ends at the most-recent end of the LRU rather than the first
+      // one evicted.
+      for (const row of rows.reverse()) {
         this.index(row.lid, row.phone);
       }
       this.logger.log(
@@ -148,12 +179,105 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
     return set ? [...set] : [];
   }
 
+  /**
+   * Reverse lookup that also reads the table. {@link lidsForPhone} only sees lids resident in the
+   * forward cache, and nothing phone-keyed ever warms it, so a mapping past the preload cap or
+   * evicted by the LRU would stay invisible to a phone filter for good. For callers that can await
+   * (the message and status filters, the handover gate, the API-key chat fence). Same rule as
+   * {@link lidsForPhonesPersisted}; a read error falls back to the cache alone.
+   */
+  async findLidsForPhone(phone: string): Promise<string[]> {
+    try {
+      return (await this.readLidsForPhones([phone]))[phone];
+    } catch (err) {
+      this.logger.warn(`Could not read lids for a phone: ${err instanceof Error ? err.message : String(err)}`);
+      return this.lidsForPhone(phone);
+    }
+  }
+
+  /**
+   * Batched forward lookup for a list filter: lid user-part -> phone digits. Chunked queries for the
+   * whole allowlist instead of one per entry, and the TABLE wins over the mirror so a stale cached
+   * negative cannot shadow a mapping another node persisted.
+   */
+  async phonesForLidsPersisted(lids: string[]): Promise<Record<string, string | null>> {
+    const out: Record<string, string | null> = {};
+    if (lids.length === 0) return out;
+    for (const lid of lids) out[lid] = this.getCached(lid) ?? null;
+    try {
+      for (const batch of chunk(lids)) {
+        const rows = await this.repo.find({ where: { lid: In(batch) } });
+        // The table WINS: a stale cached negative must not shadow a mapping another node persisted.
+        for (const row of rows) out[row.lid] = row.phone;
+      }
+    } catch {
+      // The table may not exist yet (migration pending); the mirror is the best available answer.
+    }
+    return out;
+  }
+
+  /** Batched reverse lookup, companion to {@link phonesForLidsPersisted}: phone digits -> lids. */
+  async lidsForPhonesPersisted(phones: string[]): Promise<Record<string, string[]>> {
+    try {
+      return await this.readLidsForPhones(phones);
+    } catch {
+      // The table may not exist yet (migration pending); the cache is the best available answer.
+      return Object.fromEntries(phones.map(phone => [phone, this.lidsForPhone(phone)]));
+    }
+  }
+
+  /**
+   * A lid answers a phone only when the cache and the table do not disagree: a cached reverse entry
+   * whose row another node has since re-mapped to a different phone is dropped, and a row this
+   * process has since re-mapped elsewhere is skipped. Either side alone may vouch for it (the row
+   * can be past the cache cap, the cached write can still be in flight). Throws on a read error.
+   */
+  private async readLidsForPhones(phones: string[]): Promise<Record<string, string[]>> {
+    const out: Record<string, Set<string>> = {};
+    for (const phone of phones) out[phone] = new Set(this.lidsForPhone(phone));
+    const cachedLids = [...new Set(phones.flatMap(phone => [...out[phone]]))];
+    for (const batch of chunk(cachedLids)) {
+      for (const row of await this.repo.find({ where: { lid: In(batch) } })) {
+        for (const phone of phones) if (row.phone !== phone) out[phone].delete(row.lid);
+      }
+    }
+    for (const batch of chunk(phones)) {
+      for (const { lid, phone } of await this.repo.find({ where: { phone: In(batch) } })) {
+        if (!phone || !out[phone]) continue;
+        const cached = this.lidToPhone.get(lid);
+        if (cached === undefined || cached === phone) out[phone].add(lid);
+      }
+    }
+    return Object.fromEntries(phones.map(phone => [phone, [...out[phone]]]));
+  }
+
+  /**
+   * Forward lookup for callers that can await: the API-key chat fence and every chat-bound read
+   * behind it (message history and media, the quoted body, status and handover filters). The table
+   * answers first, the in-memory mirror only when the read fails or has no row. The mirror alone is
+   * not enough: it is LRU-evicted at `LID_MAPPING_CACHE_MAX`, and nothing refreshes it when another
+   * node re-maps a lid in the shared table, so a cache-first answer could resolve the same lid to
+   * a phone the fence no longer sees, and a read behind the fence would serve that other chat. The
+   * row is not indexed into the cache, so a lookup cannot evict hot entries.
+   */
+  async findPhoneForLid(jid: string): Promise<string | null> {
+    const lid = userPart(jid);
+    try {
+      const row = await this.repo.findOne({ where: { lid } });
+      if (row) return row.phone;
+    } catch (err) {
+      this.logger.warn(`Could not read the phone for a lid: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return this.getCached(lid) ?? null;
+  }
+
   async remember(lid: string, phone: string | null, sessionId?: string): Promise<void> {
     if (!lid || this.lidToPhone.get(lid) === phone) {
       return; // unseen-or-changed only; a no-op write would just churn updatedAt
     }
     this.index(lid, phone);
-    this.unsettledWrites.add(lid);
+    this.unsettledWrites.set(lid, (this.unsettledWrites.get(lid) ?? 0) + 1);
+    if (this.pendingLookups.has(lid)) this.racedLookups.add(lid);
     try {
       await this.repo.upsert({ lid, phone, sessionId: sessionId ?? null, updatedAt: new Date() }, ['lid']);
     } catch (err) {
@@ -161,7 +285,9 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
         `Failed to persist lid->phone mapping for ${lid}: ${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
-      this.unsettledWrites.delete(lid);
+      const left = (this.unsettledWrites.get(lid) ?? 1) - 1;
+      if (left > 0) this.unsettledWrites.set(lid, left);
+      else this.unsettledWrites.delete(lid);
     }
   }
 
@@ -184,25 +310,30 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
     void this.repo
       .findOne({ where: { lid } })
       .then(row => {
-        // Last-write-wins: a remember() that landed while the lookup was in flight is newer.
+        // A write that was unsettled when the query ran, or started while it was in flight, is newer
+        // than either answer: a row would be the phone it replaces, served as a hit after the write
+        // commits, and an absence would block the warm-back once the LRU evicts the forward entry.
+        // Neither is recorded, so the next miss reads the table again.
+        if (writeInFlight || this.racedLookups.has(lid)) return;
+        // Last-write-wins: a mapping indexed while the lookup was in flight is newer.
         if (row && !this.lidToPhone.has(row.lid)) {
           this.index(row.lid, row.phone);
           return;
         }
-        // Same rule for the negative: an absence recorded over a mapping this process already holds,
-        // or is still writing, would block the warm-back once the LRU evicts the forward entry, and
-        // the row would then be unreachable until something taught the same lid again.
-        if (!row && !this.lidToPhone.has(lid) && !writeInFlight) this.noteAbsent(lid);
+        if (!row && !this.lidToPhone.has(lid)) this.noteAbsent(lid);
       })
       .catch(() => undefined)
-      .finally(() => this.pendingLookups.delete(lid));
+      .finally(() => {
+        this.pendingLookups.delete(lid);
+        this.racedLookups.delete(lid);
+      });
   }
 
   /** Update both in-memory indexes, dropping any stale reverse entry from a previous phone. */
   private index(lid: string, phone: string | null): void {
     const prev = this.lidToPhone.get(lid);
     if (prev && prev !== phone) {
-      this.phoneToLids.get(prev)?.delete(lid);
+      this.unindex(lid, prev);
     }
     // Re-insert (delete + set) so the entry moves to the most-recent end of the LRU order even on update.
     this.lidToPhone.delete(lid);
@@ -241,7 +372,13 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
       if (oldest === undefined) break;
       const phone = this.lidToPhone.get(oldest);
       this.lidToPhone.delete(oldest);
-      if (phone) this.phoneToLids.get(phone)?.delete(oldest);
+      if (phone) this.unindex(oldest, phone);
     }
+  }
+
+  /** Drop a lid from its phone's reverse entry, and the entry itself once no lid is left under it. */
+  private unindex(lid: string, phone: string): void {
+    const set = this.phoneToLids.get(phone);
+    if (set?.delete(lid) && set.size === 0) this.phoneToLids.delete(phone);
   }
 }

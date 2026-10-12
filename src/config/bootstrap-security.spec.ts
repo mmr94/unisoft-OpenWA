@@ -7,6 +7,7 @@ import {
   resolveBodyLimit,
   assertNoDefaultSecretsInProduction,
   isApiKeyPepperMissingInProduction,
+  isMainDbSynchronizeInProduction,
   isNodeEnvUnset,
 } from './bootstrap-security';
 
@@ -192,7 +193,7 @@ describe('assertNoDefaultSecretsInProduction', () => {
     ).toThrow(/DATABASE_PASSWORD/);
   });
 
-  it('allows the built-in Postgres/MinIO default credentials in prod (internal-only network) (#488 review)', () => {
+  it('allows the built-in Postgres/MinIO default credentials in prod (internal-only network) (#488)', () => {
     // The bundled containers are reachable only on the internal Docker network (not published), so the
     // known 'openwa'/'minioadmin' creds the built-in flow provisions must not crash-loop a prod boot.
     expect(() =>
@@ -219,7 +220,7 @@ describe('assertNoDefaultSecretsInProduction', () => {
         s3SecretKey: 'minioadmin',
         minioBuiltIn: 'true',
       }),
-    ).toThrow(/S3_ACCESS_KEY, S3_SECRET_KEY/);
+    ).toThrow(/S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY/);
   });
 
   it('still refuses an EXTERNAL Postgres with a default password even when MinIO is built-in', () => {
@@ -254,7 +255,7 @@ describe('assertNoDefaultSecretsInProduction', () => {
         minioBuiltIn: 'true',
         s3Endpoint: 'https://s3.amazonaws.com',
       }),
-    ).toThrow(/S3_ACCESS_KEY/);
+    ).toThrow(/S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY/);
   });
 
   it('exempts the built-in defaults when the host is the internal bundled service', () => {
@@ -282,7 +283,7 @@ describe('assertNoDefaultSecretsInProduction', () => {
         s3AccessKey: 'minioadmin',
         s3SecretKey: 'minioadmin',
       }),
-    ).toThrow(/S3_ACCESS_KEY, S3_SECRET_KEY/);
+    ).toThrow(/S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY/);
   });
 
   it('refuses prod with a placeholder API_MASTER_KEY', () => {
@@ -416,6 +417,17 @@ describe('assertNoDefaultSecretsInProduction', () => {
         apiMasterKey: 'root-pw-8821x-and-the-rest-of-entropy',
       }),
     ).not.toThrow();
+  });
+});
+
+describe('isMainDbSynchronizeInProduction', () => {
+  it('is true only for an explicit MAIN_DATABASE_SYNCHRONIZE=true in production', () => {
+    expect(isMainDbSynchronizeInProduction('production', 'true')).toBe(true);
+    expect(isMainDbSynchronizeInProduction('production', 'false')).toBe(false);
+    expect(isMainDbSynchronizeInProduction('production', undefined)).toBe(false);
+    expect(isMainDbSynchronizeInProduction('production', '')).toBe(false);
+    expect(isMainDbSynchronizeInProduction('test', 'true')).toBe(false);
+    expect(isMainDbSynchronizeInProduction(undefined, 'true')).toBe(false);
   });
 });
 

@@ -3,7 +3,7 @@ import { SessionRestrictionStore } from './session-restriction-store.service';
 import { PresenceStore } from './presence-store.service';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken, getDataSourceToken } from '@nestjs/typeorm';
-import { Repository, DataSource, In, QueryFailedError } from 'typeorm';
+import { Repository, DataSource, In, IsNull, LessThanOrEqual, Not, QueryFailedError } from 'typeorm';
 import {
   NotFoundException,
   ConflictException,
@@ -16,9 +16,11 @@ import {
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { ConfigService } from '@nestjs/config';
-import { SessionService, AUTOSTART_THROTTLE_MS } from './session.service';
+import { SessionService, AUTOSTART_SHUTDOWN_WAIT_MS, AUTOSTART_THROTTLE_MS } from './session.service';
 import { SessionOwnershipService } from './session-ownership.service';
-import { decideReconnect } from './reconnect-policy';
+import { ShutdownService } from '../../common/services/shutdown.service';
+import { ServerShuttingDownException, SessionStoppedException } from './session-engine-controls';
+import { decideReconnect, STABLE_READY_MS } from './reconnect-policy';
 import { ACK_RECONCILE_DELAY_MS } from './message-projector.service';
 import { SessionEngineLifecycle, type ReconnectState } from './session-engine-lifecycle.service';
 import {
@@ -30,11 +32,20 @@ import {
   isKnownTerminalEngineFailure,
 } from '../../engine/terminal-engine-failure';
 import { Session, SessionStatus } from './entities/session.entity';
+import { SessionResponseDto } from './dto';
 import { Message, MessageDirection, MessageStatus } from '../message/entities/message.entity';
 import { MessageBatch } from '../message/entities/message-batch.entity';
 import { Webhook } from '../webhook/entities/webhook.entity';
 import { Template } from '../template/entities/template.entity';
 import { BaileysStoredMessage } from '../../engine/adapters/baileys-stored-message.entity';
+import { ChatState } from '../../engine/adapters/baileys-chat-state.entity';
+import { StatusUpdate } from '../status-store/entities/status-update.entity';
+import { WebhookOutboxEvent } from '../webhook/entities/webhook-outbox-event.entity';
+import { WebhookDeliveryFailure } from '../webhook/entities/webhook-delivery-failure.entity';
+import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
+import { ConversationMapping } from '../integration/entities/conversation-mapping.entity';
+import { IngressEvent } from '../integration/entities/ingress-event.entity';
+import { LidMapping } from '../../engine/identity/lid-mapping.entity';
 import { EngineFactory } from '../../engine/engine.factory';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import type { KeyedMutationQueue } from '../../common/utils/keyed-mutation-queue';
@@ -84,6 +95,7 @@ function createMockSession(overrides: Partial<Session> = {}): Session {
     nodeId: null,
     claimedAt: null,
     leaseExpiresAt: null,
+    desiredState: null,
     nodeUrl: null,
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -98,6 +110,7 @@ describe('SessionService', () => {
   let lifecycle: SessionEngineLifecycle;
   /** The real registry the service writes to, read directly for the live-engine proxy snapshot. */
   let registry: EngineRegistry;
+  let shutdown: ShutdownService;
   let repository: jest.Mocked<Partial<Repository<Session>>>;
   let messageRepository: jest.Mocked<Partial<Repository<Message>>>;
   let dataSource: jest.Mocked<Partial<DataSource>>;
@@ -121,6 +134,7 @@ describe('SessionService', () => {
       save: jest.fn(),
       remove: jest.fn(),
       update: jest.fn(),
+      exists: jest.fn().mockResolvedValue(false),
     };
 
     messageRepository = {
@@ -146,7 +160,11 @@ describe('SessionService', () => {
       transaction: jest.fn().mockImplementation(async (cb: (manager: unknown) => Promise<unknown>) => {
         const manager = {
           save: jest.fn().mockImplementation((entity: unknown) => Promise.resolve(entity)),
-          remove: jest.fn().mockResolvedValue(undefined),
+          // As TypeORM does: a removed entity comes back with its primary key cleared.
+          remove: jest.fn().mockImplementation((entity: { id?: string }) => {
+            entity.id = undefined;
+            return Promise.resolve(entity);
+          }),
           delete: jest.fn().mockResolvedValue({ affected: 0 }),
         };
         return cb(manager);
@@ -165,6 +183,7 @@ describe('SessionService', () => {
       sendSeen: jest.fn().mockResolvedValue(true),
       markUnread: jest.fn().mockResolvedValue(true),
       deleteChat: jest.fn().mockResolvedValue(true),
+      clearChatMessages: jest.fn().mockResolvedValue(true),
       sendChatState: jest.fn().mockResolvedValue(undefined),
       setOnlinePresence: jest.fn().mockResolvedValue(undefined),
       resolveContactPhone: jest.fn().mockResolvedValue('628111222333'),
@@ -210,7 +229,8 @@ describe('SessionService', () => {
     auditService = { logWarn: jest.fn().mockResolvedValue(null), logInfo: jest.fn().mockResolvedValue(null) };
 
     hookManager = {
-      execute: jest.fn().mockResolvedValue({ continue: true, data: {} }),
+      // With no handlers registered the real HookManager hands the payload back unchanged.
+      execute: jest.fn().mockImplementation((_e: string, data: unknown) => Promise.resolve({ continue: true, data })),
     };
 
     configService = {
@@ -221,6 +241,8 @@ describe('SessionService', () => {
       remember: jest.fn().mockResolvedValue(undefined),
       getCached: jest.fn().mockReturnValue(undefined),
       lidsForPhone: jest.fn().mockReturnValue([]),
+      findPhoneForLid: jest.fn().mockResolvedValue(null),
+      findLidsForPhone: jest.fn().mockResolvedValue([]),
     };
 
     statusStore = {
@@ -262,12 +284,14 @@ describe('SessionService', () => {
         { provide: ConfigService, useValue: configService },
         { provide: LidMappingStoreService, useValue: lidMappingStore },
         { provide: StatusStoreService, useValue: statusStore },
+        ShutdownService,
       ],
     }).compile();
 
     service = module.get<SessionService>(SessionService);
     lifecycle = module.get<SessionEngineLifecycle>(SessionEngineLifecycle);
     registry = module.get<EngineRegistry>(EngineRegistry);
+    shutdown = module.get(ShutdownService);
   });
 
   // ── shutdown ──────────────────────────────────────────────────────
@@ -346,6 +370,45 @@ describe('SessionService', () => {
       await service.delete('sess-uuid-1');
 
       expect(engineFactory.purgeSessionData).toHaveBeenCalledWith('sess-uuid-1', 'test-session');
+    });
+
+    // Name-keyed directories predate 0.23.5, and a session may well be named after a tenant UUID: its
+    // shape says nothing about whose login the directory holds. Only a live session id does.
+    it('delete() purges the legacy dirs of a UUID-shaped name that is no session id', async () => {
+      const uuidName = '0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b';
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ id: 'sess-uuid-1', name: uuidName }));
+
+      await service.delete('sess-uuid-1');
+
+      expect(repository.exists).toHaveBeenCalledWith({ where: { id: uuidName } });
+      expect(engineFactory.purgeSessionData).toHaveBeenCalledWith('sess-uuid-1', uuidName);
+    });
+
+    // The name rule lets a session be named after another session's id, whatever that id looks like
+    // (an import accepts any safe key). The dirs that name points at are then the other session's
+    // live credentials, so the name is kept out of the purge.
+    it("delete() keeps the name out of the purge when it is another session's id", async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(
+        createMockSession({ id: 'sess-uuid-1', name: 'imported-bob' }),
+      );
+      (repository.exists as jest.Mock).mockResolvedValue(true);
+
+      await service.delete('sess-uuid-1');
+
+      expect(repository.exists).toHaveBeenCalledWith({ where: { id: 'imported-bob' } });
+      expect(engineFactory.purgeSessionData).toHaveBeenCalledTimes(1);
+      expect((engineFactory.purgeSessionData as jest.Mock).mock.calls[0]).toEqual(['sess-uuid-1', undefined]);
+    });
+
+    it('delete() still purges the id-keyed dirs, and resolves, when the name lookup fails', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(
+        createMockSession({ id: 'sess-uuid-1', name: 'test-session' }),
+      );
+      (repository.exists as jest.Mock).mockRejectedValue(new Error('db gone'));
+
+      await expect(service.delete('sess-uuid-1')).resolves.toBeUndefined();
+
+      expect((engineFactory.purgeSessionData as jest.Mock).mock.calls[0]).toEqual(['sess-uuid-1', undefined]);
     });
 
     it('stop() escalates to forceDestroy when engine.disconnect() rejects — stop completes with a warning', async () => {
@@ -598,19 +661,28 @@ describe('SessionService', () => {
       expect(result).toBeDefined();
     });
 
-    it('forceKill() completes even when forceDestroy() rejects (best-effort recovery)', async () => {
+    it('forceKill() surfaces a 502 when forceDestroy() fails, after settling local state', async () => {
       (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
       (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
       const engine = { forceDestroy: jest.fn().mockRejectedValue(new Error('still wedged')) };
       enginesOf().set('sess-uuid-1', engine);
 
-      await expect(service.forceKill('sess-uuid-1')).resolves.toBeDefined();
+      const thrown = await service.forceKill('sess-uuid-1').catch((e: unknown) => e);
+
+      // Not reported as a clean kill (the controller audits only a resolved one): the process may live.
+      expect(thrown).toBeInstanceOf(BadGatewayException);
+      expect(((thrown as BadGatewayException).getResponse() as { code?: string }).code).toBe(
+        'SESSION_FORCE_KILL_INCOMPLETE',
+      );
       expect(enginesOf().has('sess-uuid-1')).toBe(false); // map reconciled despite the failure
+      expect(repository.update).toHaveBeenCalledWith('sess-uuid-1', { status: SessionStatus.DISCONNECTED });
     });
 
-    it('forceKill() throws NotFoundException for an unknown session', async () => {
+    it('forceKill() throws NotFoundException for an unknown session and keeps no stop request', async () => {
       (repository.findOne as jest.Mock).mockResolvedValue(null);
       await expect(service.forceKill('nope')).rejects.toThrow(NotFoundException);
+      // An id that only ever answers 404 must not leave an entry behind.
+      expect((service as unknown as { stopRequests: Map<string, number> }).stopRequests.has('nope')).toBe(false);
     });
 
     it('forceKill() rejects with BadRequestException when the session has no live engine', async () => {
@@ -668,7 +740,10 @@ describe('SessionService', () => {
       // teardown that threw/timed out must land in `failed` (its Chromium/socket may still be alive),
       // not be misreported as cleanly stopped — the infra import turns `failed` into restartRequired.
       const good = { destroy: jest.fn().mockResolvedValue(undefined) };
-      const bad = { destroy: jest.fn().mockRejectedValue(new Error('stuck chromium')) };
+      const bad = {
+        destroy: jest.fn().mockRejectedValue(new Error('stuck chromium')),
+        forceDestroy: jest.fn().mockRejectedValue(new Error('kill failed')),
+      };
       enginesOf().set('good', good);
       enginesOf().set('bad', bad);
 
@@ -676,12 +751,84 @@ describe('SessionService', () => {
 
       expect(good.destroy).toHaveBeenCalledTimes(1);
       expect(bad.destroy).toHaveBeenCalledTimes(1);
+      expect(bad.forceDestroy).toHaveBeenCalledTimes(1); // escalated before being reported failed
       // Map reconciled for both regardless of teardown outcome — neither holds a concurrency slot.
       expect(enginesOf().has('good')).toBe(false);
       expect(enginesOf().has('bad')).toBe(false);
       expect(result.stopped).toEqual(['good']);
       expect(result.failed).toEqual(['bad']);
       expect(result.notRunning).toEqual([]);
+    });
+
+    it('escalates a failing destroy() to forceDestroy() and reports the orphan stopped when the kill succeeds', async () => {
+      const g1 = {
+        destroy: jest.fn().mockRejectedValue(new Error('stuck chromium')),
+        forceDestroy: jest.fn().mockResolvedValue(undefined),
+      };
+      enginesOf().set('g1', g1);
+
+      const result = await service.stopOrphanEngines(['g1']);
+
+      expect(g1.forceDestroy).toHaveBeenCalledTimes(1);
+      expect(g1.destroy.mock.invocationCallOrder[0]).toBeLessThan(g1.forceDestroy.mock.invocationCallOrder[0]);
+      expect(result.stopped).toEqual(['g1']);
+      expect(result.failed).toEqual([]);
+      expect(enginesOf().has('g1')).toBe(false);
+    });
+
+    it('escalates a hung destroy() after its deadline and reports failed only when the kill hangs too', async () => {
+      jest.useFakeTimers();
+      try {
+        const g1 = {
+          destroy: jest.fn(() => new Promise<void>(() => undefined)),
+          forceDestroy: jest.fn(() => new Promise<void>(() => undefined)),
+        };
+        enginesOf().set('g1', g1);
+
+        const pending = service.stopOrphanEngines(['g1']);
+        await jest.advanceTimersByTimeAsync(10_000);
+        expect(g1.forceDestroy).toHaveBeenCalledTimes(1);
+        await jest.advanceTimersByTimeAsync(10_000);
+        const result = await pending;
+
+        expect(result.failed).toEqual(['g1']);
+        expect(enginesOf().has('g1')).toBe(false);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('logs the ids a lease-loss teardown could not stop, and stays quiet when it stops them', async () => {
+      let onLost!: (ids: string[]) => Promise<void>;
+      const ownership = {
+        onLeaseLoss: jest.fn((fn: (ids: string[]) => Promise<void>) => (onLost = fn)),
+        setEngineLiveness: jest.fn(),
+        startHeartbeat: jest.fn(),
+      };
+      Object.assign(service as unknown as Record<string, unknown>, { ownership });
+      const watchdog = (service as unknown as { watchdog: { start: () => void } }).watchdog;
+      jest.spyOn(watchdog, 'start').mockImplementation(() => undefined);
+      (configService.get as jest.Mock).mockImplementation(
+        <T>(key: string, def?: T): T => (key === 'features' ? { autoStartSessions: false } : def) as T,
+      );
+      const logger = (service as unknown as { logger: { error: (...a: unknown[]) => void } }).logger;
+      const error = jest.spyOn(logger, 'error').mockImplementation(() => undefined);
+      service.onApplicationBootstrap();
+
+      enginesOf().set('ok', { destroy: jest.fn().mockResolvedValue(undefined) });
+      await onLost(['ok']);
+      expect(error).not.toHaveBeenCalled();
+
+      enginesOf().set('g1', {
+        destroy: jest.fn().mockRejectedValue(new Error('stuck')),
+        forceDestroy: jest.fn().mockRejectedValue(new Error('kill failed')),
+      });
+      error.mockClear();
+      await onLost(['g1']);
+      const leaseLoss = error.mock.calls.find(
+        c => (c[2] as { action?: string } | undefined)?.action === 'lease_loss_teardown_failed',
+      );
+      expect(leaseLoss?.[2]).toEqual({ sessionIds: ['g1'], action: 'lease_loss_teardown_failed' });
     });
 
     it('is a bounded no-op for an empty id list', async () => {
@@ -720,9 +867,29 @@ describe('SessionService', () => {
       expect(repository.create).toHaveBeenCalledWith(expect.objectContaining({ status: SessionStatus.CREATED }));
       expect(hookManager.execute).toHaveBeenCalledWith(
         'session:created',
-        session,
+        expect.objectContaining({ id: session.id, name: 'test-session', status: SessionStatus.CREATED }),
         expect.objectContaining({ sessionId: session.id }),
       );
+    });
+
+    it('hands session:created plugins the API shape, never the proxy credentials or config', async () => {
+      const session = createMockSession({
+        proxyUrl: 'http://alice:s3cret@proxy.corp:8080',
+        proxyType: 'http',
+        config: { webhookSecret: 'hush' },
+      });
+      (repository.findOne as jest.Mock).mockResolvedValue(null);
+      (repository.create as jest.Mock).mockReturnValue(session);
+      (repository.save as jest.Mock).mockResolvedValue(session);
+
+      const result = await service.create({ name: 'test-session', proxyUrl: 'http://alice:s3cret@proxy.corp:8080' });
+
+      const calls = (hookManager.execute as jest.Mock).mock.calls as [string, unknown][];
+      const payload = calls.find(([event]) => event === 'session:created')?.[1];
+      expect(payload).toEqual(SessionResponseDto.fromEntity(session, false));
+      expect(JSON.stringify(payload)).not.toMatch(/s3cret|hush|proxy/);
+      // The caller still gets the saved entity (the controller maps it for the response).
+      expect(result).toBe(session);
     });
 
     it('should throw ConflictException if session name already exists', async () => {
@@ -907,6 +1074,38 @@ describe('SessionService', () => {
       const initializing = (lifecycle as unknown as { initializingSessions: Set<string> }).initializingSessions;
       expect(initializing.has('sess-uuid-1')).toBe(false);
       expect(service.getActiveSessionIds()).toContain('sess-uuid-1');
+    });
+
+    it('counts a session waiting to relaunch after a failed reconnect as active for the import pre-flight', () => {
+      // Its engine was evicted, but its timer re-registers one, so an import must see it as an orphan.
+      const reconnectStates = (lifecycle as unknown as { reconnectStates: Map<string, ReconnectState> })
+        .reconnectStates;
+      reconnectStates.set('relaunching', { timer: null, attempts: 1, maxAttempts: 5, baseDelay: 1000 });
+
+      expect(service.getActiveSessionIds()).toContain('relaunching');
+    });
+
+    it('shows a start in its retry pause to the import pre-flight, and a stopOrphans import cancels it', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      (engineFactory.create as jest.Mock).mockClear().mockReturnValue(mockEngine);
+      mockEngine.initialize.mockRejectedValueOnce(new EngineTransportError('Protocol error: Target closed'));
+
+      const outcome = service.start('sess-uuid-1').catch((error: unknown) => error);
+      for (let i = 0; i < 200 && mockEngine.initialize.mock.calls.length === 0; i++) {
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      for (let i = 0; i < 200 && lifecycle.isEngineActive('sess-uuid-1'); i++) {
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      expect(lifecycle.isEngineActive('sess-uuid-1')).toBe(false);
+
+      expect(service.getActiveSessionIds()).toContain('sess-uuid-1');
+      await service.stopOrphanEngines(['sess-uuid-1']);
+
+      expect(await outcome).toBeInstanceOf(SessionStoppedException);
+      expect(mockEngine.initialize).toHaveBeenCalledTimes(1);
+      expect(lifecycle.isEngineActive('sess-uuid-1')).toBe(false);
     });
 
     it('evicts and tears down the engine when engine.initialize() fails (no orphan wedging the session)', async () => {
@@ -1134,6 +1333,22 @@ describe('SessionService', () => {
       expect(managerDelete).toHaveBeenCalledWith(Webhook, { sessionId: 'sess-uuid-1' });
       expect(managerDelete).toHaveBeenCalledWith(Template, { sessionId: 'sess-uuid-1' });
       expect(managerDelete).toHaveBeenCalledWith(BaileysStoredMessage, { sessionId: 'sess-uuid-1' });
+      // chat_states and status_updates carry a plain sessionId with no FK at all.
+      expect(managerDelete).toHaveBeenCalledWith(ChatState, { sessionId: 'sess-uuid-1' });
+      expect(managerDelete).toHaveBeenCalledWith(StatusUpdate, { sessionId: 'sess-uuid-1' });
+      // Delivery records keyed on the session: outbox rows, lost-delivery records, dead-letter payloads.
+      expect(managerDelete).toHaveBeenCalledWith(WebhookOutboxEvent, { sessionId: 'sess-uuid-1' });
+      expect(managerDelete).toHaveBeenCalledWith(WebhookDeliveryFailure, { sessionId: 'sess-uuid-1' });
+      expect(managerDelete).toHaveBeenCalledWith(IntegrationDeliveryFailure, { sessionId: 'sess-uuid-1' });
+      // Kept on purpose: a re-paired session is rebound to its conversations, ingress rows are the
+      // instance-keyed dedup record, and LID mappings are a global cache.
+      const deleted = managerDelete.mock.calls.map(([entity]) => entity as unknown);
+      expect(deleted).not.toContain(ConversationMapping);
+      expect(deleted).not.toContain(IngressEvent);
+      expect(deleted).not.toContain(LidMapping);
+      // Children before the parent.
+      const removeOrder = managerRemove.mock.invocationCallOrder[0];
+      for (const order of managerDelete.mock.invocationCallOrder) expect(order).toBeLessThan(removeOrder);
       expect(managerRemove).toHaveBeenCalledWith(session);
     });
   });
@@ -1236,6 +1451,237 @@ describe('SessionService', () => {
       return ownership;
     };
 
+    /** A row whose desiredState follows the service's own writes, so a stop's keep-down is visible. */
+    const trackDesiredState = (): (() => string | null) => {
+      let desired: string | null = null;
+      (repository.findOne as jest.Mock).mockImplementation(() =>
+        Promise.resolve(createMockSession({ desiredState: desired as Session['desiredState'] })),
+      );
+      (repository.update as jest.Mock).mockImplementation((_where: unknown, patch: Record<string, unknown>) => {
+        if ('desiredState' in patch) desired = patch.desiredState as string | null;
+        return Promise.resolve({ affected: 1 });
+      });
+      return () => desired;
+    };
+
+    // The stop finished, released its claim and answered 200 while the start still waited on its
+    // claim; the start then launched the engine on the released claim and cleared the stop record.
+    it('start() refuses with 409 when a stop() lands while its claim is pending', async () => {
+      const ownership = withOwnership();
+      const desired = trackDesiredState();
+      let finishClaim: () => void = () => undefined;
+      ownership.claim.mockImplementationOnce(
+        () => new Promise<boolean>(resolve => (finishClaim = () => resolve(true))),
+      );
+
+      const starting = service.start('sess-uuid-1', { explicit: true });
+      const outcome = starting.catch((error: unknown) => error);
+      await service.stop('sess-uuid-1');
+      const releasesBefore = ownership.release.mock.calls.length;
+      finishClaim();
+
+      expect(await outcome).toBeInstanceOf(SessionStoppedException);
+      expect(mockEngine.initialize).not.toHaveBeenCalled();
+      expect(lifecycle.isEngineActive('sess-uuid-1')).toBe(false);
+      expect(desired()).toBe('stopped');
+      expect(ownership.release.mock.calls.length).toBeGreaterThan(releasesBefore);
+    });
+
+    // The same race with a force-kill: the start sent while the engine still ran launched a new one
+    // once its claim resolved and cleared the stop record the kill had just written.
+    it('start() refuses with 409 when a forceKill() lands while its claim is pending', async () => {
+      const ownership = withOwnership();
+      const desired = trackDesiredState();
+      (service as unknown as { engines: Map<string, unknown> }).engines.set('sess-uuid-1', {
+        forceDestroy: jest.fn().mockResolvedValue(undefined),
+      });
+      let finishClaim: () => void = () => undefined;
+      ownership.claim.mockImplementationOnce(
+        () => new Promise<boolean>(resolve => (finishClaim = () => resolve(true))),
+      );
+
+      const starting = service.start('sess-uuid-1', { explicit: true });
+      const outcome = starting.catch((error: unknown) => error);
+      await service.forceKill('sess-uuid-1');
+      finishClaim();
+
+      expect(await outcome).toBeInstanceOf(SessionStoppedException);
+      expect(mockEngine.initialize).not.toHaveBeenCalled();
+      expect(lifecycle.isEngineActive('sess-uuid-1')).toBe(false);
+      expect(desired()).toBe('stopped');
+    });
+
+    // A refused force-kill took nothing down, so a start waiting on its claim must still launch.
+    it('start() still launches after a forceKill() refused with 400 while its claim is pending', async () => {
+      const ownership = withOwnership();
+      trackDesiredState();
+      let finishClaim: () => void = () => undefined;
+      ownership.claim.mockImplementationOnce(
+        () => new Promise<boolean>(resolve => (finishClaim = () => resolve(true))),
+      );
+
+      const starting = service.start('sess-uuid-1', { explicit: true });
+      await expect(service.forceKill('sess-uuid-1')).rejects.toThrow(BadRequestException);
+      finishClaim();
+      await starting;
+
+      expect(lifecycle.isEngineActive('sess-uuid-1')).toBe(true);
+    });
+
+    // The claim resolves while the force-kill is still reading the row, and the start's own read is
+    // held so no engine appears meanwhile: a kill that ends in a 400 (no engine) or in a failed read
+    // took nothing down, so the start must still launch.
+    type SettleRead = (resolveRead: (row: Session) => void, failRead: (error: Error) => void) => void;
+    it.each<[string, SettleRead]>([
+      ['refused with 400', resolveRead => resolveRead(createMockSession())],
+      ['whose row read fails', (_resolveRead, failRead) => failRead(new Error('connection terminated'))],
+    ])('start() still launches when a forceKill() %s overlaps its claim', async (_label, settleRead) => {
+      const ownership = withOwnership();
+      const desired = trackDesiredState();
+      let finishClaim: () => void = () => undefined;
+      ownership.claim.mockImplementationOnce(
+        () => new Promise<boolean>(resolve => (finishClaim = () => resolve(true))),
+      );
+      const starting = service.start('sess-uuid-1', { explicit: true });
+      await new Promise(resolve => setImmediate(resolve));
+
+      let resolveKillRead: (row: Session) => void = () => undefined;
+      let failKillRead: (error: Error) => void = () => undefined;
+      let resolveStartRead: (row: Session) => void = () => undefined;
+      (repository.findOne as jest.Mock)
+        .mockImplementationOnce(
+          () =>
+            new Promise<Session>((resolve, reject) => {
+              resolveKillRead = resolve;
+              failKillRead = reject;
+            }),
+        )
+        .mockImplementationOnce(() => new Promise<Session>(resolve => (resolveStartRead = resolve)));
+      const killing = service.forceKill('sess-uuid-1').catch((error: unknown) => error);
+      finishClaim();
+      await new Promise(resolve => setImmediate(resolve));
+      settleRead(resolveKillRead, failKillRead);
+      await killing;
+      resolveStartRead(createMockSession());
+      await starting;
+
+      expect(lifecycle.isEngineActive('sess-uuid-1')).toBe(true);
+      expect(desired()).not.toBe('stopped');
+    });
+
+    // An engine registered while the force-kill read the row is still killed, and still counted.
+    it('start() refuses with 409 when a forceKill() finds an engine only after its row read', async () => {
+      const ownership = withOwnership();
+      trackDesiredState();
+      let finishClaim: () => void = () => undefined;
+      ownership.claim.mockImplementationOnce(
+        () => new Promise<boolean>(resolve => (finishClaim = () => resolve(true))),
+      );
+      const starting = service.start('sess-uuid-1', { explicit: true });
+      const outcome = starting.catch((error: unknown) => error);
+      await new Promise(resolve => setImmediate(resolve));
+
+      let resolveKillRead: (row: Session) => void = () => undefined;
+      (repository.findOne as jest.Mock).mockImplementationOnce(
+        () => new Promise<Session>(resolve => (resolveKillRead = resolve)),
+      );
+      const killing = service.forceKill('sess-uuid-1');
+      (service as unknown as { engines: Map<string, unknown> }).engines.set('sess-uuid-1', {
+        forceDestroy: jest.fn().mockResolvedValue(undefined),
+      });
+      resolveKillRead(createMockSession());
+      await killing;
+      finishClaim();
+
+      expect(await outcome).toBeInstanceOf(SessionStoppedException);
+      expect(mockEngine.initialize).not.toHaveBeenCalled();
+    });
+
+    // The teardown finished while a start sent after it still waited on its claim, and handed back
+    // the claim that start had just taken: the start then ran its engine on a row no node held.
+    it.each([
+      ['stop', true],
+      ['stop', false],
+      ['logout', true],
+      ['logout', false],
+      ['forceKill', true],
+      ['forceKill', false],
+    ] as const)('%s() leaves the claim to a start still claiming it (teardown completes: %s)', async (verb, clean) => {
+      const ownership = withOwnership();
+      trackDesiredState();
+      const teardown = () => (clean ? Promise.resolve() : Promise.reject(new Error('engine wedged')));
+      (service as unknown as { engines: Map<string, unknown> }).engines.set('sess-uuid-1', {
+        disconnect: jest.fn(teardown),
+        logout: jest.fn(teardown),
+        forceDestroy: jest.fn(teardown),
+      });
+      let finishClaim: () => void = () => undefined;
+      ownership.claim.mockImplementationOnce(
+        () => new Promise<boolean>(resolve => (finishClaim = () => resolve(true))),
+      );
+
+      const tearingDown = service[verb]('sess-uuid-1').catch((error: unknown) => error);
+      const starting = service.start('sess-uuid-1', { explicit: true });
+      const teardownOutcome = await tearingDown;
+      finishClaim();
+      await starting;
+
+      if (!clean) expect(teardownOutcome).toBeInstanceOf(BadGatewayException);
+      expect(lifecycle.isEngineActive('sess-uuid-1')).toBe(true);
+      expect(ownership.release).not.toHaveBeenCalled();
+    });
+
+    // A duplicate start of the same id (a double click, a client retry) must hold the claim as well:
+    // the first start returning early must not leave the second one's claim to the teardown.
+    it('stop() leaves the claim to a duplicate start still claiming it after the first start failed', async () => {
+      const ownership = withOwnership();
+      trackDesiredState();
+      (service as unknown as { engines: Map<string, unknown> }).engines.set('sess-uuid-1', {
+        disconnect: jest.fn().mockResolvedValue(undefined),
+      });
+      let finishFirstClaim: () => void = () => undefined;
+      let finishSecondClaim: () => void = () => undefined;
+      ownership.claim
+        .mockImplementationOnce(() => new Promise<boolean>(resolve => (finishFirstClaim = () => resolve(false))))
+        .mockImplementationOnce(() => new Promise<boolean>(resolve => (finishSecondClaim = () => resolve(true))));
+
+      const stopping = service.stop('sess-uuid-1');
+      const first = service.start('sess-uuid-1', { explicit: true }).catch((error: unknown) => error);
+      const second = service.start('sess-uuid-1', { explicit: true });
+      finishFirstClaim();
+      expect(await first).toBeInstanceOf(ConflictException);
+      await stopping;
+      finishSecondClaim();
+      await second;
+
+      expect(lifecycle.isEngineActive('sess-uuid-1')).toBe(true);
+      expect(ownership.release).not.toHaveBeenCalled();
+    });
+
+    it('start() does not retry a transient failure when a stop() lands while the re-claim is pending', async () => {
+      const ownership = withOwnership();
+      const desired = trackDesiredState();
+      (engineFactory.create as jest.Mock).mockReturnValue(mockEngine);
+      mockEngine.initialize.mockRejectedValueOnce(new EngineTransportError('Protocol error: Target closed'));
+      let finishClaim: () => void = () => undefined;
+      let reclaimed: () => void = () => undefined;
+      const reclaim = new Promise<void>(resolve => (reclaimed = resolve));
+      ownership.claim.mockResolvedValueOnce(true).mockImplementationOnce(() => {
+        reclaimed();
+        return new Promise<boolean>(resolve => (finishClaim = () => resolve(true)));
+      });
+
+      const outcome = service.start('sess-uuid-1', { explicit: true }).catch((error: unknown) => error);
+      await reclaim;
+      await service.stop('sess-uuid-1');
+      finishClaim();
+
+      expect(await outcome).toBeInstanceOf(SessionStoppedException);
+      expect(mockEngine.initialize).toHaveBeenCalledTimes(1);
+      expect(lifecycle.isEngineActive('sess-uuid-1')).toBe(false);
+      expect(desired()).toBe('stopped');
+    });
+
     it('start() releases the claim when the launch fails and nothing stays alive here', async () => {
       const ownership = withOwnership();
       jest.spyOn(lifecycle, 'start').mockRejectedValue(new Error('engine init failed'));
@@ -1245,6 +1691,141 @@ describe('SessionService', () => {
 
       expect(ownership.claim).toHaveBeenCalledWith('sess-uuid-1');
       expect(ownership.release).toHaveBeenCalledWith('sess-uuid-1');
+    });
+
+    // The engine's own cap check runs after the claim, and its refusal releases the claim to no node:
+    // a row nobody holds is never adopted by a peer, so the session stayed down until a reboot.
+    it('start() at MAX_CONCURRENT_SESSIONS refuses before claiming, leaving the lease for a peer', async () => {
+      const ownership = withOwnership();
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | number =>
+        key === 'sessions.maxConcurrent' ? 1 : (def as T),
+      );
+      jest.spyOn(lifecycle, 'startSlotHolders').mockReturnValue(new Set(['other']));
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      const engineStart = jest.spyOn(lifecycle, 'start');
+
+      await expect(service.start('sess-uuid-1')).rejects.toThrow('Maximum concurrent sessions reached (1)');
+
+      expect(ownership.claim).not.toHaveBeenCalled();
+      expect(ownership.release).not.toHaveBeenCalled();
+      expect(engineStart).not.toHaveBeenCalled();
+    });
+
+    // Both starts passed the cap check while neither had reached the engine yet, so the second
+    // claimed its lapsed lease, met the engine's own cap refusal, and released the lease to no node.
+    it('start() racing another start for the last slot refuses before claiming', async () => {
+      const ownership = withOwnership();
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | number =>
+        key === 'sessions.maxConcurrent' ? 2 : (def as T),
+      );
+      jest.spyOn(lifecycle, 'startSlotHolders').mockImplementation(() => new Set(['other']));
+      jest.spyOn(lifecycle, 'isEngineActive').mockReturnValue(false);
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      let finishClaim = (): void => undefined;
+      ownership.claim.mockImplementationOnce(
+        () => new Promise<boolean>(resolve => (finishClaim = () => resolve(true))),
+      );
+      // The first start reaches the engine first and takes the slot there.
+      jest
+        .spyOn(lifecycle, 'start')
+        .mockImplementation(id =>
+          id === 'first'
+            ? Promise.resolve(createMockSession())
+            : Promise.reject(new BadRequestException('Maximum concurrent sessions reached (2)')),
+        );
+
+      const first = service.start('first');
+      await expect(service.start('second')).rejects.toThrow('Maximum concurrent sessions reached (2)');
+      expect(ownership.claim).not.toHaveBeenCalledWith('second');
+      expect(ownership.release).not.toHaveBeenCalledWith('second');
+
+      finishClaim();
+      await first;
+    });
+
+    it('start() refused as a duplicate keeps the slot the first start of that id holds', async () => {
+      const ownership = withOwnership();
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | number =>
+        key === 'sessions.maxConcurrent' ? 2 : (def as T),
+      );
+      jest.spyOn(lifecycle, 'startSlotHolders').mockImplementation(() => new Set(['other']));
+      jest.spyOn(lifecycle, 'isEngineActive').mockReturnValue(false);
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      let finishClaim = (): void => undefined;
+      ownership.claim.mockImplementationOnce(
+        () => new Promise<boolean>(resolve => (finishClaim = () => resolve(true))),
+      );
+      jest
+        .spyOn(lifecycle, 'start')
+        .mockRejectedValueOnce(new BadRequestException('Session is already starting'))
+        .mockResolvedValue(createMockSession());
+
+      const first = service.start('first');
+      await expect(service.start('first')).rejects.toThrow('Session is already starting');
+      await expect(service.start('second')).rejects.toThrow('Maximum concurrent sessions reached (2)');
+      expect(ownership.claim).not.toHaveBeenCalledWith('second');
+
+      finishClaim();
+      await first;
+    });
+
+    // Boot auto-start and the takeover sweep stop at the first false answer, so a start whose claim
+    // then fails must not read as a used slot while that claim is awaited.
+    it('hasStartCapacity() does not count a start whose claim is still awaited', async () => {
+      const ownership = withOwnership();
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | number =>
+        key === 'sessions.maxConcurrent' ? 2 : (def as T),
+      );
+      jest.spyOn(lifecycle, 'startSlotHolders').mockImplementation(() => new Set(['other']));
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      let finishClaim = (): void => undefined;
+      ownership.claim.mockImplementationOnce(
+        () => new Promise<boolean>(resolve => (finishClaim = () => resolve(false))),
+      );
+
+      const first = service.start('first');
+      expect(service.hasStartCapacity(2)).toBe(true);
+
+      finishClaim();
+      await expect(first).rejects.toThrow(ConflictException);
+    });
+
+    it('start() at MAX_CONCURRENT_SESSIONS still answers 404 for an unknown id', async () => {
+      withOwnership();
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | number =>
+        key === 'sessions.maxConcurrent' ? 1 : (def as T),
+      );
+      jest.spyOn(lifecycle, 'startSlotHolders').mockReturnValue(new Set(['other']));
+      (repository.findOne as jest.Mock).mockResolvedValue(null);
+
+      await expect(service.start('missing')).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('start() at MAX_CONCURRENT_SESSIONS still answers 409 for a session a live peer holds', async () => {
+      const ownership = withOwnership();
+      ownership.isHeldByOtherNode.mockResolvedValue(true);
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | number =>
+        key === 'sessions.maxConcurrent' ? 1 : (def as T),
+      );
+      jest.spyOn(lifecycle, 'startSlotHolders').mockReturnValue(new Set(['other']));
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+
+      await expect(service.start('sess-uuid-1')).rejects.toBeInstanceOf(ConflictException);
+      expect(ownership.claim).not.toHaveBeenCalled();
+      expect(ownership.release).not.toHaveBeenCalled();
+    });
+
+    it('start() does not count its own running engine against the cap', async () => {
+      const ownership = withOwnership();
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | number =>
+        key === 'sessions.maxConcurrent' ? 1 : (def as T),
+      );
+      jest.spyOn(lifecycle, 'startSlotHolders').mockReturnValue(new Set(['sess-uuid-1']));
+      jest.spyOn(lifecycle, 'start').mockRejectedValue(new BadRequestException('Session is already started'));
+      jest.spyOn(lifecycle, 'isEngineActive').mockReturnValue(true);
+
+      await expect(service.start('sess-uuid-1')).rejects.toThrow('Session is already started');
+      expect(ownership.claim).toHaveBeenCalledWith('sess-uuid-1');
     });
 
     it('start() keeps the claim when the refusal means the engine genuinely runs here', async () => {
@@ -1289,7 +1870,7 @@ describe('SessionService', () => {
 
         await call(service);
 
-        expect(lifecycleSpy).toHaveBeenCalledWith('sess-uuid-1');
+        expect(lifecycleSpy).toHaveBeenCalledWith('sess-uuid-1', expect.any(Object));
       },
     );
 
@@ -1324,6 +1905,39 @@ describe('SessionService', () => {
       await expect(service.logout('sess-uuid-1')).rejects.toThrow(BadGatewayException);
 
       expect(ownership.release).toHaveBeenCalledWith('sess-uuid-1');
+    });
+
+    // The incomplete stop evicted the engine and wrote DISCONNECTED. A claim left to lapse still names
+    // this node, and a peer's takeover sweep adopts exactly such a row: it would restart the session
+    // the operator just stopped. A released claim is not adopted.
+    it('stop() releases on the 502 SESSION_STOP_INCOMPLETE path when nothing stays alive here', async () => {
+      const ownership = withOwnership();
+      jest.spyOn(lifecycle, 'stop').mockRejectedValue(new BadGatewayException({ code: 'SESSION_STOP_INCOMPLETE' }));
+      jest.spyOn(lifecycle, 'isEngineActive').mockReturnValue(false);
+
+      await expect(service.stop('sess-uuid-1')).rejects.toThrow(BadGatewayException);
+
+      expect(ownership.release).toHaveBeenCalledWith('sess-uuid-1');
+    });
+
+    it('stop() keeps the claim on the 502 path when a concurrent start still holds the session here', async () => {
+      const ownership = withOwnership();
+      jest.spyOn(lifecycle, 'stop').mockRejectedValue(new BadGatewayException({ code: 'SESSION_STOP_INCOMPLETE' }));
+      jest.spyOn(lifecycle, 'isEngineActive').mockReturnValue(true);
+
+      await expect(service.stop('sess-uuid-1')).rejects.toThrow(BadGatewayException);
+
+      expect(ownership.release).not.toHaveBeenCalled();
+    });
+
+    it('stop() keeps the claim when it fails for any other reason', async () => {
+      const ownership = withOwnership();
+      jest.spyOn(lifecycle, 'stop').mockRejectedValue(new NotFoundException('Session not found'));
+      jest.spyOn(lifecycle, 'isEngineActive').mockReturnValue(false);
+
+      await expect(service.stop('sess-uuid-1')).rejects.toThrow(NotFoundException);
+
+      expect(ownership.release).not.toHaveBeenCalled();
     });
 
     it('forceKill() hands the claim back after the kill', async () => {
@@ -1477,6 +2091,12 @@ describe('SessionService', () => {
       (repository.findOne as jest.Mock).mockRejectedValueOnce(new Error('Connection terminated unexpectedly'));
       await expect(call(service)).rejects.toThrow('Connection terminated unexpectedly');
       expect(internals.stoppingSessions.has('sess-uuid-1')).toBe(false);
+      // Nothing was taken down, so no stop is recorded for the next boot and no request stays counted.
+      expect((repository.update as jest.Mock).mock.calls).not.toContainEqual([
+        'sess-uuid-1',
+        { desiredState: 'stopped' },
+      ]);
+      expect((service as unknown as { stopRequests: Map<string, number> }).stopRequests.has('sess-uuid-1')).toBe(false);
 
       callbacks.onDisconnected?.('socket closed');
       await new Promise(resolve => setImmediate(resolve));
@@ -1578,9 +2198,187 @@ describe('SessionService', () => {
         await until(() => mockEngine.initialize.mock.calls.length === 1 && !lifecycle.isEngineActive(row.id));
         await service.stop(row.id);
 
-        expect(await outcome).toBeInstanceOf(EngineTransportError);
+        expect(await outcome).toBeInstanceOf(SessionStoppedException);
         expect(mockEngine.initialize).toHaveBeenCalledTimes(1);
         expect(lifecycle.isEngineActive(row.id)).toBe(false);
+        expect(await nodeIdOf(row.id)).toBeNull();
+      });
+
+      // The retry would re-claim the row after shutdown released it and launch an engine nothing tears down.
+      it('start() does not retry a transient failure once shutdown ran during the delay', async () => {
+        const row = await seed();
+        (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ id: row.id }));
+        mockEngine.initialize.mockRejectedValueOnce(new EngineTransportError('Protocol error: Target closed'));
+        const claim = jest.spyOn(ownership, 'claim');
+
+        const outcome = service.start(row.id).catch((error: unknown) => error);
+        await until(() => mockEngine.initialize.mock.calls.length === 1 && !lifecycle.isEngineActive(row.id));
+        await service.onModuleDestroy();
+
+        expect(await outcome).toMatchObject({ status: 503 });
+        expect(claim).toHaveBeenCalledTimes(1);
+        expect(mockEngine.initialize).toHaveBeenCalledTimes(1);
+        expect(lifecycle.isEngineActive(row.id)).toBe(false);
+        expect(await nodeIdOf(row.id)).toBeNull();
+      });
+
+      // The first attempt's FAILED is skipped by the boot reset, auto-start and the takeover sweep,
+      // and shutdown refuses the retry that would have overwritten it.
+      describe('a transient failure whose retry shutdown refuses leaves the session for the next boot', () => {
+        const statusOf = async (id: string): Promise<SessionStatus> => (await sessions.findOneByOrFail({ id })).status;
+        const untilFailed = async (id: string): Promise<void> => {
+          for (let i = 0; i < 200 && (await statusOf(id)) !== SessionStatus.FAILED; i++) {
+            await new Promise(resolve => setImmediate(resolve));
+          }
+          expect(await statusOf(id)).toBe(SessionStatus.FAILED);
+        };
+        const arrange = async (): Promise<Session> => {
+          const row = await seed({ status: SessionStatus.DISCONNECTED, phone: '123' });
+          (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ id: row.id }));
+          (repository.update as jest.Mock).mockImplementation((...args: Parameters<Repository<Session>['update']>) =>
+            sessions.update(...args),
+          );
+          mockEngine.initialize.mockRejectedValueOnce(new EngineTransportError('Protocol error: Target closed'));
+          return row;
+        };
+        const originalFlag = process.env.AUTO_START_SESSIONS;
+
+        afterEach(() => {
+          if (originalFlag === undefined) delete process.env.AUTO_START_SESSIONS;
+          else process.env.AUTO_START_SESSIONS = originalFlag;
+        });
+
+        it('for an explicit start refused during the delay', async () => {
+          const row = await arrange();
+
+          const outcome = service.start(row.id, { explicit: true }).catch((error: unknown) => error);
+          await untilFailed(row.id);
+          await service.onModuleDestroy();
+
+          expect(await outcome).toBeInstanceOf(ServerShuttingDownException);
+          expect(mockEngine.initialize).toHaveBeenCalledTimes(1);
+          expect(await statusOf(row.id)).toBe(SessionStatus.DISCONNECTED);
+          expect(await nodeIdOf(row.id)).toBeNull();
+        });
+
+        it('for a boot auto-start refused during the delay', async () => {
+          const row = await arrange();
+          process.env.AUTO_START_SESSIONS = 'true';
+          (repository.find as jest.Mock).mockResolvedValue([createMockSession({ id: row.id })]);
+
+          service.onApplicationBootstrap();
+          await untilFailed(row.id);
+          await service.onModuleDestroy();
+
+          expect(mockEngine.initialize).toHaveBeenCalledTimes(1);
+          expect(await statusOf(row.id)).toBe(SessionStatus.DISCONNECTED);
+          expect(await nodeIdOf(row.id)).toBeNull();
+        });
+
+        it('for a retry whose re-claim was pending when shutdown began', async () => {
+          const row = await arrange();
+          const claimNow = ownership.claim.bind(ownership);
+          let releaseClaim: () => void = () => undefined;
+          const reclaiming = new Promise<void>(reached => {
+            jest
+              .spyOn(ownership, 'claim')
+              .mockImplementationOnce(claimNow)
+              .mockImplementationOnce(id => {
+                reached();
+                return new Promise<boolean>(resolve => (releaseClaim = () => resolve(claimNow(id))));
+              });
+          });
+
+          const startingHooks = (): number =>
+            (hookManager.execute as jest.Mock).mock.calls.filter(([event]) => event === 'session:starting').length;
+
+          const outcome = service.start(row.id, { explicit: true }).catch((error: unknown) => error);
+          await reclaiming;
+          expect(await statusOf(row.id)).toBe(SessionStatus.FAILED);
+          expect(startingHooks()).toBe(1);
+          await service.onModuleDestroy();
+          releaseClaim();
+
+          expect(await outcome).toBeInstanceOf(ServerShuttingDownException);
+          expect(startingHooks()).toBe(1);
+          expect(mockEngine.initialize).toHaveBeenCalledTimes(1);
+          expect(await statusOf(row.id)).toBe(SessionStatus.DISCONNECTED);
+          expect(await nodeIdOf(row.id)).toBeNull();
+        });
+
+        it('for a start whose FAILED write was pending when shutdown began', async () => {
+          const row = await arrange();
+          let reachedFailed: () => void = () => undefined;
+          const failedHeld = new Promise<void>(resolve => (reachedFailed = resolve));
+          let releaseFailed: () => void = () => undefined;
+          const gate = new Promise<void>(resolve => (releaseFailed = resolve));
+          (repository.update as jest.Mock).mockImplementation(
+            async (...args: Parameters<Repository<Session>['update']>) => {
+              if ((args[1] as { status?: SessionStatus }).status === SessionStatus.FAILED) {
+                reachedFailed();
+                await gate;
+              }
+              return sessions.update(...args);
+            },
+          );
+
+          const outcome = service.start(row.id, { explicit: true }).catch((error: unknown) => error);
+          await failedHeld;
+          const shutdown = service.onModuleDestroy();
+          releaseFailed();
+          await shutdown;
+
+          expect(await outcome).toBeInstanceOf(ServerShuttingDownException);
+          expect(mockEngine.initialize).toHaveBeenCalledTimes(1);
+          expect(await statusOf(row.id)).toBe(SessionStatus.DISCONNECTED);
+        });
+
+        it('but not on a row a peer adopted since, whose FAILED is its own', async () => {
+          const row = await arrange();
+
+          const outcome = service.start(row.id, { explicit: true }).catch((error: unknown) => error);
+          await untilFailed(row.id);
+          await sessions.update(row.id, { nodeId: 'node-b', leaseExpiresAt: new Date(Date.now() + 60_000) });
+          await service.onModuleDestroy();
+
+          expect(await outcome).toBeInstanceOf(ServerShuttingDownException);
+          expect(await statusOf(row.id)).toBe(SessionStatus.FAILED);
+          expect(await nodeIdOf(row.id)).toBe('node-b');
+        });
+      });
+
+      it('start() after shutdown released the claims does not claim the row again', async () => {
+        const row = await seed({ status: SessionStatus.DISCONNECTED });
+        const claim = jest.spyOn(ownership, 'claim');
+        await service.onModuleDestroy();
+
+        await expect(service.start(row.id)).rejects.toMatchObject({ status: 503 });
+        expect(claim).not.toHaveBeenCalled();
+        expect(await nodeIdOf(row.id)).toBeNull();
+      });
+
+      // The claim resolves after shutdown released this node's rows; the start must not clear the stop or run the hook.
+      it('start() still waiting on its claim when shutdown begins neither clears a stop nor runs the hook', async () => {
+        const row = await seed({ status: SessionStatus.DISCONNECTED, desiredState: 'stopped' });
+        (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ id: row.id, desiredState: 'stopped' }));
+        const claimNow = ownership.claim.bind(ownership);
+        let releaseClaim: () => void = () => undefined;
+        const claim = jest
+          .spyOn(ownership, 'claim')
+          .mockImplementationOnce(id => new Promise<boolean>(resolve => (releaseClaim = () => resolve(claimNow(id)))));
+
+        const outcome = service.start(row.id, { explicit: true }).catch((error: unknown) => error);
+        await until(() => claim.mock.calls.length === 1);
+        await service.onModuleDestroy();
+        releaseClaim();
+
+        expect(await outcome).toMatchObject({ status: 503 });
+        expect(hookManager.execute).not.toHaveBeenCalled();
+        expect((repository.update as jest.Mock).mock.calls).not.toContainEqual([
+          { id: row.id, desiredState: 'stopped' },
+          { desiredState: null },
+        ]);
+        expect(engineFactory.create).not.toHaveBeenCalled();
         expect(await nodeIdOf(row.id)).toBeNull();
       });
 
@@ -1634,7 +2432,7 @@ describe('SessionService', () => {
         jest.spyOn(ownership, 'isHeldByOtherNode').mockResolvedValueOnce(true);
         await expect(service.stop(row.id)).rejects.toThrow(ConflictException);
 
-        expect(await outcome).toBeInstanceOf(EngineTransportError);
+        expect(await outcome).toBeInstanceOf(SessionStoppedException);
         expect(mockEngine.initialize).toHaveBeenCalledTimes(1);
         expect(lifecycle.isEngineActive(row.id)).toBe(false);
       });
@@ -1676,7 +2474,11 @@ describe('SessionService', () => {
       intern.reconnectStates.set('x', { attempts: 1, timer: null });
       expect(lifecycle.isEngineActive('x')).toBe(true);
 
-      // An armed timer, attempts reset by a successful READY.
+      // A streak whose last event was READY: kept for the stability window, but nothing is pending.
+      intern.reconnectStates.set('x', { attempts: 3, timer: null, readyAt: Date.now() });
+      expect(lifecycle.isEngineActive('x')).toBe(false);
+
+      // An armed timer on a fresh streak.
       intern.reconnectStates.set('x', { attempts: 0, timer: setTimeout(() => undefined, 60_000) });
       expect(lifecycle.isEngineActive('x')).toBe(true);
       clearTimeout((intern.reconnectStates.get('x') as { timer: NodeJS.Timeout }).timer);
@@ -1688,6 +2490,41 @@ describe('SessionService', () => {
 
       intern.reconnectStates.delete('x');
       expect(lifecycle.isEngineActive('x')).toBe(false);
+    });
+
+    it('a session waiting out a relaunch holds a start slot; a dormant reconnect entry does not', () => {
+      const intern = lifecycle as unknown as { reconnectStates: Map<string, unknown> };
+      const timer = setTimeout(() => undefined, 60_000);
+      try {
+        intern.reconnectStates.set('waiting', { attempts: 1, timer });
+        intern.reconnectStates.set('dormant', { attempts: 0, timer: null });
+
+        expect([...lifecycle.startSlotHolders()]).toEqual(['waiting']);
+      } finally {
+        clearTimeout(timer);
+        intern.reconnectStates.clear();
+      }
+    });
+
+    // The takeover sweep asks this before adopting a lapsed session: counting engines alone let it
+    // call start() at the cap, and the refused start released the claimed lease to no node.
+    it('hasStartCapacity counts a pending relaunch with no engine against the cap', () => {
+      const intern = lifecycle as unknown as {
+        engines: { set: (id: string, e: unknown) => void; delete: (id: string) => void };
+        reconnectStates: Map<string, unknown>;
+      };
+      const timer = setTimeout(() => undefined, 60_000);
+      try {
+        intern.engines.set('running', {});
+        intern.reconnectStates.set('waiting', { attempts: 1, timer });
+
+        expect(service.hasStartCapacity(2)).toBe(false);
+        expect(service.hasStartCapacity(3)).toBe(true);
+      } finally {
+        clearTimeout(timer);
+        intern.engines.delete('running');
+        intern.reconnectStates.clear();
+      }
     });
 
     it('a failed start leaves no reconnect state behind', async () => {
@@ -1759,12 +2596,9 @@ describe('SessionService', () => {
 
       jest.useFakeTimers();
       try {
-        const run = intern().executeReconnect('sess-uuid-1', createMockSession(), {
-          attempts: 1,
-          timer: null,
-          maxAttempts: 5,
-          baseDelay: 5000,
-        });
+        const state = { attempts: 1, timer: null, maxAttempts: 5, baseDelay: 5000 };
+        (lifecycle as unknown as { reconnectStates: Map<string, unknown> }).reconnectStates.set('sess-uuid-1', state);
+        const run = intern().executeReconnect('sess-uuid-1', createMockSession(), state);
         await jest.advanceTimersByTimeAsync(10_000); // the graceful-destroy teardown race is lost
         await run;
 
@@ -1892,6 +2726,70 @@ describe('SessionService', () => {
         delete process.env.WWEBJS_AUTH_TIMEOUT_MS;
       }
     });
+
+    it('registers the engine synchronously, before initializeEngine first awaits (start() captures it there)', () => {
+      (repository.update as jest.Mock).mockReturnValue(new Promise(() => undefined));
+      const init = (
+        lifecycle as unknown as { initializeEngine: (id: string, s: Session) => Promise<void> }
+      ).initializeEngine('sess-uuid-1', createMockSession());
+      init.catch(() => undefined);
+      expect(registry.get('sess-uuid-1')).toBe(mockEngine);
+    });
+
+    it('a stale init deadline leaves a replacement engine registered, alive, and its status and error untouched', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      mockEngine.initialize.mockReturnValue(new Promise<void>(() => undefined));
+      const replacement = { forceDestroy: jest.fn().mockResolvedValue(undefined) };
+      const reconnectStates = (lifecycle as unknown as { reconnectStates: Map<string, unknown> }).reconnectStates;
+
+      jest.useFakeTimers();
+      try {
+        let caught: unknown;
+        const settled = service.start('sess-uuid-1').catch((e: unknown) => {
+          caught = e;
+        });
+        await jest.advanceTimersByTimeAsync(1_000);
+        // A stop() + start() (or a reconnect) registered a new engine while this init hangs.
+        registry.set('sess-uuid-1', replacement as never);
+        (repository.update as jest.Mock).mockClear();
+
+        await jest.advanceTimersByTimeAsync(60_000);
+        await settled;
+
+        expect((caught as HttpException).getStatus()).toBe(HttpStatus.GATEWAY_TIMEOUT);
+        expect(registry.get('sess-uuid-1')).toBe(replacement);
+        expect(replacement.forceDestroy).not.toHaveBeenCalled();
+        expect(mockEngine.forceDestroy).toHaveBeenCalled(); // the stale engine is still reaped
+        expect(repository.update).not.toHaveBeenCalled(); // no DISCONNECTED, no FAILED over the replacement
+        expect(intern().sessionErrors.get('sess-uuid-1')).toBeUndefined();
+        expect(reconnectStates.has('sess-uuid-1')).toBe(true); // the replacement keeps its reconnect state
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it("start()'s catch leaves a replacement engine alone when its own engine was superseded mid-init", async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      let reject!: (e: Error) => void;
+      mockEngine.initialize.mockReturnValue(new Promise<void>((_, r) => (reject = r)));
+      const replacement = { forceDestroy: jest.fn().mockResolvedValue(undefined) };
+      const reconnectStates = (lifecycle as unknown as { reconnectStates: Map<string, unknown> }).reconnectStates;
+
+      const pending = service.start('sess-uuid-1');
+      await new Promise(resolve => setImmediate(resolve));
+      expect(mockEngine.initialize).toHaveBeenCalled();
+      // A mid-init disconnect scheduled a reconnect, which registered its own engine.
+      registry.set('sess-uuid-1', replacement as never);
+      reject(new Error('Target closed'));
+      await expect(pending).rejects.toThrow('Target closed');
+
+      expect(registry.get('sess-uuid-1')).toBe(replacement);
+      expect(replacement.forceDestroy).not.toHaveBeenCalled();
+      expect(repository.update).not.toHaveBeenCalledWith('sess-uuid-1', { status: SessionStatus.FAILED });
+      expect(reconnectStates.has('sess-uuid-1')).toBe(true);
+    });
   });
 
   describe('scheduleReconnect (max attempts)', () => {
@@ -1999,9 +2897,11 @@ describe('SessionService', () => {
         i.reconnectStates.set('sess-uuid-1', state);
         const exec = jest.spyOn(i, 'executeReconnect').mockResolvedValue(undefined);
 
-        // Twelve consecutive disconnects — the pre-fix default (5) would have wedged FAILED at the
-        // 6th; with the unlimited default every one schedules another attempt.
+        // Twelve consecutive failed attempts (each timer fires, and its failure schedules the next):
+        // the pre-fix default (5) would have wedged FAILED at the 6th; with the unlimited default
+        // every one schedules another attempt.
         for (let k = 0; k < 12; k++) {
+          jest.runOnlyPendingTimers();
           i.scheduleReconnect('sess-uuid-1', createMockSession());
         }
 
@@ -2011,6 +2911,7 @@ describe('SessionService', () => {
 
         // The 12th schedule computed its delay with attempts=11: 5000*2^11 ≈ 10.24M ms, clamped to
         // the 5-minute cap; the timer fires exactly at the cap, not earlier.
+        exec.mockClear();
         jest.advanceTimersByTime(299_999);
         expect(exec).not.toHaveBeenCalled();
         jest.advanceTimersByTime(1);
@@ -2021,7 +2922,24 @@ describe('SessionService', () => {
       }
     });
 
-    it('resets the attempt budget only on READY, never because time passed between attempts', () => {
+    it('keeps the account number out of the ready line message, in its metadata only', () => {
+      const i = internals();
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      const engine = { getStatus: jest.fn().mockReturnValue(EngineStatus.READY) };
+      i.engines.set('sess-uuid-1', engine);
+      const logger = (lifecycle as unknown as { logger: { log: () => void } }).logger;
+      const log = jest.spyOn(logger, 'log');
+
+      try {
+        i.handleEngineReady('sess-uuid-1', engine, '628123', 'Tester');
+
+        expect(log).toHaveBeenCalledWith('Session ready', expect.objectContaining({ phone: '628123' }));
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    it('resets the attempt budget only after a stable READY, never because time passed between attempts', () => {
       jest.useFakeTimers();
       try {
         const i = internals();
@@ -2038,14 +2956,16 @@ describe('SessionService', () => {
         for (let k = 0; k < 6; k++) failedAttempt();
         expect(state.attempts).toBe(6);
 
-        // READY is the only reset, so the next drop restarts at the base delay (~5s).
+        // A READY that held for the stability window is the only reset, so the next drop restarts
+        // at the base delay (~5s).
         const engine = {
           getStatus: jest.fn().mockReturnValue(EngineStatus.READY),
           forceDestroy: jest.fn().mockResolvedValue(undefined),
         };
         i.engines.set('sess-uuid-1', engine);
         i.handleEngineReady('sess-uuid-1', engine, '628123', 'Tester');
-        expect(state.attempts).toBe(0);
+        expect(state.attempts).toBe(6);
+        jest.advanceTimersByTime(STABLE_READY_MS);
         i.scheduleReconnect('sess-uuid-1', createMockSession());
         expect(state.attempts).toBe(1);
         const callsBefore = exec.mock.calls.length;
@@ -2067,6 +2987,134 @@ describe('SessionService', () => {
       }
     });
 
+    it('ends the streak on a READY that held the stability window, even if another READY follows it', () => {
+      // Baileys fires READY on every internal socket reopen with no gateway-level drop in between, so
+      // a later READY must not restart the window and carry a long-finished streak forward.
+      jest.useFakeTimers();
+      try {
+        const i = internals();
+        (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+        const state = { attempts: 0, timer: null, maxAttempts: 7, baseDelay: 5000 };
+        i.reconnectStates.set('sess-uuid-1', state);
+        jest.spyOn(i, 'executeReconnect').mockResolvedValue(undefined);
+        const engine = {
+          getStatus: jest.fn().mockReturnValue(EngineStatus.READY),
+          forceDestroy: jest.fn().mockResolvedValue(undefined),
+        };
+        i.engines.set('sess-uuid-1', engine);
+
+        i.scheduleReconnect('sess-uuid-1', createMockSession());
+        expect(state.attempts).toBe(1);
+        i.handleEngineReady('sess-uuid-1', engine, '628123', 'Tester');
+        jest.advanceTimersByTime(STABLE_READY_MS);
+        i.handleEngineReady('sess-uuid-1', engine, '628123', 'Tester');
+        jest.advanceTimersByTime(60_000);
+        i.scheduleReconnect('sess-uuid-1', createMockSession());
+        expect(state.attempts).toBe(1);
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
+    it('measures a READY stretch to where the engine left READY, not to the next READY', async () => {
+      // Baileys handles a transient close inside the engine: it reports INITIALIZING and retries, and
+      // never reports a drop to the gateway. Those minutes spent reconnecting are not READY time.
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      let callbacks: EngineEventCallbacks = {};
+      mockEngine.initialize.mockImplementationOnce((cb: EngineEventCallbacks) => {
+        callbacks = cb;
+        return Promise.resolve();
+      });
+      await service.start('sess-uuid-1');
+      jest.useFakeTimers();
+      try {
+        const i = internals();
+        jest.spyOn(i, 'executeReconnect').mockResolvedValue(undefined);
+        const state = i.reconnectStates.get('sess-uuid-1')!;
+        state.attempts = 3;
+
+        // READY for 10s, then six minutes of in-engine reconnecting, then READY again.
+        i.handleEngineReady('sess-uuid-1', mockEngine, '628123', 'Tester');
+        jest.advanceTimersByTime(10_000);
+        callbacks.onStateChanged?.(EngineStatus.INITIALIZING);
+        jest.advanceTimersByTime(6 * 60_000);
+        i.handleEngineReady('sess-uuid-1', mockEngine, '628123', 'Tester');
+        expect(state.attempts).toBe(3);
+
+        // Same shape, but the READY held the window before the engine left it: the streak ends.
+        jest.advanceTimersByTime(STABLE_READY_MS);
+        callbacks.onStateChanged?.(EngineStatus.INITIALIZING);
+        jest.advanceTimersByTime(60_000);
+        i.handleEngineReady('sess-uuid-1', mockEngine, '628123', 'Tester');
+        expect(state.attempts).toBe(0);
+
+        // A gateway drop after an in-engine one measures the same way.
+        state.attempts = 3;
+        jest.advanceTimersByTime(10_000);
+        callbacks.onStateChanged?.(EngineStatus.INITIALIZING);
+        jest.advanceTimersByTime(6 * 60_000);
+        i.scheduleReconnect('sess-uuid-1', createMockSession());
+        expect(state.attempts).toBe(4);
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
+    it('keeps the streak when a second READY follows one that did not hold the stability window', () => {
+      jest.useFakeTimers();
+      try {
+        const i = internals();
+        (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+        const state = { attempts: 0, timer: null, maxAttempts: 7, baseDelay: 5000 };
+        i.reconnectStates.set('sess-uuid-1', state);
+        jest.spyOn(i, 'executeReconnect').mockResolvedValue(undefined);
+        const engine = {
+          getStatus: jest.fn().mockReturnValue(EngineStatus.READY),
+          forceDestroy: jest.fn().mockResolvedValue(undefined),
+        };
+        i.engines.set('sess-uuid-1', engine);
+
+        i.scheduleReconnect('sess-uuid-1', createMockSession());
+        i.handleEngineReady('sess-uuid-1', engine, '628123', 'Tester');
+        jest.advanceTimersByTime(STABLE_READY_MS - 1);
+        i.handleEngineReady('sess-uuid-1', engine, '628123', 'Tester');
+        jest.advanceTimersByTime(60_000);
+        i.scheduleReconnect('sess-uuid-1', createMockSession());
+        expect(state.attempts).toBe(2);
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not postpone an armed reconnect when the same episode reports another disconnect', () => {
+      // The liveness watchdog re-probes a wedged engine that still reports READY and calls onDead
+      // again ~120s later. With a 150s base delay, re-arming on every report would push the attempt
+      // back each time and it would never run.
+      jest.useFakeTimers();
+      try {
+        const i = internals();
+        const state = { attempts: 0, timer: null, maxAttempts: Number.POSITIVE_INFINITY, baseDelay: 150_000 };
+        i.reconnectStates.set('sess-uuid-1', state);
+        const exec = jest.spyOn(i, 'executeReconnect').mockResolvedValue(undefined);
+
+        i.scheduleReconnect('sess-uuid-1', createMockSession());
+        jest.advanceTimersByTime(120_000);
+        i.scheduleReconnect('sess-uuid-1', createMockSession());
+        expect(state.attempts).toBe(1); // the repeat consumed no attempt
+
+        jest.advanceTimersByTime(31_000); // past 150s + <1s jitter from the FIRST schedule
+        expect(exec).toHaveBeenCalledTimes(1);
+        expect(state.timer).toBeNull(); // spent, so the attempt's own failure can schedule the next one
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
     it('still wedges FAILED once an EXPLICIT cap is exhausted', () => {
       jest.useFakeTimers();
       try {
@@ -2074,11 +3122,13 @@ describe('SessionService', () => {
         (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
         const state = { attempts: 2, timer: null, maxAttempts: 3, baseDelay: 5000 };
         i.reconnectStates.set('sess-uuid-1', state);
+        jest.spyOn(i, 'executeReconnect').mockResolvedValue(undefined);
 
         i.scheduleReconnect('sess-uuid-1', createMockSession()); // attempt 3/3 still schedules
         expect(state.attempts).toBe(3);
         expect(i.sessionErrors.get('sess-uuid-1')).toBeUndefined();
 
+        jest.runOnlyPendingTimers(); // attempt 3 runs and fails
         i.scheduleReconnect('sess-uuid-1', createMockSession()); // budget exhausted → terminal FAILED
         expect(state.attempts).toBe(3); // no further attempt consumed
         expect(i.sessionErrors.get('sess-uuid-1')).toMatch(/Reconnection failed after 3 attempts/);
@@ -2103,9 +3153,15 @@ describe('SessionService', () => {
       >;
       engines: { set: (id: string, engine: unknown) => void };
       scheduleReconnect: (id: string, session: Session) => void;
+      executeReconnect: (...args: unknown[]) => Promise<void>;
       handleEngineReady: (id: string, engine: unknown, phone: string, pushName: string) => void;
     };
     const internals = (): LoopInternals => lifecycle as unknown as LoopInternals;
+    // One failed attempt: the pending timer (if any) fires, and that attempt's failure schedules the next.
+    const failedAttempt = (i: LoopInternals): void => {
+      jest.runOnlyPendingTimers();
+      i.scheduleReconnect('sess-uuid-1', createMockSession());
+    };
     const loopDispatches = (): unknown[][] =>
       ((webhookService.dispatch as jest.Mock).mock.calls as unknown[][]).filter(c => c[1] === 'session.reconnect_loop');
 
@@ -2115,13 +3171,12 @@ describe('SessionService', () => {
         const i = internals();
         const state = { attempts: 0, timer: null, maxAttempts: Number.POSITIVE_INFINITY, baseDelay: 5000 };
         i.reconnectStates.set('sess-uuid-1', state);
+        jest.spyOn(i, 'executeReconnect').mockResolvedValue(undefined);
 
         const attemptsBefore = getSessionReconnectAttemptsTotal();
         const alertsBefore = getSessionReconnectLoopAlertsTotal();
 
-        for (let k = 0; k < 4; k++) {
-          i.scheduleReconnect('sess-uuid-1', createMockSession());
-        }
+        for (let k = 0; k < 4; k++) failedAttempt(i);
 
         expect(state.attempts).toBe(4);
         // One counter tick per scheduled attempt.
@@ -2141,13 +3196,12 @@ describe('SessionService', () => {
         const i = internals();
         const state = { attempts: 0, timer: null, maxAttempts: Number.POSITIVE_INFINITY, baseDelay: 5000 };
         i.reconnectStates.set('sess-uuid-1', state);
+        jest.spyOn(i, 'executeReconnect').mockResolvedValue(undefined);
 
         const attemptsBefore = getSessionReconnectAttemptsTotal();
         const alertsBefore = getSessionReconnectLoopAlertsTotal();
 
-        for (let k = 0; k < 10; k++) {
-          i.scheduleReconnect('sess-uuid-1', createMockSession());
-        }
+        for (let k = 0; k < 10; k++) failedAttempt(i);
 
         expect(getSessionReconnectAttemptsTotal()).toBe(attemptsBefore + 10);
         expect(getSessionReconnectLoopAlertsTotal()).toBe(alertsBefore + 2);
@@ -2167,35 +3221,101 @@ describe('SessionService', () => {
       }
     });
 
-    it('re-arms the alert after READY: the next alert waits 5 fresh attempts', () => {
+    it('re-arms the alert after a stable READY: the next alert waits 5 fresh attempts', () => {
       jest.useFakeTimers();
       try {
         const i = internals();
-        // Four attempts already consumed, then the session reached READY, which resets the budget.
+        // Four attempts already consumed, then the session held READY long enough to reset the budget.
         const state = { attempts: 4, timer: null, maxAttempts: Number.POSITIVE_INFINITY, baseDelay: 5000 };
         i.reconnectStates.set('sess-uuid-1', state);
         (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
         const engine = { getStatus: jest.fn().mockReturnValue(EngineStatus.READY) };
         i.engines.set('sess-uuid-1', engine);
+        jest.spyOn(i, 'executeReconnect').mockResolvedValue(undefined);
 
         const alertsBefore = getSessionReconnectLoopAlertsTotal();
 
         i.handleEngineReady('sess-uuid-1', engine, '628123', 'Tester');
-        for (let k = 0; k < 4; k++) {
-          i.scheduleReconnect('sess-uuid-1', createMockSession());
-        }
+        jest.advanceTimersByTime(STABLE_READY_MS);
+        // The first drop consumes the READY; the three re-init failures after it must not reset again.
+        for (let k = 0; k < 4; k++) failedAttempt(i);
         // Without the reset the very first of these would have been attempt 5 and alerted; instead the
         // streak restarted at 0, so 4 fresh schedules reach only attempt 4 — still no alert.
         expect(state.attempts).toBe(4);
         expect(loopDispatches()).toHaveLength(0);
         expect(getSessionReconnectLoopAlertsTotal()).toBe(alertsBefore);
 
-        i.scheduleReconnect('sess-uuid-1', createMockSession()); // fresh attempt 5 → alert again
+        failedAttempt(i); // fresh attempt 5 → alert again
         expect(state.attempts).toBe(5);
         const calls = loopDispatches();
         expect(calls).toHaveLength(1);
         expect(calls[0][2]).toMatchObject({ sessionId: 'sess-uuid-1', attempts: 5 });
         expect(getSessionReconnectLoopAlertsTotal()).toBe(alertsBefore + 1);
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
+    it('keeps the streak across a READY that drops within the stability window, so a flap still alerts', () => {
+      jest.useFakeTimers();
+      try {
+        const i = internals();
+        const state = { attempts: 0, timer: null, maxAttempts: Number.POSITIVE_INFINITY, baseDelay: 5000 };
+        i.reconnectStates.set('sess-uuid-1', state);
+        (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+        const engine = { getStatus: jest.fn().mockReturnValue(EngineStatus.READY) };
+        i.engines.set('sess-uuid-1', engine);
+        jest.spyOn(i, 'executeReconnect').mockResolvedValue(undefined);
+        const alertsBefore = getSessionReconnectLoopAlertsTotal();
+
+        // Each cycle: the pending attempt fires, the new engine reaches READY, and it drops again before
+        // the window ends (the first one just short of it).
+        const holds = [STABLE_READY_MS - 1, 2_000, 2_000, 2_000];
+        i.scheduleReconnect('sess-uuid-1', createMockSession());
+        for (const hold of holds) {
+          jest.runOnlyPendingTimers();
+          i.handleEngineReady('sess-uuid-1', engine, '628123', 'Tester');
+          jest.advanceTimersByTime(hold);
+          i.scheduleReconnect('sess-uuid-1', createMockSession());
+        }
+
+        expect(state.attempts).toBe(5);
+        const calls = loopDispatches();
+        expect(calls).toHaveLength(1);
+        // Attempt 5 backs off at 5000 * 2^4 (plus under 1s of jitter), not at the base delay.
+        const payload = calls[0][2] as { attempts: number; nextDelayMs: number };
+        expect(payload.attempts).toBe(5);
+        expect(payload.nextDelayMs).toBeGreaterThanOrEqual(80_000);
+        expect(payload.nextDelayMs).toBeLessThan(81_000);
+        expect(getSessionReconnectLoopAlertsTotal()).toBe(alertsBefore + 1);
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
+    // A wedged engine the watchdog reported can recover on its own (Baileys reconnects its socket
+    // internally) before the gateway's backoff elapses. The timer armed for it must not then tear
+    // down the engine that just came back.
+    it('disarms a pending reconnect when the same engine reaches READY, keeping the reconnect state', () => {
+      jest.useFakeTimers();
+      try {
+        const i = internals();
+        const state = { attempts: 0, timer: null, maxAttempts: Number.POSITIVE_INFINITY, baseDelay: 150000 };
+        i.reconnectStates.set('sess-uuid-1', state);
+        (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+        const engine = { getStatus: jest.fn().mockReturnValue(EngineStatus.READY) };
+        i.engines.set('sess-uuid-1', engine);
+        const reconnect = jest.spyOn(i, 'executeReconnect').mockResolvedValue(undefined);
+
+        i.scheduleReconnect('sess-uuid-1', createMockSession());
+        i.handleEngineReady('sess-uuid-1', engine, '628123', 'Tester');
+        jest.advanceTimersByTime(151000);
+
+        expect(reconnect).not.toHaveBeenCalled();
+        expect(state.timer).toBeNull();
+        expect(i.reconnectStates.get('sess-uuid-1')).toBe(state);
       } finally {
         jest.clearAllTimers();
         jest.useRealTimers();
@@ -2241,9 +3361,16 @@ describe('SessionService', () => {
       executeReconnect: (id: string, session: Session, state: unknown) => Promise<void>;
       stoppingSessions: Set<string>;
       engines: Map<string, unknown>;
+      reconnectStates: Map<string, unknown>;
     }
     const internals = (): Internals => lifecycle as unknown as Internals;
-    const reconnectState = { attempts: 1, timer: null, maxAttempts: 5, baseDelay: 5000 };
+    let reconnectState: { attempts: number; timer: null; maxAttempts: number; baseDelay: number };
+
+    beforeEach(() => {
+      // Registered as scheduleReconnect leaves it just before its timer fires executeReconnect.
+      reconnectState = { attempts: 1, timer: null, maxAttempts: 5, baseDelay: 5000 };
+      internals().reconnectStates.set('sess-uuid-1', reconnectState);
+    });
 
     it('does not create an engine when the session was already stopped (early guard)', async () => {
       const i = internals();
@@ -2333,6 +3460,47 @@ describe('SessionService', () => {
       expect(i.engines.has('sess-uuid-1')).toBe(true);
     });
 
+    it('escalates to forceDestroy() when an engine retired during re-init fails its graceful destroy()', async () => {
+      const i = internals();
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      jest
+        .spyOn(lifecycle as unknown as { isSessionRetired: () => Promise<boolean> }, 'isSessionRetired')
+        .mockResolvedValue(true);
+      mockEngine.destroy.mockRejectedValueOnce(new Error('stuck chromium'));
+
+      await i.executeReconnect('sess-uuid-1', createMockSession(), reconnectState);
+
+      expect(mockEngine.forceDestroy).toHaveBeenCalledTimes(1);
+      expect(i.engines.has('sess-uuid-1')).toBe(false);
+    });
+
+    it('does not replace the engine a stop and start registered while it tore down the old engine', async () => {
+      const i = internals();
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      let releaseDestroy: () => void = () => undefined;
+      const old = {
+        destroy: jest.fn(() => new Promise<void>(resolve => (releaseDestroy = resolve))),
+        forceDestroy: jest.fn().mockResolvedValue(undefined),
+        disconnect: jest.fn().mockResolvedValue(undefined),
+      };
+      const started = { ...mockEngine, destroy: jest.fn(), forceDestroy: jest.fn() };
+      const replacement = { ...mockEngine };
+      (engineFactory.create as jest.Mock).mockReturnValueOnce(started).mockReturnValueOnce(replacement);
+      i.engines.set('sess-uuid-1', old);
+      const reconnect = i.executeReconnect('sess-uuid-1', createMockSession(), reconnectState);
+      await new Promise(resolve => setImmediate(resolve));
+      await service.stop('sess-uuid-1');
+      await service.start('sess-uuid-1', { explicit: true });
+      releaseDestroy();
+      await reconnect;
+
+      expect(engineFactory.create).toHaveBeenCalledTimes(1);
+      expect(i.engines.get('sess-uuid-1')).toBe(started);
+      expect(started.destroy).not.toHaveBeenCalled();
+      expect(started.forceDestroy).not.toHaveBeenCalled();
+    });
+
     it('does not stack reconnect timers when scheduled twice back-to-back', () => {
       jest.useFakeTimers();
       try {
@@ -2345,12 +3513,13 @@ describe('SessionService', () => {
         };
         i.reconnectStates.set('sess-uuid-1', { attempts: 0, timer: null, maxAttempts: 5, baseDelay: 5000 });
 
-        // Two disconnect events in a row each schedule a reconnect. The second must clear the
-        // first timer, leaving exactly one pending — otherwise both fire and double-init the engine.
+        // Two disconnect events in a row each schedule a reconnect. The second must leave the first
+        // timer as the only one pending; otherwise both fire and double-init the engine.
         i.scheduleReconnect('sess-uuid-1', createMockSession());
         i.scheduleReconnect('sess-uuid-1', createMockSession());
 
         expect(jest.getTimerCount()).toBe(1);
+        expect(i.reconnectStates.get('sess-uuid-1')?.attempts).toBe(1);
       } finally {
         jest.clearAllTimers();
         jest.useRealTimers();
@@ -2419,6 +3588,26 @@ describe('SessionService', () => {
       for (const state of internals().reconnectStates.values()) if (state.timer) clearTimeout(state.timer);
     });
 
+    it('does not reap a replacement registered while its init ran, nor arm an attempt over it', async () => {
+      // A disconnect of this attempt's engine mid-init re-arms the same state, and the next attempt
+      // registers a replacement before this init rejects. That replacement owns the episode now.
+      const i = internals();
+      const init = deferredInit();
+      const state = armState();
+      const replacement = { ...mockEngine, forceDestroy: jest.fn().mockResolvedValue(undefined) };
+
+      const run = i.executeReconnect(ID, createMockSession(), state);
+      await flush();
+      i.engines.set(ID, replacement as never);
+      init.fail('net::ERR_CONNECTION_RESET');
+      await run;
+      await flush();
+
+      expect(i.engines.get(ID)).toBe(replacement);
+      expect(replacement.forceDestroy).not.toHaveBeenCalled();
+      expect(state.timer).toBeNull();
+    });
+
     it('retries a network rejection: same state re-armed, no FAILED, no session:error, engine evicted once', async () => {
       const i = internals();
       mockEngine.initialize.mockImplementationOnce(failingInit('net::ERR_NAME_NOT_RESOLVED'));
@@ -2436,7 +3625,8 @@ describe('SessionService', () => {
       expect(i.engines.has(ID)).toBe(false);
       expect(i.sessionErrors.get(ID)).toBe('net::ERR_NAME_NOT_RESOLVED');
 
-      // The next attempt succeeds, and READY resets the streak.
+      // The next attempt succeeds. READY records when it happened; the streak itself resets only if
+      // the session then holds READY for the stability window before its next drop.
       clearTimeout(state.timer!);
       let callbacks: EngineEventCallbacks = {};
       mockEngine.initialize.mockImplementationOnce((cb: EngineEventCallbacks) => {
@@ -2447,7 +3637,8 @@ describe('SessionService', () => {
       callbacks.onReady?.('628123', 'Tester');
 
       expect(i.engines.get(ID)).toBe(mockEngine);
-      expect(state.attempts).toBe(0);
+      expect(state.attempts).toBe(2);
+      expect(state.readyAt).toEqual(expect.any(Number));
       expect(failedWrites()).toBe(0);
 
       // Init has settled, so a later failure on the READY session is applied, not parked.
@@ -3572,6 +4763,33 @@ describe('SessionService', () => {
         'Reconnecting after a dropped connection (attempt 5, down for 80s).',
       );
     });
+
+    // Baileys keeps its attempt counter across a READY that lasted under five minutes, so the next
+    // drop can arrive as attempt 5. The time the session spent READY is not downtime.
+    it('measures the downtime from the first drop after the last READY when the attempt count carries across it', async () => {
+      const callbacks = await startAndCapture();
+      const sessionErrors = (service as unknown as { sessionErrors: SessionErrorStore }).sessionErrors;
+      const start = Date.now();
+      const now = jest.spyOn(Date, 'now');
+      try {
+        for (let attempt = 1; attempt <= 4; attempt++) {
+          now.mockReturnValue(start + (attempt - 1) * 5_000);
+          callbacks.onReconnecting?.(attempt, 8_000);
+        }
+        now.mockReturnValue(start + 20_000);
+        callbacks.onReady?.('628123', 'Tester');
+        now.mockReturnValue(start + 4 * 60_000);
+        callbacks.onReconnecting?.(5, 16_000);
+        now.mockReturnValue(start + 4 * 60_000 + 16_000);
+        callbacks.onReconnecting?.(6, 32_000);
+      } finally {
+        now.mockRestore();
+      }
+
+      expect(sessionErrors.get('sess-uuid-1')).toBe(
+        'Reconnecting after a dropped connection (attempt 6, down for 16s).',
+      );
+    });
   });
 
   // A restriction is WhatsApp judging the account, not a fault on our side, so it has its own
@@ -4117,9 +5335,14 @@ describe('SessionService', () => {
       enginesOf().set('sess-uuid-1', { marker: 'engine-B' }); // a newer engine now owns the id
       (repository.update as jest.Mock).mockClear();
       (webhookService.dispatch as jest.Mock).mockClear();
+      (repository.findOne as jest.Mock).mockClear();
 
       callbacks.onDisconnected?.('socket closed');
+      // Every side effect follows the handler's awaited reload; let it run before asserting.
+      await new Promise(resolve => setImmediate(resolve));
 
+      // Only the entry fences stop the reload itself; the post-reload fence is covered below.
+      expect(repository.findOne).not.toHaveBeenCalled();
       expect(repository.update).not.toHaveBeenCalled();
       expect(webhookService.dispatch).not.toHaveBeenCalled();
     });
@@ -4189,6 +5412,23 @@ describe('SessionService', () => {
         jest.clearAllTimers();
         jest.useRealTimers();
       }
+    });
+
+    // better-sqlite3 writes within the arrival's own task, so nothing is held there and the engines
+    // run exactly as before; PostgreSQL inserts asynchronously and gets the arrival tickets.
+    it('offers admitInbound to the engine on PostgreSQL only', async () => {
+      const sqlite = await startAndCapture();
+      expect(sqlite).not.toHaveProperty('admitInbound');
+      await service.stop('sess-uuid-1');
+
+      (messageRepository as unknown as { manager: unknown }).manager = {
+        connection: { options: { type: 'postgres' } },
+      };
+      mockEngine.initialize.mockClear();
+      const postgres = await startAndCapture();
+      const ticket = postgres.admitInbound?.({ id: 'wa-1', chatId: 'peer@c.us', needsRoom: false, status: false });
+      expect(typeof ticket?.reserve).toBe('function');
+      ticket?.drop();
     });
 
     it('ignores onMessage from a superseded engine (no persist, no webhook)', async () => {
@@ -4511,10 +5751,6 @@ describe('SessionService', () => {
       // UNIQUE(sessionId, waMessageId) index dedups against the REST send path, which persists
       // API-originated sends itself (see the unique-race test below).
       const callbacks = await startAndCaptureCallbacks();
-      // Pass the message through the hook chain untouched (the default mock replaces data with {}).
-      (hookManager.execute as jest.Mock).mockImplementation((_e: string, data: unknown) =>
-        Promise.resolve({ continue: true, data }),
-      );
       (messageRepository.insert as jest.Mock).mockClear();
 
       callbacks.onMessageCreate!(makeMessage({ id: 'wa-out-2', from: 'me@c.us', to: 'peer@c.us', fromMe: true }));
@@ -4571,9 +5807,6 @@ describe('SessionService', () => {
       // is today's contract and stays; only storage honors the opt-out.
       process.env.STORE_EPHEMERAL_MESSAGES = 'false';
       const callbacks = await startAndCaptureCallbacks();
-      (hookManager.execute as jest.Mock).mockImplementation((_e: string, data: unknown) =>
-        Promise.resolve({ continue: true, data }),
-      );
       (messageRepository.insert as jest.Mock).mockClear();
 
       callbacks.onMessageCreate!(
@@ -4591,9 +5824,6 @@ describe('SessionService', () => {
       // attaches none and the enrichment around it is best-effort. Without the marker the dashboard
       // renders an empty bubble and the by-type stats filter would skip the row.
       const callbacks = await startAndCaptureCallbacks();
-      (hookManager.execute as jest.Mock).mockImplementation((_e: string, data: unknown) =>
-        Promise.resolve({ continue: true, data }),
-      );
       (messageRepository.create as jest.Mock).mockClear();
 
       callbacks.onMessageCreate!(
@@ -4608,9 +5838,6 @@ describe('SessionService', () => {
 
     it('passes a Baileys-style omitted marker through unchanged', async () => {
       const callbacks = await startAndCaptureCallbacks();
-      (hookManager.execute as jest.Mock).mockImplementation((_e: string, data: unknown) =>
-        Promise.resolve({ continue: true, data }),
-      );
       (messageRepository.create as jest.Mock).mockClear();
       const marker = { mimetype: 'image/png', omitted: true, sizeBytes: 1234 };
 
@@ -4634,10 +5861,6 @@ describe('SessionService', () => {
 
     it('persists the group participant as author (the stable sender id attribution keys on)', async () => {
       const callbacks = await startAndCaptureCallbacks();
-      // Pass the message through the hook chain untouched (the default mock replaces data with {}).
-      (hookManager.execute as jest.Mock).mockImplementation((_e: string, data: unknown) =>
-        Promise.resolve({ continue: true, data }),
-      );
 
       callbacks.onMessage!(
         makeMessage({
@@ -4901,7 +6124,7 @@ describe('SessionService', () => {
 
       expect(messageRepository.save).not.toHaveBeenCalled();
       expect(messageRepository.update).toHaveBeenCalledWith(
-        { sessionId: 'sess-uuid-1', waMessageId: 'wa-1' },
+        expect.objectContaining({ sessionId: 'sess-uuid-1', waMessageId: 'wa-1' }),
         { metadata: { reactions: { alice: '👍' } } },
       );
     });
@@ -5229,9 +6452,9 @@ describe('SessionService', () => {
         ([ev]: unknown[]) => ev === 'message:persisted',
       );
       expect(persistedCalls).toHaveLength(0);
-      // Fail-open: webhook still dispatched so the inbound message is not silently dropped. (The
-      // payload is `{}` here because the hook mock returns `data: {}`; the point is that dispatch
-      // fired at all on a transient DB error — only the message:persisted hook is gated on `persisted`.)
+      // Fail-open: webhook still dispatched so the inbound message is not silently dropped. The point
+      // is that dispatch fired at all on a transient DB error; only the message:persisted hook is
+      // gated on `persisted`.
       expect(webhookService.dispatch).toHaveBeenCalledWith('sess-uuid-1', 'message.received', expect.anything());
     });
 
@@ -5294,17 +6517,9 @@ describe('SessionService', () => {
       expect(messageRepository.insert).not.toHaveBeenCalled();
     });
 
-    // The default hookManager mock returns an empty `data: {}`; echo the message through so the
-    // engine-set fields (isLidSender) survive the hook and reach the inline-resolution branch.
-    const echoHook = () =>
-      (hookManager.execute as jest.Mock).mockImplementation((_event: string, data: unknown) =>
-        Promise.resolve({ continue: true, data }),
-      );
-
     it('attaches senderPhone inline for an @lid sender when RESOLVE_LID_TO_PHONE is on (#263)', async () => {
       process.env.RESOLVE_LID_TO_PHONE = 'true';
       try {
-        echoHook();
         mockEngine.resolveContactPhone.mockResolvedValue('628111222333');
         const callbacks = await startAndCaptureCallbacks();
 
@@ -5329,7 +6544,6 @@ describe('SessionService', () => {
       // if resolvePhone regressed to null for @c.us, senderPhone would be null here.
       process.env.RESOLVE_LID_TO_PHONE = 'true';
       try {
-        echoHook();
         const store = new BaileysSessionStore();
         store.addLidMappings([{ lid: '111@lid', pn: '628111222333@s.whatsapp.net' }]);
         mockEngine.resolveContactPhone.mockImplementation((id: string) => Promise.resolve(store.resolvePhone(id)));
@@ -5352,7 +6566,6 @@ describe('SessionService', () => {
 
     it('does not resolve senderPhone when RESOLVE_LID_TO_PHONE is unset (default off)', async () => {
       delete process.env.RESOLVE_LID_TO_PHONE;
-      echoHook();
       const callbacks = await startAndCaptureCallbacks();
 
       callbacks.onMessage!(makeMessage({ from: '111@lid', chatId: '111@lid', isLidSender: true }));
@@ -5367,7 +6580,6 @@ describe('SessionService', () => {
     it('does not resolve for a normal (non-lid) sender even when the flag is on', async () => {
       process.env.RESOLVE_LID_TO_PHONE = 'true';
       try {
-        echoHook();
         const callbacks = await startAndCaptureCallbacks();
 
         callbacks.onMessage!(makeMessage({ from: 'peer@c.us', chatId: 'peer@c.us' })); // no isLidSender
@@ -5382,7 +6594,6 @@ describe('SessionService', () => {
     it('caches @lid resolution so the same sender is queried only once (#263)', async () => {
       process.env.RESOLVE_LID_TO_PHONE = 'true';
       try {
-        echoHook();
         mockEngine.resolveContactPhone.mockResolvedValue('628111222333');
         const callbacks = await startAndCaptureCallbacks();
 
@@ -5434,7 +6645,7 @@ describe('SessionService', () => {
 
       expect(messageRepository.update as jest.Mock).toHaveBeenCalledWith(
         { sessionId: 'sess-uuid-1', waMessageId: 'ORIGINAL_MSG' },
-        { body: '', type: 'revoked' },
+        { body: '', type: 'revoked', metadata: null, mediaPath: null, mediaMimetype: null },
       );
 
       // The DB flag is an internal side effect; the delivered payload is the public contract
@@ -5465,7 +6676,7 @@ describe('SessionService', () => {
 
       expect(messageRepository.update as jest.Mock).toHaveBeenCalledWith(
         { sessionId: 'sess-uuid-1', waMessageId: 'ORIGINAL_MSG' },
-        { body: '', type: 'revoked' },
+        { body: '', type: 'revoked', metadata: null, mediaPath: null, mediaMimetype: null },
       );
     });
 
@@ -5528,6 +6739,64 @@ describe('SessionService', () => {
       expect(auth).toHaveLength(1);
       expect(auth[0][0]).toBe('sess-uuid-1');
       expect(auth[0][2]).toMatchObject({ sessionId: 'sess-uuid-1', phone: '628123', pushName: 'Alice' });
+    });
+
+    it('re-applies a successful own-presence preference once when the connection opens', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      await service.setOnlinePresence('sess-uuid-1', false);
+      mockEngine.setOnlinePresence.mockClear();
+
+      callbacks.onReady!('628123', 'Alice');
+      await flush();
+
+      expect(mockEngine.setOnlinePresence).toHaveBeenCalledTimes(1);
+      expect(mockEngine.setOnlinePresence).toHaveBeenCalledWith(false);
+    });
+
+    it('re-applies on every later open of the same engine, and keeps the preference after a failed re-apply', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      await service.setOnlinePresence('sess-uuid-1', false);
+      mockEngine.setOnlinePresence.mockClear();
+
+      // A transient reconnect keeps the engine and fires onReady again; the first re-apply fails.
+      mockEngine.setOnlinePresence.mockRejectedValueOnce(new Error('socket closed'));
+      callbacks.onReady!('628123', 'Alice');
+      await flush();
+      callbacks.onReady!('628123', 'Alice');
+      await flush();
+
+      expect(mockEngine.setOnlinePresence).toHaveBeenCalledTimes(2);
+      expect(mockEngine.setOnlinePresence).toHaveBeenNthCalledWith(2, false);
+    });
+
+    it('drops the own-presence preference and chat presence when the engine is replaced', async () => {
+      const first = await startAndCaptureCallbacks();
+      await service.setOnlinePresence('sess-uuid-1', false);
+      first.onPresenceUpdate!({ chatId: 'c@c.us', participants: [{ id: 'c@c.us', state: 'composing' }] });
+      expect(await service.getPresence('sess-uuid-1', 'c@c.us')).not.toBeNull();
+
+      await service.stop('sess-uuid-1');
+      await service.start('sess-uuid-1');
+      const calls = mockEngine.initialize.mock.calls as [EngineEventCallbacks][];
+      expect(calls).toHaveLength(2);
+      mockEngine.setOnlinePresence.mockClear();
+
+      // The replacement engine's first open must not re-publish the previous engine's choice.
+      calls[1][0].onReady!('628123', 'Alice');
+      await flush();
+
+      expect(mockEngine.setOnlinePresence).not.toHaveBeenCalled();
+      expect(await service.getPresence('sess-uuid-1', 'c@c.us')).toBeNull();
+    });
+
+    it('does not publish own presence on ready when the caller never set one', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      mockEngine.setOnlinePresence.mockClear();
+
+      callbacks.onReady!('628123', 'Alice');
+      await flush();
+
+      expect(mockEngine.setOnlinePresence).not.toHaveBeenCalled();
     });
 
     it('does not fetch status history on ready by default', async () => {
@@ -5803,7 +7072,8 @@ describe('SessionService', () => {
       (messageRepository.insert as jest.Mock).mockReset();
       (webhookService.dispatch as jest.Mock).mockClear();
       (messageRepository.insert as jest.Mock)
-        .mockResolvedValueOnce(undefined) // first delivery: new row
+        // first delivery: new row
+        .mockResolvedValueOnce({ identifiers: [{ id: 'gen-uuid-1' }], generatedMaps: [], raw: undefined })
         .mockRejectedValueOnce({
           driverError: { code: 'SQLITE_CONSTRAINT_UNIQUE', message: 'UNIQUE constraint failed' },
         }); // re-fire
@@ -5828,6 +7098,9 @@ describe('SessionService', () => {
       expect(messageRepository.insert).toHaveBeenCalledTimes(2);
       expect(
         ((webhookService.dispatch as jest.Mock).mock.calls as unknown[][]).filter(c => c[1] === 'message.received'),
+      ).toHaveLength(1);
+      expect(
+        ((hookManager.execute as jest.Mock).mock.calls as unknown[][]).filter(c => c[0] === 'message:persisted'),
       ).toHaveLength(1);
     });
 
@@ -5893,15 +7166,55 @@ describe('SessionService', () => {
         expect(messageRepository.save).not.toHaveBeenCalled(); // no longer the throwing path
       });
 
+      it('stops a history backfill whose engine retired mid-batch, so a session delete leaves no orphan rows', async () => {
+        const callbacks = await startAndCaptureCallbacks();
+        const execute = jest.fn().mockResolvedValue({ identifiers: [] });
+        const qb = {
+          insert: jest.fn().mockReturnThis(),
+          values: jest.fn().mockReturnThis(),
+          orIgnore: jest.fn().mockReturnThis(),
+          execute,
+        };
+        (messageRepository.createQueryBuilder as jest.Mock) = jest.fn().mockReturnValue(qb);
+        (messageRepository.create as jest.Mock).mockImplementation((data: Record<string, unknown>) => ({ ...data }));
+        // delete() tears the engine down while the de-dup query is in flight.
+        (messageRepository.find as jest.Mock).mockImplementation(() => {
+          registry.delete('sess-uuid-1');
+          return Promise.resolve([]);
+        });
+
+        callbacks.onHistoryMessages?.([
+          {
+            id: 'h1',
+            from: 'peer@c.us',
+            to: 'me@c.us',
+            chatId: 'peer@c.us',
+            body: 'old',
+            type: 'text',
+            timestamp: 1,
+            fromMe: false,
+            isGroup: false,
+            kind: 'individual',
+          },
+        ]);
+        await flush();
+
+        expect(messageRepository.find).toHaveBeenCalled();
+        expect(execute).not.toHaveBeenCalled();
+      });
+
       it('persists author only for inbound history rows, never for the account’s own (fromMe) posts', async () => {
         // The Baileys history sync includes the account's own group messages (with author = self);
         // those must land with author NULL to keep the column's "null on outgoing" contract.
         const callbacks = await startAndCaptureCallbacks();
-        const created: Array<Record<string, unknown>> = [];
-        (messageRepository.create as jest.Mock).mockImplementation((data: Record<string, unknown>) => {
-          created.push(data);
-          return { ...data };
-        });
+        const qb = {
+          insert: jest.fn().mockReturnThis(),
+          values: jest.fn().mockReturnThis(),
+          orIgnore: jest.fn().mockReturnThis(),
+          execute: jest.fn().mockResolvedValue({ identifiers: [] }),
+        };
+        (messageRepository.createQueryBuilder as jest.Mock) = jest.fn().mockReturnValue(qb);
+        (messageRepository.create as jest.Mock).mockImplementation((data: Record<string, unknown>) => ({ ...data }));
         (messageRepository.find as jest.Mock).mockResolvedValue([]); // nothing pre-seen
 
         const histMsg = (over: Partial<IncomingMessage>): IncomingMessage => ({
@@ -5923,7 +7236,9 @@ describe('SessionService', () => {
         ]);
         await flush();
 
-        const byId = new Map(created.map(r => [r.waMessageId as string, r]));
+        expect(qb.execute).toHaveBeenCalled();
+        const rows = (qb.values.mock.calls as unknown[][])[0][0] as Array<Record<string, unknown>>;
+        const byId = new Map(rows.map(r => [r.waMessageId as string, r]));
         expect(byId.get('h-in')?.author).toBe('628111@c.us');
         expect(byId.get('h-out')?.author).toBeUndefined();
       });
@@ -6335,21 +7650,6 @@ describe('SessionService', () => {
     });
   });
 
-  describe('getGroups pagination', () => {
-    it('caps an unbounded group list at the default limit (1000)', async () => {
-      const session = createMockSession();
-      (repository.findOne as jest.Mock).mockResolvedValue(session);
-      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
-      await service.start('sess-uuid-1');
-
-      const groups = Array.from({ length: 1500 }, (_, i) => ({ id: `g${i}`, name: `G${i}` }));
-      mockEngine.getGroups.mockResolvedValue(groups);
-
-      const result = await service.getGroups('sess-uuid-1');
-      expect(result).toHaveLength(1000);
-    });
-  });
-
   describe('start() concurrent stop/delete guard', () => {
     it('tears down the just-initialized engine if a stop/delete lands during start() (no resurrection to READY)', async () => {
       const session = createMockSession();
@@ -6369,6 +7669,21 @@ describe('SessionService', () => {
       expect(service.getEngine('sess-uuid-1')).toBeUndefined();
       // A stop() retirement must NOT purge: the row (and its credentials) is meant to survive.
       expect(engineFactory.purgeSessionData).not.toHaveBeenCalled();
+    });
+
+    it('escalates to forceDestroy() when the retired engine fails its graceful destroy()', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      mockEngine.destroy.mockRejectedValueOnce(new Error('stuck chromium'));
+      mockEngine.initialize.mockImplementationOnce(() => {
+        (lifecycle as unknown as { stoppingSessions: Set<string> }).stoppingSessions.add('sess-uuid-1');
+        return Promise.resolve();
+      });
+
+      await service.start('sess-uuid-1');
+
+      expect(mockEngine.forceDestroy).toHaveBeenCalledTimes(1);
+      expect(service.getEngine('sess-uuid-1')).toBeUndefined();
     });
 
     it('tears down the just-initialized engine if the session is deleted during start() (row gone, mark cleared)', async () => {
@@ -6450,6 +7765,28 @@ describe('SessionService', () => {
       expect(mockEngine.destroy).toHaveBeenCalled();
       expect(engineFactory.purgeSessionData).toHaveBeenCalledWith('sess-uuid-1');
       expect(engineFactory.purgeSessionData).not.toHaveBeenCalledWith('sess-uuid-2');
+    });
+
+    it('keeps the DISCONNECTED a stop wrote while start() awaited session:starting', async () => {
+      // The stop finds no engine yet, so nothing fences its write: an engine registered after it
+      // would overwrite the row with INITIALIZING and then retire, leaving a stopped session that
+      // reads as starting, with no engine, until the next boot.
+      const row = createMockSession({ status: SessionStatus.DISCONNECTED });
+      (repository.findOne as jest.Mock).mockImplementation(() => Promise.resolve({ ...row }));
+      (repository.update as jest.Mock).mockImplementation((_where: unknown, patch: Partial<Session>) => {
+        Object.assign(row, patch);
+        return Promise.resolve({ affected: 1 });
+      });
+      (hookManager.execute as jest.Mock).mockImplementation(async (event: string) => {
+        if (event === 'session:starting') await service.stop('sess-uuid-1');
+        return { continue: true, data: {} };
+      });
+
+      await service.start('sess-uuid-1');
+
+      expect(row).toMatchObject({ status: SessionStatus.DISCONNECTED, desiredState: 'stopped' });
+      expect(engineFactory.create).not.toHaveBeenCalled();
+      expect(service.getEngine('sess-uuid-1')).toBeUndefined();
     });
 
     it('does not purge anything on a normal start (session row present throughout)', async () => {
@@ -6568,6 +7905,162 @@ describe('SessionService', () => {
     });
   });
 
+  // ── stored copies of a cleared or deleted chat ────────────────────
+
+  describe('clearChatMessages / deleteChat: stored message removal', () => {
+    const rows = (n: number, from = 0) =>
+      Array.from({ length: n }, (_, i) => ({
+        id: `row-${from + i}`,
+        waMessageId: `wa-${from + i}`,
+        chatId: '123@c.us',
+        sessionId: 'sess-uuid-1',
+      }));
+    const deletedHooks = (): unknown[][] =>
+      ((hookManager.execute as jest.Mock).mock.calls as unknown[][]).filter(([e]) => e === 'message:deleted');
+
+    beforeEach(async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      messageRepository.delete = jest.fn().mockResolvedValue({ affected: 1 });
+      await service.start('sess-uuid-1');
+      (hookManager.execute as jest.Mock).mockClear();
+    });
+
+    it.each([
+      ['clearChatMessages', (id: string, chat: string) => service.clearChatMessages(id, chat)],
+      ['deleteChat', (id: string, chat: string) => service.deleteChat(id, chat)],
+    ] as const)('%s removes the rows of every id form of the chat and emits message:deleted', async (_, run) => {
+      (lidMappingStore.findLidsForPhone as jest.Mock).mockResolvedValue(['999']);
+      (messageRepository.find as jest.Mock).mockResolvedValueOnce(rows(2));
+
+      await expect(run('sess-uuid-1', '123@c.us')).resolves.toBe(true);
+
+      const [[{ where }]] = (messageRepository.find as jest.Mock).mock.calls as [[{ where: Record<string, unknown> }]];
+      expect(where).toEqual({
+        sessionId: 'sess-uuid-1',
+        chatId: In(['123@c.us', '123@s.whatsapp.net', '999@lid']),
+        createdAt: LessThanOrEqual(expect.any(Date)),
+      });
+      expect(messageRepository.delete).toHaveBeenCalledWith({ id: In(['row-0', 'row-1']) });
+      expect(deletedHooks()).toEqual([
+        ['message:deleted', { sessionId: 'sess-uuid-1', message: rows(1)[0] }, expect.anything()],
+        ['message:deleted', { sessionId: 'sess-uuid-1', message: rows(1, 1)[0] }, expect.anything()],
+      ]);
+    });
+
+    it('a group chat removes only its literal id', async () => {
+      await service.clearChatMessages('sess-uuid-1', '1234567890-123@g.us');
+
+      const [[{ where }]] = (messageRepository.find as jest.Mock).mock.calls as [[{ where: Record<string, unknown> }]];
+      expect(where).toMatchObject({ sessionId: 'sess-uuid-1', chatId: In(['1234567890-123@g.us']) });
+      expect(lidMappingStore.findLidsForPhone).not.toHaveBeenCalled();
+    });
+
+    // A busy chat keeps storing messages while the batches run. Those arrived after the clear and
+    // still exist on WhatsApp, so every batch is bounded by a cutoff taken before the engine call.
+    it.each([
+      ['clearChatMessages', 'clearChatMessages', (id: string, chat: string) => service.clearChatMessages(id, chat)],
+      ['deleteChat', 'deleteChat', (id: string, chat: string) => service.deleteChat(id, chat)],
+    ] as const)('%s keeps messages stored after the engine call', async (_, method, run) => {
+      let engineCalledAt = 0;
+      mockEngine[method].mockImplementationOnce(async () => {
+        engineCalledAt = Date.now();
+        await new Promise(resolve => setTimeout(resolve, 5));
+        return true;
+      });
+      (messageRepository.find as jest.Mock).mockResolvedValueOnce(rows(500)).mockResolvedValueOnce(rows(3, 500));
+
+      await run('sess-uuid-1', '123@c.us');
+
+      const calls = (messageRepository.find as jest.Mock).mock.calls as [{ where: { createdAt: unknown } }][];
+      expect(calls).toHaveLength(2);
+      const bounds = calls.map(([{ where }]) => where.createdAt as { value: Date });
+      for (const bound of bounds) {
+        expect(bound).toEqual(LessThanOrEqual(expect.any(Date)));
+        expect(bound.value.getTime()).toBeLessThanOrEqual(engineCalledAt);
+      }
+      expect(bounds[1].value).toBe(bounds[0].value);
+    });
+
+    // SQLite stores createdAt as whole seconds and compares it as text against the bound parameter,
+    // so a millisecond cutoff would also match a row stored later in the cutoff's own second.
+    describe('against a real database', () => {
+      let db: DataSource;
+      let messages: Repository<Message>;
+
+      beforeAll(async () => {
+        db = new DataSource({ type: 'better-sqlite3', database: ':memory:', entities: [Message], synchronize: true });
+        await db.initialize();
+        messages = db.getRepository(Message);
+      });
+
+      afterAll(async () => {
+        await db.destroy();
+      });
+
+      afterEach(() => {
+        jest.useRealTimers();
+      });
+
+      it("keeps a row stored in the cutoff's own second and removes the ones before it", async () => {
+        const seed = async (waMessageId: string, createdAt: string): Promise<void> => {
+          await messages.insert({ sessionId: 'sess-uuid-1', chatId: '123@c.us', from: 'a', to: 'b', waMessageId });
+          await messages.update({ waMessageId }, { createdAt: () => `'${createdAt}'` });
+        };
+        await seed('before', '2026-09-29 13:39:00');
+        Object.assign(service as unknown as Record<string, unknown>, { messageRepository: messages });
+        // Only the clock is frozen, so the cutoff lands mid-second; the driver still needs real timers.
+        jest.useFakeTimers({
+          now: Date.parse('2026-09-29T13:39:01.500Z'),
+          doNotFake: ['nextTick', 'queueMicrotask', 'setImmediate', 'clearImmediate', 'setTimeout', 'clearTimeout'],
+        });
+        mockEngine.clearChatMessages.mockImplementationOnce(async () => {
+          await seed('after', '2026-09-29 13:39:01');
+          return true;
+        });
+
+        await expect(service.clearChatMessages('sess-uuid-1', '123@c.us')).resolves.toBe(true);
+
+        expect((await messages.find()).map(row => row.waMessageId)).toEqual(['after']);
+      });
+    });
+
+    it('removes in batches until a short one', async () => {
+      (messageRepository.find as jest.Mock).mockResolvedValueOnce(rows(500)).mockResolvedValueOnce(rows(3, 500));
+
+      await service.deleteChat('sess-uuid-1', '123@c.us');
+
+      expect(messageRepository.find).toHaveBeenCalledTimes(2);
+      expect(messageRepository.delete).toHaveBeenCalledTimes(2);
+      expect(deletedHooks()).toHaveLength(503);
+    });
+
+    it('keeps the stored rows when the engine declines or fails', async () => {
+      mockEngine.clearChatMessages.mockResolvedValueOnce(false);
+      await expect(service.clearChatMessages('sess-uuid-1', '123@c.us')).resolves.toBe(false);
+
+      mockEngine.deleteChat.mockRejectedValueOnce(new Error('timed out'));
+      await expect(service.deleteChat('sess-uuid-1', '123@c.us')).rejects.toThrow('timed out');
+
+      expect(messageRepository.find).not.toHaveBeenCalled();
+      expect(messageRepository.delete).not.toHaveBeenCalled();
+      expect(deletedHooks()).toHaveLength(0);
+    });
+
+    it('a failed removal after the engine succeeded is logged and the call still succeeds', async () => {
+      (messageRepository.find as jest.Mock).mockRejectedValueOnce(new Error('db down'));
+      const logError = jest.spyOn((service as unknown as { logger: { error: jest.Mock } }).logger, 'error');
+
+      await expect(service.clearChatMessages('sess-uuid-1', '123@c.us')).resolves.toBe(true);
+
+      expect(logError).toHaveBeenCalledWith(
+        expect.any(String),
+        'db down',
+        expect.objectContaining({ action: 'chat_local_purge_failed' }),
+      );
+    });
+  });
+
   // ── sendChatState (typing/recording/paused) ───────────────────────
 
   describe('sendChatState', () => {
@@ -6581,6 +8074,21 @@ describe('SessionService', () => {
       await service.sendChatState('sess-uuid-1', '123@c.us', 'typing');
 
       expect(mockEngine.sendChatState).toHaveBeenCalledWith('123@c.us', 'typing');
+    });
+
+    it('does not publish global presence when a chat indicator is cleared', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.start('sess-uuid-1');
+      await service.setOnlinePresence('sess-uuid-1', true);
+      mockEngine.setOnlinePresence.mockClear();
+
+      await service.sendChatState('sess-uuid-1', '123@c.us', 'paused');
+
+      expect(mockEngine.sendChatState).toHaveBeenCalledWith('123@c.us', 'paused');
+      expect(mockEngine.setOnlinePresence).not.toHaveBeenCalled();
     });
 
     it('should throw BadRequestException when session is not started', async () => {
@@ -6612,6 +8120,24 @@ describe('SessionService', () => {
 
       await expect(service.setOnlinePresence('sess-uuid-1', true)).rejects.toThrow(BadRequestException);
     });
+
+    it('does not remember a preference the engine refused to publish', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.start('sess-uuid-1');
+      mockEngine.setOnlinePresence.mockRejectedValueOnce(new Error('no name'));
+
+      await expect(service.setOnlinePresence('sess-uuid-1', true)).rejects.toThrow('no name');
+
+      mockEngine.setOnlinePresence.mockClear();
+      const callbacks = (mockEngine.initialize.mock.calls as [EngineEventCallbacks][])[0][0];
+      callbacks.onReady!('628123', 'Alice');
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(mockEngine.setOnlinePresence).not.toHaveBeenCalled();
+    });
   });
 
   // ── onMessageRevoked (no localized string) ────────────────────────
@@ -6642,14 +8168,13 @@ describe('SessionService', () => {
       };
 
       callbacks.onMessageRevoked(revoked);
-      // Allow the queued microtask (repository.update().then()) to resolve.
-      await Promise.resolve();
-      await Promise.resolve();
+      // Allow the queued revoke on the message's mutation chain to run.
+      await new Promise(resolve => setImmediate(resolve));
 
       // The stored update must carry an EMPTY body and the 'revoked' type — no display string.
       expect(messageRepository.update).toHaveBeenCalledWith(
         { sessionId: 'sess-uuid-1', waMessageId: 'WA_MSG_1' },
-        { body: '', type: 'revoked' },
+        { body: '', type: 'revoked', metadata: null, mediaPath: null, mediaMimetype: null },
       );
 
       // The structured payload emitted to clients must not contain any localized text.
@@ -6708,7 +8233,7 @@ describe('SessionService', () => {
       await new Promise(resolve => setImmediate(resolve));
 
       expect(messageRepository.update).toHaveBeenCalledWith(
-        { sessionId: 'sess-uuid-1', waMessageId: 'WA_MSG_EDIT_1' },
+        { sessionId: 'sess-uuid-1', waMessageId: 'WA_MSG_EDIT_1', type: Not('revoked') },
         { body: 'New edited text' },
       );
       expect(eventsGateway.emitMessageEdited).not.toHaveBeenCalled();
@@ -7092,6 +8617,22 @@ describe('SessionService', () => {
       }
     });
 
+    // The caller is a third party; callId already ties the log line to the call.received event.
+    it("logs the incoming call without the caller's number", async () => {
+      const onCall = await startAndCaptureCallCallback();
+      const logger = (lifecycle as unknown as { logger: { log: () => void } }).logger;
+      const log = jest.spyOn(logger, 'log');
+
+      try {
+        onCall(callEvent({ from: '628111@c.us' }));
+
+        expect(log).toHaveBeenCalledWith('Incoming call', expect.objectContaining({ callId: 'CALL1' }));
+        expect(JSON.stringify(log.mock.calls)).not.toContain('628111');
+      } finally {
+        log.mockRestore();
+      }
+    });
+
     it('drops the event when it arrives from a stale (superseded) engine', async () => {
       const onCall = await startAndCaptureCallCallback({ autoRejectCalls: true });
       // A newer engine now owns the id (restart/reconnect window): the captured callback is stale.
@@ -7123,6 +8664,42 @@ describe('SessionService', () => {
       await service.start('sess-uuid-1');
 
       expect(service.isActive('sess-uuid-1')).toBe(true);
+    });
+  });
+
+  // A list or stats read is answered by whichever node the load balancer picked, while the lifecycle
+  // routes are forwarded to the owner: a session a live peer runs is loaded as far as a client can act.
+  describe('engineLoaded', () => {
+    const withOwnership = (): void => {
+      const ownership = new SessionOwnershipService(
+        {} as Repository<Session>,
+        {
+          get: (key: string) => ({ 'session.nodeId': 'node-a' })[key],
+        } as unknown as ConfigService,
+      );
+      Object.assign(service as unknown as Record<string, unknown>, { ownership });
+    };
+    // Evaluated per test: a lease computed at collection time can lapse before a slow run reaches it.
+    const live = (): Date => new Date(Date.now() + 60_000);
+
+    it('is true for a session a peer node holds on a live lease, with no engine here', () => {
+      withOwnership();
+      const row = createMockSession({ nodeId: 'node-b', leaseExpiresAt: live() });
+      expect(service.isActive(row.id)).toBe(false);
+      expect(service.engineLoaded(row)).toBe(true);
+    });
+
+    it('is false for a lapsed peer claim, and for this node’s own claim without an engine', () => {
+      withOwnership();
+      expect(service.engineLoaded(createMockSession({ nodeId: 'node-b', leaseExpiresAt: new Date(0) }))).toBe(false);
+      expect(service.engineLoaded(createMockSession({ nodeId: 'node-a', leaseExpiresAt: live() }))).toBe(false);
+    });
+
+    it('is true for this process’s own engine', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      await service.start('sess-uuid-1');
+      expect(service.engineLoaded(createMockSession())).toBe(true);
     });
   });
 
@@ -7169,6 +8746,813 @@ describe('SessionService', () => {
 
       expect(mockEngine.destroy).toHaveBeenCalled();
       expect(service.isActive('sess-uuid-1')).toBe(false);
+    });
+
+    it('refuses a start still on its way to the engine when shutdown tears the engines down', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      let releaseHook: () => void = () => undefined;
+      const hookHeld = new Promise<void>(resolve => {
+        (hookManager.execute as jest.Mock).mockImplementationOnce(
+          (_e: string, data: unknown) =>
+            new Promise(done => {
+              releaseHook = () => done({ continue: true, data });
+              resolve();
+            }),
+        );
+      });
+
+      const start = service.start('sess-uuid-1');
+      await hookHeld;
+      await service.onModuleDestroy();
+      releaseHook();
+
+      await expect(start).rejects.toMatchObject({ status: 503 });
+      expect(engineFactory.create).not.toHaveBeenCalled();
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+    });
+
+    it('refuses a start that arrives after shutdown before it clears a stop or runs the hook', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ desiredState: 'stopped' }));
+      await service.onModuleDestroy();
+
+      await expect(service.start('sess-uuid-1', { explicit: true })).rejects.toMatchObject({ status: 503 });
+      expect(hookManager.execute).not.toHaveBeenCalled();
+      expect((repository.update as jest.Mock).mock.calls).not.toContainEqual([
+        { id: 'sess-uuid-1', desiredState: 'stopped' },
+        { desiredState: null },
+      ]);
+      expect(engineFactory.create).not.toHaveBeenCalled();
+    });
+
+    // The drain (readiness 503) starts SHUTDOWN_DELAY_MS before onModuleDestroy, which would tear down
+    // an engine launched in between.
+    it('refuses a start from the start of the shutdown drain, before teardown', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ desiredState: 'stopped' }));
+      shutdown.markShuttingDown();
+
+      await expect(service.start('sess-uuid-1', { explicit: true })).rejects.toBeInstanceOf(
+        ServerShuttingDownException,
+      );
+      expect(hookManager.execute).not.toHaveBeenCalled();
+      expect(repository.update as jest.Mock).not.toHaveBeenCalled();
+      expect(engineFactory.create).not.toHaveBeenCalled();
+    });
+
+    it('does not initialize an engine whose first status write settles while shutdown destroys it', async () => {
+      const flush = async (): Promise<void> => {
+        for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve));
+      };
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      let releaseWrite: () => void = () => undefined;
+      (repository.update as jest.Mock).mockImplementation((_id: unknown, patch: { status?: SessionStatus }) =>
+        patch?.status === SessionStatus.INITIALIZING
+          ? new Promise(resolve => (releaseWrite = () => resolve({ affected: 1 })))
+          : Promise.resolve({ affected: 1 }),
+      );
+      let releaseDestroy: () => void = () => undefined;
+      mockEngine.destroy.mockImplementationOnce(() => new Promise<void>(resolve => (releaseDestroy = resolve)));
+
+      const start = service.start('sess-uuid-1').catch((error: unknown) => error);
+      await flush();
+      expect(engineFactory.create).toHaveBeenCalledTimes(1);
+      const shutdown = service.onModuleDestroy();
+      await flush();
+      expect(mockEngine.destroy).toHaveBeenCalledTimes(1);
+      releaseWrite();
+      await flush();
+      releaseDestroy();
+      await shutdown;
+
+      expect(await start).toBeInstanceOf(ServerShuttingDownException);
+      expect(mockEngine.initialize).not.toHaveBeenCalled();
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+      // Left INITIALIZING for the next boot's reset, never FAILED.
+      expect((repository.update as jest.Mock).mock.calls).not.toContainEqual([
+        expect.anything(),
+        expect.objectContaining({ status: SessionStatus.FAILED }),
+      ]);
+    });
+
+    it('answers 503 for a start whose engine finished initializing as shutdown began', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      let releaseInit: () => void = () => undefined;
+      const initHeld = new Promise<void>(resolve => {
+        mockEngine.initialize.mockImplementationOnce(
+          () =>
+            new Promise<void>(done => {
+              releaseInit = done;
+              resolve();
+            }),
+        );
+      });
+      // The init settles inside shutdown's destroy, as an adapter does when teardown cuts it short.
+      mockEngine.destroy.mockImplementationOnce(() => {
+        releaseInit();
+        return Promise.resolve();
+      });
+
+      const start = service.start('sess-uuid-1').catch((error: unknown) => error);
+      await initHeld;
+      await service.onModuleDestroy();
+
+      expect(await start).toBeInstanceOf(ServerShuttingDownException);
+      expect(mockEngine.forceDestroy).not.toHaveBeenCalled();
+    });
+
+    it('refuses a start that shutdown overtakes during its reads before it clears a stop or runs the hook', async () => {
+      const stopped = createMockSession({ desiredState: 'stopped' });
+      let releaseRead: () => void = () => undefined;
+      const readHeld = new Promise<void>(resolve => {
+        (repository.findOne as jest.Mock).mockImplementationOnce(
+          () =>
+            new Promise(done => {
+              releaseRead = () => done(stopped);
+              resolve();
+            }),
+        );
+      });
+      (repository.findOne as jest.Mock).mockResolvedValue(stopped);
+
+      const start = service.start('sess-uuid-1', { explicit: true }).catch((error: unknown) => error);
+      await readHeld;
+      await service.onModuleDestroy();
+      releaseRead();
+
+      expect(await start).toBeInstanceOf(ServerShuttingDownException);
+      expect(hookManager.execute).not.toHaveBeenCalled();
+      expect((repository.update as jest.Mock).mock.calls).not.toContainEqual([
+        { id: 'sess-uuid-1', desiredState: 'stopped' },
+        { desiredState: null },
+      ]);
+      expect(engineFactory.create).not.toHaveBeenCalled();
+    });
+
+    it('does not run the hook for a start that shutdown overtakes while it clears a stop', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ desiredState: 'stopped' }));
+      let releaseClear: () => void = () => undefined;
+      const clearHeld = new Promise<void>(resolve => {
+        (repository.update as jest.Mock).mockImplementationOnce(
+          () =>
+            new Promise(done => {
+              releaseClear = () => done({ affected: 1 });
+              resolve();
+            }),
+        );
+      });
+
+      const start = service.start('sess-uuid-1', { explicit: true }).catch((error: unknown) => error);
+      await clearHeld;
+      await service.onModuleDestroy();
+      releaseClear();
+
+      expect(await start).toBeInstanceOf(ServerShuttingDownException);
+      expect(repository.update).toHaveBeenCalledWith(
+        { id: 'sess-uuid-1', desiredState: 'stopped' },
+        { desiredState: null },
+      );
+      expect(hookManager.execute).not.toHaveBeenCalled();
+      expect(engineFactory.create).not.toHaveBeenCalled();
+    });
+
+    it('answers a start as the stop that landed during its reads even when shutdown began too', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValueOnce(createMockSession());
+      let releaseRead: () => void = () => undefined;
+      const readHeld = new Promise<void>(resolve => {
+        (repository.findOne as jest.Mock).mockImplementationOnce(
+          () =>
+            new Promise(done => {
+              releaseRead = () => done(createMockSession({ desiredState: 'stopped' }));
+              resolve();
+            }),
+        );
+      });
+
+      const start = service.start('sess-uuid-1', { explicit: true }).catch((error: unknown) => error);
+      await readHeld;
+      await service.onModuleDestroy();
+      releaseRead();
+
+      expect(await start).toBeInstanceOf(SessionStoppedException);
+      expect(hookManager.execute).not.toHaveBeenCalled();
+      expect((repository.update as jest.Mock).mock.calls).not.toContainEqual([
+        { id: 'sess-uuid-1', desiredState: 'stopped' },
+        { desiredState: null },
+      ]);
+    });
+
+    it('answers a start as a stop marked during its last read, not 503, when shutdown began too', async () => {
+      const marks = (lifecycle as unknown as { stoppingSessions: Set<string> }).stoppingSessions;
+      (repository.findOne as jest.Mock).mockResolvedValueOnce(createMockSession());
+      let releaseRead: () => void = () => undefined;
+      const readHeld = new Promise<void>(resolve => {
+        (repository.findOne as jest.Mock).mockImplementationOnce(
+          () =>
+            new Promise(done => {
+              releaseRead = () => done(createMockSession());
+              resolve();
+            }),
+        );
+      });
+
+      const start = service.start('sess-uuid-1').catch((error: unknown) => error);
+      await readHeld;
+      // The stop has set its mark but not yet written the row.
+      marks.add('sess-uuid-1');
+      await service.onModuleDestroy();
+      releaseRead();
+
+      expect(await start).toBeInstanceOf(SessionStoppedException);
+      expect(hookManager.execute).not.toHaveBeenCalled();
+      expect(engineFactory.create).not.toHaveBeenCalled();
+    });
+
+    it('answers a start as a stop marked while it clears a stop, not 503, when shutdown began too', async () => {
+      const marks = (lifecycle as unknown as { stoppingSessions: Set<string> }).stoppingSessions;
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ desiredState: 'stopped' }));
+      let releaseClear: () => void = () => undefined;
+      const clearHeld = new Promise<void>(resolve => {
+        (repository.update as jest.Mock).mockImplementationOnce(
+          () =>
+            new Promise(done => {
+              releaseClear = () => done({ affected: 1 });
+              resolve();
+            }),
+        );
+      });
+
+      const start = service.start('sess-uuid-1', { explicit: true }).catch((error: unknown) => error);
+      await clearHeld;
+      marks.add('sess-uuid-1');
+      await service.onModuleDestroy();
+      releaseClear();
+
+      expect(await start).toBeInstanceOf(SessionStoppedException);
+      expect(hookManager.execute).not.toHaveBeenCalled();
+      expect(engineFactory.create).not.toHaveBeenCalled();
+    });
+
+    it('answers a start retired by a stop during init as the stop, not 503, when shutdown began too', async () => {
+      const marks = (lifecycle as unknown as { stoppingSessions: Set<string> }).stoppingSessions;
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      let releaseInit: () => void = () => undefined;
+      const initHeld = new Promise<void>(resolve => {
+        mockEngine.initialize.mockImplementationOnce(
+          () =>
+            new Promise<void>(done => {
+              marks.add('sess-uuid-1');
+              releaseInit = done;
+              resolve();
+            }),
+        );
+      });
+      mockEngine.destroy.mockImplementationOnce(() => {
+        releaseInit();
+        return Promise.resolve();
+      });
+
+      const start = service.start('sess-uuid-1').catch((error: unknown) => error);
+      await initHeld;
+      await service.onModuleDestroy();
+
+      expect(await start).toMatchObject({ id: 'sess-uuid-1' });
+    });
+
+    it('answers a start retired by a stop during its hook as the stop, not 503, when shutdown began too', async () => {
+      const marks = (lifecycle as unknown as { stoppingSessions: Set<string> }).stoppingSessions;
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      let shutdown: Promise<void> = Promise.resolve();
+      (hookManager.execute as jest.Mock).mockImplementationOnce((_e: string, data: unknown) => {
+        marks.add('sess-uuid-1');
+        shutdown = service.onModuleDestroy();
+        return Promise.resolve({ continue: true, data });
+      });
+
+      const start = service.start('sess-uuid-1').catch((error: unknown) => error);
+      const outcome = await start;
+      await shutdown;
+
+      expect(outcome).toMatchObject({ id: 'sess-uuid-1' });
+      expect(engineFactory.create).not.toHaveBeenCalled();
+    });
+
+    it('keeps the adapter error of a start a stop retired during a failed init, not 503, when shutdown began too', async () => {
+      const marks = (lifecycle as unknown as { stoppingSessions: Set<string> }).stoppingSessions;
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      let rejectInit: (error: Error) => void = () => undefined;
+      const initHeld = new Promise<void>(resolve => {
+        mockEngine.initialize.mockImplementationOnce(
+          () =>
+            new Promise<void>((_done, reject) => {
+              marks.add('sess-uuid-1');
+              rejectInit = reject;
+              resolve();
+            }),
+        );
+      });
+      mockEngine.destroy.mockImplementationOnce(() => {
+        rejectInit(new Error('Target closed'));
+        return Promise.resolve();
+      });
+
+      const start = service.start('sess-uuid-1').catch((error: unknown) => error);
+      await initHeld;
+      await service.onModuleDestroy();
+
+      const outcome = await start;
+      expect(outcome).not.toBeInstanceOf(ServerShuttingDownException);
+      expect(outcome).toMatchObject({ message: 'Target closed' });
+    });
+
+    it('does not initialize a reconnect engine whose first status write settles while shutdown destroys it', async () => {
+      const flush = async (): Promise<void> => {
+        for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve));
+      };
+      let releaseWrite: () => void = () => undefined;
+      (repository.update as jest.Mock).mockImplementation((_id: unknown, patch: { status?: SessionStatus }) =>
+        patch?.status === SessionStatus.INITIALIZING
+          ? new Promise(resolve => (releaseWrite = () => resolve({ affected: 1 })))
+          : Promise.resolve({ affected: 1 }),
+      );
+      let releaseDestroy: () => void = () => undefined;
+      mockEngine.destroy.mockImplementationOnce(() => new Promise<void>(resolve => (releaseDestroy = resolve)));
+      const internals = lifecycle as unknown as {
+        reconnectStates: Map<string, ReconnectState>;
+        executeReconnect: (id: string, session: Session, state: ReconnectState) => Promise<void>;
+      };
+      const state: ReconnectState = { attempts: 1, timer: null, maxAttempts: 5, baseDelay: 5000 };
+      internals.reconnectStates.set('sess-uuid-1', state);
+
+      const reconnect = internals.executeReconnect('sess-uuid-1', createMockSession(), state);
+      await flush();
+      expect(engineFactory.create).toHaveBeenCalledTimes(1);
+      const shutdown = service.onModuleDestroy();
+      await flush();
+      expect(mockEngine.destroy).toHaveBeenCalledTimes(1);
+      releaseWrite();
+      await flush();
+      releaseDestroy();
+      await shutdown;
+      await reconnect;
+
+      expect(mockEngine.initialize).not.toHaveBeenCalled();
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+    });
+
+    // FAILED is left out of the boot reset and auto-start, so the session would stay down after a routine restart.
+    it('does not mark a session FAILED when shutdown destroys its engine mid-initialize', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      let rejectInit: (error: Error) => void = () => undefined;
+      mockEngine.initialize.mockImplementationOnce(
+        () => new Promise<void>((_resolve, reject) => (rejectInit = reject)),
+      );
+      mockEngine.destroy.mockImplementationOnce(() => {
+        rejectInit(new Error('Target closed'));
+        return Promise.resolve();
+      });
+      const updateStatus = jest.spyOn(lifecycle, 'updateStatus');
+
+      const start = service.start('sess-uuid-1').catch((error: unknown) => error);
+      for (let i = 0; i < 50 && mockEngine.initialize.mock.calls.length === 0; i++) {
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      expect(mockEngine.initialize).toHaveBeenCalledTimes(1);
+      await service.onModuleDestroy();
+
+      // Answered as the shutdown it is, not as the adapter fault its destroy caused.
+      expect(await start).toBeInstanceOf(ServerShuttingDownException);
+      expect(updateStatus).not.toHaveBeenCalledWith('sess-uuid-1', SessionStatus.FAILED);
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+    });
+  });
+
+  // ── operator stop intent ──────────────────────────────────────────
+  describe('operator stop intent (desiredState)', () => {
+    const STOPPED = { desiredState: 'stopped' };
+    const updates = (): unknown[][] => (repository.update as jest.Mock).mock.calls as unknown[][];
+    const withOwnership = (over: Record<string, jest.Mock> = {}) => {
+      const ownership = {
+        claim: jest.fn().mockResolvedValue(true),
+        release: jest.fn().mockResolvedValue(undefined),
+        isHeldByOtherNode: jest.fn().mockResolvedValue(false),
+        ...over,
+      };
+      Object.assign(service as unknown as Record<string, unknown>, { ownership });
+      return ownership;
+    };
+
+    beforeEach(() => {
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      jest.spyOn(lifecycle, 'isEngineActive').mockReturnValue(false);
+    });
+
+    it('stop() records the stop before tearing down', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      await service.start('sess-uuid-1');
+
+      await service.stop('sess-uuid-1');
+
+      const at = updates().findIndex(([, patch]) => (patch as { desiredState?: unknown }).desiredState === 'stopped');
+      expect(at).toBeGreaterThanOrEqual(0);
+      expect((repository.update as jest.Mock).mock.invocationCallOrder[at]).toBeLessThan(
+        mockEngine.disconnect.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('stop() keeps the record on the 502 SESSION_STOP_INCOMPLETE path', async () => {
+      jest.spyOn(lifecycle, 'stop').mockImplementation(async (_id, hooks) => {
+        await hooks?.afterRead?.();
+        throw new BadGatewayException({ code: 'SESSION_STOP_INCOMPLETE' });
+      });
+
+      await expect(service.stop('sess-uuid-1')).rejects.toBeInstanceOf(BadGatewayException);
+
+      expect(repository.update).toHaveBeenCalledWith('sess-uuid-1', STOPPED);
+    });
+
+    it('stop() refused because a live peer holds the session records nothing', async () => {
+      withOwnership({ isHeldByOtherNode: jest.fn().mockResolvedValue(true) });
+
+      await expect(service.stop('sess-uuid-1')).rejects.toBeInstanceOf(ConflictException);
+
+      expect(updates()).not.toContainEqual(['sess-uuid-1', STOPPED]);
+    });
+
+    it('stop() whose record write fails takes nothing down and leaves no stop mark behind', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      await service.start('sess-uuid-1');
+      (repository.update as jest.Mock).mockRejectedValueOnce(new Error('db down'));
+
+      await expect(service.stop('sess-uuid-1')).rejects.toThrow('db down');
+
+      expect(mockEngine.disconnect).not.toHaveBeenCalled();
+      expect(mockEngine.forceDestroy).not.toHaveBeenCalled();
+      expect((lifecycle as unknown as { stoppingSessions: Set<string> }).stoppingSessions.has('sess-uuid-1')).toBe(
+        false,
+      );
+      expect((service as unknown as { stopRequests: Map<string, number> }).stopRequests.has('sess-uuid-1')).toBe(false);
+    });
+
+    it('forceKill() records the stop before the teardown; a "not started" refusal does not', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      await expect(service.forceKill('sess-uuid-1')).rejects.toBeInstanceOf(BadRequestException);
+      expect(updates()).not.toContainEqual(['sess-uuid-1', STOPPED]);
+
+      await service.start('sess-uuid-1');
+      await service.forceKill('sess-uuid-1');
+
+      const at = updates().findIndex(([, patch]) => (patch as { desiredState?: unknown }).desiredState === 'stopped');
+      expect(at).toBeGreaterThanOrEqual(0);
+      expect((repository.update as jest.Mock).mock.invocationCallOrder[at]).toBeLessThan(
+        mockEngine.forceDestroy.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('forceKill() still kills, resolves and hands the claim back when the record write fails', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      await service.start('sess-uuid-1');
+      const ownership = withOwnership();
+      (repository.update as jest.Mock).mockImplementation((_id: unknown, patch: { desiredState?: unknown }) =>
+        patch.desiredState === 'stopped' ? Promise.reject(new Error('db busy')) : Promise.resolve({ affected: 1 }),
+      );
+      const logError = jest.spyOn((lifecycle as unknown as { logger: { error: jest.Mock } }).logger, 'error');
+
+      await expect(service.forceKill('sess-uuid-1')).resolves.toBeDefined();
+
+      expect(mockEngine.forceDestroy).toHaveBeenCalled();
+      expect(ownership.release).toHaveBeenCalledWith('sess-uuid-1');
+      expect(logError).toHaveBeenCalledWith(
+        expect.any(String),
+        'db busy',
+        expect.objectContaining({ action: 'force_kill_keep_down_failed' }),
+      );
+    });
+
+    it('only an explicit start clears the record, after a successful claim and before the launch', async () => {
+      const ownership = withOwnership();
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ desiredState: 'stopped' }));
+      const clear = JSON.stringify([{ id: 'sess-uuid-1', desiredState: 'stopped' }, { desiredState: null }]);
+      const clearAt = () => updates().findIndex(call => JSON.stringify(call) === clear);
+
+      await expect(service.start('sess-uuid-1')).rejects.toBeInstanceOf(SessionStoppedException);
+      expect(clearAt()).toBe(-1);
+
+      await service.start('sess-uuid-1', { explicit: true });
+      const cleared = (repository.update as jest.Mock).mock.invocationCallOrder[clearAt()];
+      expect(ownership.claim.mock.invocationCallOrder[1]).toBeLessThan(cleared);
+      expect(cleared).toBeLessThan((engineFactory.create as jest.Mock).mock.invocationCallOrder[0]);
+    });
+
+    // Auto-start and takeover read their candidate rows once and launch them seconds apart, so a
+    // stop can land between that read and this row's turn.
+    it('a non-explicit start refuses a row stopped after the caller read it, and hands the claim back', async () => {
+      const ownership = withOwnership();
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ desiredState: 'stopped' }));
+
+      await expect(service.start('sess-uuid-1')).rejects.toBeInstanceOf(SessionStoppedException);
+
+      expect(engineFactory.create).not.toHaveBeenCalled();
+      expect(ownership.release).toHaveBeenCalledWith('sess-uuid-1');
+    });
+
+    it('an explicit start refused by a live peer clears nothing', async () => {
+      withOwnership({ claim: jest.fn().mockResolvedValue(false) });
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+
+      await expect(service.start('sess-uuid-1', { explicit: true })).rejects.toBeInstanceOf(ConflictException);
+
+      expect(repository.update).not.toHaveBeenCalled();
+    });
+
+    it('boot auto-start only selects rows nobody stopped', async () => {
+      process.env.AUTO_START_SESSIONS = 'true';
+      (repository.find as jest.Mock).mockResolvedValue([]);
+      try {
+        withOwnership({ claimableWhere: jest.fn().mockReturnValue([{ nodeId: IsNull() }, { nodeId: 'node-a' }]) });
+        Object.assign((service as unknown as { ownership: object }).ownership, {
+          onLeaseLoss: jest.fn(),
+          setEngineLiveness: jest.fn(),
+          startHeartbeat: jest.fn(),
+          stopHeartbeat: jest.fn(),
+          releaseAll: jest.fn().mockResolvedValue(undefined),
+        });
+        service.onApplicationBootstrap();
+        await (service as unknown as { autoStartRun: Promise<void> }).autoStartRun;
+
+        const [[{ where }]] = (repository.find as jest.Mock).mock.calls as [[{ where: Record<string, unknown>[] }]];
+        expect(where).toHaveLength(2);
+        for (const clause of where) {
+          expect(clause).toMatchObject({
+            phone: Not(IsNull()),
+            status: In([SessionStatus.DISCONNECTED, SessionStatus.HIBERNATED]),
+            desiredState: IsNull(),
+          });
+        }
+      } finally {
+        delete process.env.AUTO_START_SESSIONS;
+        await service.onModuleDestroy();
+      }
+    });
+
+    describe('against a real database', () => {
+      let db: DataSource;
+      let sessions: Repository<Session>;
+
+      beforeAll(async () => {
+        db = new DataSource({ type: 'better-sqlite3', database: ':memory:', entities: [Session], synchronize: true });
+        await db.initialize();
+        sessions = db.getRepository(Session);
+      });
+
+      afterAll(async () => {
+        await db.destroy();
+      });
+
+      it('a stopped session is not auto-started on the next boot until an explicit start', async () => {
+        const linked = { status: SessionStatus.DISCONNECTED, phone: '628111', config: {} };
+        const stopped = await sessions.save(sessions.create({ name: 'stopped', ...linked }));
+        const crashed = await sessions.save(sessions.create({ name: 'crashed', ...linked }));
+        (repository.find as jest.Mock).mockImplementation((opts: Parameters<Repository<Session>['find']>[0]) =>
+          sessions.find(opts),
+        );
+        (repository.update as jest.Mock).mockImplementation((...args: Parameters<Repository<Session>['update']>) =>
+          sessions.update(...args),
+        );
+        jest.spyOn(lifecycle, 'stop').mockImplementation(async (_id, hooks) => {
+          await hooks?.afterRead?.();
+          return createMockSession();
+        });
+        const engineStart = jest.spyOn(lifecycle, 'start').mockResolvedValue(createMockSession());
+
+        await service.stop(stopped.id);
+
+        process.env.AUTO_START_SESSIONS = 'true';
+        const startSpy = jest.spyOn(service, 'start');
+        try {
+          service.onApplicationBootstrap();
+          await (service as unknown as { autoStartRun: Promise<void> }).autoStartRun;
+          expect(startSpy.mock.calls.map(([id]) => id)).toEqual([crashed.id]);
+
+          engineStart.mockRestore();
+          (repository.findOne as jest.Mock).mockImplementation((opts: Parameters<Repository<Session>['findOne']>[0]) =>
+            sessions.findOne(opts),
+          );
+          await service.start(stopped.id, { explicit: true });
+          expect((await sessions.findOneByOrFail({ id: stopped.id })).desiredState).toBeNull();
+        } finally {
+          delete process.env.AUTO_START_SESSIONS;
+          await service.onModuleDestroy();
+        }
+      });
+
+      // A refusal (another start holds the reservation, the credential-teardown fence) means the
+      // start did not happen, so the operator's stop must survive it. A launch that fails midway
+      // still counts as the start the operator asked for.
+      it('an explicit start refused before launching keeps the stop; one that failed launching clears it', async () => {
+        const stopped = await sessions.save(
+          sessions.create({
+            name: 'refused',
+            status: SessionStatus.DISCONNECTED,
+            phone: '628222',
+            config: {},
+            desiredState: 'stopped',
+          }),
+        );
+        (repository.findOne as jest.Mock).mockImplementation((opts: Parameters<Repository<Session>['findOne']>[0]) =>
+          sessions.findOne(opts),
+        );
+        (repository.update as jest.Mock).mockImplementation((...args: Parameters<Repository<Session>['update']>) =>
+          sessions.update(...args),
+        );
+        const desired = async () => (await sessions.findOneByOrFail({ id: stopped.id })).desiredState;
+
+        const reserved = (lifecycle as unknown as { initializingSessions: Set<string> }).initializingSessions;
+        reserved.add(stopped.id);
+        await expect(service.start(stopped.id, { explicit: true })).rejects.toThrow('Session is already starting');
+        reserved.delete(stopped.id);
+        expect(await desired()).toBe('stopped');
+
+        const fences = (lifecycle as unknown as { fences: { awaitPendingTeardown(name: string): Promise<void> } })
+          .fences;
+        const fenced = new ConflictException('Session credentials are still being removed; retry shortly');
+        jest.spyOn(fences, 'awaitPendingTeardown').mockRejectedValueOnce(fenced);
+        await expect(service.start(stopped.id, { explicit: true })).rejects.toBe(fenced);
+        expect(await desired()).toBe('stopped');
+
+        mockEngine.initialize.mockRejectedValueOnce(new GatewayTimeoutException('authentication timed out'));
+        await expect(service.start(stopped.id, { explicit: true })).rejects.toBeInstanceOf(GatewayTimeoutException);
+        expect(await desired()).toBeNull();
+      });
+
+      // A stop keeps the engine registered until its teardown ends, so a start sent meanwhile is
+      // refused as "already started" by the engine that is going down, not by one it launched.
+      it('an explicit start refused while a stop tears the engine down keeps the stop', async () => {
+        const running = await sessions.save(
+          sessions.create({ name: 'stopping', status: SessionStatus.DISCONNECTED, phone: '628333', config: {} }),
+        );
+        (repository.findOne as jest.Mock).mockImplementation((opts: Parameters<Repository<Session>['findOne']>[0]) =>
+          sessions.findOne(opts),
+        );
+        (repository.update as jest.Mock).mockImplementation((...args: Parameters<Repository<Session>['update']>) =>
+          sessions.update(...args),
+        );
+        await service.start(running.id);
+        let refused: unknown;
+        mockEngine.disconnect.mockImplementationOnce(async () => {
+          refused = await service.start(running.id, { explicit: true }).catch((error: unknown) => error);
+        });
+
+        await service.stop(running.id);
+
+        expect(refused).toBeInstanceOf(BadRequestException);
+        expect((refused as Error).message).toBe('Session is already started');
+        expect((await sessions.findOneByOrFail({ id: running.id })).desiredState).toBe('stopped');
+      });
+
+      // A stop that finishes while a start waits at the credential-teardown fence finds no engine to
+      // take down, and the start drops its mark once past the fence. The start must yield to it.
+      it('a start yields to a stop that finished while it waited at the teardown fence', async () => {
+        const idle = await sessions.save(
+          sessions.create({ name: 'fenced', status: SessionStatus.DISCONNECTED, phone: '628666', config: {} }),
+        );
+        (repository.findOne as jest.Mock).mockImplementation((opts: Parameters<Repository<Session>['findOne']>[0]) =>
+          sessions.findOne(opts),
+        );
+        (repository.update as jest.Mock).mockImplementation((...args: Parameters<Repository<Session>['update']>) =>
+          sessions.update(...args),
+        );
+        const fences = (lifecycle as unknown as { fences: { awaitPendingTeardown(name: string): Promise<void> } })
+          .fences;
+        const stopping = (lifecycle as unknown as { stoppingSessions: Set<string> }).stoppingSessions;
+
+        for (const explicit of [false, true]) {
+          await sessions.update(idle.id, { desiredState: null });
+          let waiting!: () => void;
+          let settle!: () => void;
+          const atFence = new Promise<void>(resolve => (waiting = resolve));
+          jest.spyOn(fences, 'awaitPendingTeardown').mockImplementationOnce(() => {
+            waiting();
+            return new Promise<void>(resolve => (settle = resolve));
+          });
+
+          const start = service.start(idle.id, { explicit });
+          await atFence;
+          await service.stop(idle.id);
+          settle();
+
+          await expect(start).rejects.toBeInstanceOf(SessionStoppedException);
+          expect(engineFactory.create).not.toHaveBeenCalled();
+          expect(stopping.has(idle.id)).toBe(true);
+          expect((await sessions.findOneByOrFail({ id: idle.id })).desiredState).toBe('stopped');
+        }
+      });
+
+      // The stop's own write is a no-op on a row already marked stopped, so the start's clear that
+      // lands after it erased the stop, and the next boot relaunched a session left down by a stop.
+      it('a stop that finishes just before an explicit start clears the record keeps the session down', async () => {
+        const stopped = await sessions.save(
+          sessions.create({
+            name: 'cleared-late',
+            status: SessionStatus.DISCONNECTED,
+            phone: '628777',
+            config: {},
+            desiredState: 'stopped',
+          }),
+        );
+        (repository.findOne as jest.Mock).mockImplementation((opts: Parameters<Repository<Session>['findOne']>[0]) =>
+          sessions.findOne(opts),
+        );
+        let stopResult: Promise<unknown> | undefined;
+        (repository.update as jest.Mock).mockImplementation(
+          async (...args: Parameters<Repository<Session>['update']>) => {
+            const patch = args[1] as { desiredState?: unknown };
+            if (!stopResult && patch.desiredState === null) {
+              stopResult = service.stop(stopped.id);
+              await stopResult;
+            }
+            return sessions.update(...args);
+          },
+        );
+
+        await service.start(stopped.id, { explicit: true });
+
+        await expect(stopResult).resolves.toBeDefined();
+        expect(lifecycle.isEngineActive(stopped.id)).toBe(false);
+        expect((await sessions.findOneByOrFail({ id: stopped.id })).desiredState).toBe('stopped');
+      });
+
+      // The start that holds the reservation already cleared the stop; the refused one must not
+      // bring it back over the session that start is launching.
+      it('an explicit start refused by another explicit start leaves the stop cleared', async () => {
+        const stopped = await sessions.save(
+          sessions.create({
+            name: 'racing',
+            status: SessionStatus.DISCONNECTED,
+            phone: '628555',
+            config: {},
+            desiredState: 'stopped',
+          }),
+        );
+        (repository.findOne as jest.Mock).mockImplementation((opts: Parameters<Repository<Session>['findOne']>[0]) =>
+          sessions.findOne(opts),
+        );
+        (repository.update as jest.Mock).mockImplementation((...args: Parameters<Repository<Session>['update']>) =>
+          sessions.update(...args),
+        );
+        const desired = async () => (await sessions.findOneByOrFail({ id: stopped.id })).desiredState;
+        let reached!: () => void;
+        let finish!: () => void;
+        const launching = new Promise<void>(resolve => (reached = resolve));
+        mockEngine.initialize.mockImplementationOnce(() => {
+          reached();
+          return new Promise<void>(resolve => (finish = resolve));
+        });
+
+        const first = service.start(stopped.id, { explicit: true });
+        await launching;
+        expect(await desired()).toBeNull();
+
+        await expect(service.start(stopped.id, { explicit: true })).rejects.toThrow('Session is already starting');
+        expect(await desired()).toBeNull();
+
+        finish();
+        await first;
+        expect(await desired()).toBeNull();
+      });
+
+      // The kill records its stop before the teardown, so a POST /start that lands after the eviction
+      // (here, while the kill writes DISCONNECTED) clears it and the new engine stays marked to run.
+      it('a force-kill leaves an explicit start sent after the eviction marked to run', async () => {
+        const running = await sessions.save(
+          sessions.create({ name: 'killed', status: SessionStatus.DISCONNECTED, phone: '628444', config: {} }),
+        );
+        (repository.findOne as jest.Mock).mockImplementation((opts: Parameters<Repository<Session>['findOne']>[0]) =>
+          sessions.findOne(opts),
+        );
+        (repository.update as jest.Mock).mockImplementation((...args: Parameters<Repository<Session>['update']>) =>
+          sessions.update(...args),
+        );
+        const desired = async () => (await sessions.findOneByOrFail({ id: running.id })).desiredState;
+        await service.start(running.id);
+        const updateStatus = jest.spyOn(
+          lifecycle as unknown as { updateStatus(id: string, status: SessionStatus): Promise<void> },
+          'updateStatus',
+        );
+        updateStatus.mockImplementationOnce(async id => {
+          await service.start(id, { explicit: true });
+        });
+
+        await service.forceKill(running.id);
+        expect(engineFactory.create).toHaveBeenCalledTimes(2);
+        expect(await desired()).toBeNull();
+
+        // A kill with nothing launched after it records the stop.
+        await service.forceKill(running.id);
+        expect(await desired()).toBe('stopped');
+      });
     });
   });
 
@@ -7256,10 +9640,129 @@ describe('SessionService', () => {
       }
     });
 
+    // Each start past the cap is refused anyway; launching on would only log one failure per row.
+    it('stops at MAX_CONCURRENT_SESSIONS and leaves the remaining sessions alone', async () => {
+      process.env.AUTO_START_SESSIONS = 'true';
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | number =>
+        key === 'sessions.maxConcurrent' ? 1 : (def as T),
+      );
+      (repository.find as jest.Mock).mockResolvedValue([
+        { id: 'a', name: 'A' },
+        { id: 'b', name: 'B' },
+      ]);
+      const slots = jest.spyOn(lifecycle, 'startSlotHolders').mockReturnValue(new Set());
+      const startSpy = jest.spyOn(service, 'start').mockImplementation((id: string) => {
+        slots.mockReturnValue(new Set([id]));
+        return Promise.resolve(undefined as never);
+      });
+      const logger = (service as unknown as { logger: { error: jest.Mock } }).logger;
+      const logError = jest.spyOn(logger, 'error');
+
+      jest.useFakeTimers();
+      try {
+        service.onApplicationBootstrap();
+        await jest.advanceTimersByTimeAsync(AUTOSTART_THROTTLE_MS);
+        await autoStartRun();
+
+        expect(startSpy).toHaveBeenCalledTimes(1);
+        expect(startSpy).toHaveBeenCalledWith('a');
+        expect(logError).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('reports a session stopped after the scan as skipped, not as a failed start', async () => {
+      process.env.AUTO_START_SESSIONS = 'true';
+      (repository.find as jest.Mock).mockResolvedValue([{ id: 'a', name: 'A' }]);
+      jest.spyOn(service, 'start').mockRejectedValueOnce(new SessionStoppedException('Session a was stopped'));
+      const logger = (service as unknown as { logger: { log: jest.Mock; error: jest.Mock } }).logger;
+      const logError = jest.spyOn(logger, 'error');
+      const logInfo = jest.spyOn(logger, 'log');
+
+      service.onApplicationBootstrap();
+      await autoStartRun();
+
+      expect(logError).not.toHaveBeenCalled();
+      expect(logInfo).toHaveBeenCalledWith(
+        'Auto-start skipped for session A: stopped by an operator',
+        expect.objectContaining({ action: 'auto_start_skipped' }),
+      );
+    });
+
+    it('reports a launch refused by shutdown as abandoned, not as a failed start', async () => {
+      process.env.AUTO_START_SESSIONS = 'true';
+      (repository.find as jest.Mock).mockResolvedValue([{ id: 'a', name: 'A' }]);
+      jest.spyOn(service, 'start').mockImplementationOnce(() => {
+        (service as unknown as { shuttingDown: boolean }).shuttingDown = true;
+        return Promise.reject(new ServerShuttingDownException());
+      });
+      const logger = (service as unknown as { logger: { log: jest.Mock; error: jest.Mock } }).logger;
+      const logError = jest.spyOn(logger, 'error');
+      const logInfo = jest.spyOn(logger, 'log');
+
+      service.onApplicationBootstrap();
+      await autoStartRun();
+
+      expect(logError).not.toHaveBeenCalled();
+      expect(logInfo).toHaveBeenCalledWith(
+        'Auto-start abandoned for session A: shutting down',
+        expect.objectContaining({ action: 'auto_start_aborted' }),
+      );
+    });
+
+    // onModuleDestroy awaits this loop, so the inter-launch throttle would only delay the exit.
+    it('ends the run without the inter-launch throttle once a launch is refused by shutdown', async () => {
+      process.env.AUTO_START_SESSIONS = 'true';
+      (repository.find as jest.Mock).mockResolvedValue([
+        { id: 'a', name: 'A' },
+        { id: 'b', name: 'B' },
+      ]);
+      const startSpy = jest.spyOn(service, 'start').mockImplementationOnce(() => {
+        (service as unknown as { shuttingDown: boolean }).shuttingDown = true;
+        return Promise.reject(new ServerShuttingDownException());
+      });
+
+      jest.useFakeTimers();
+      try {
+        service.onApplicationBootstrap();
+        let ended = false;
+        void autoStartRun().then(() => (ended = true));
+        await jest.advanceTimersByTimeAsync(AUTOSTART_THROTTLE_MS - 1);
+
+        expect(ended).toBe(true);
+        expect(startSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    // EngineTransportError is a 503 too; a real launch failure stays an error even during shutdown.
+    it('reports a transport failure that coincides with shutdown as a failed start', async () => {
+      process.env.AUTO_START_SESSIONS = 'true';
+      (repository.find as jest.Mock).mockResolvedValue([{ id: 'a', name: 'A' }]);
+      jest.spyOn(service, 'start').mockImplementationOnce(() => {
+        (service as unknown as { shuttingDown: boolean }).shuttingDown = true;
+        return Promise.reject(new EngineTransportError('Protocol error: Target closed'));
+      });
+      const logger = (service as unknown as { logger: { error: jest.Mock } }).logger;
+      const logError = jest.spyOn(logger, 'error');
+
+      service.onApplicationBootstrap();
+      await autoStartRun();
+
+      expect(logError).toHaveBeenCalledWith(
+        'Auto-start failed for session: A',
+        'Protocol error: Target closed',
+        expect.objectContaining({ action: 'auto_start_failed' }),
+      );
+    });
+
     // Nest binds the HTTP listener only after every bootstrap hook settles, and a launch is a
     // Chromium start bounded by resolveEngineInitTimeoutMs (>= 60s) with a 2s throttle between
-    // sessions. Awaiting the loop here kept the port CLOSED for that whole time, so every liveness
-    // probe in the window was a connection refusal — the chart's budget is ~50s.
+    // sessions. Awaiting the loop here kept the port CLOSED for that whole time, so every probe in
+    // the window was a connection refusal, and the chart's startupProbe budget
+    // (charts/openwa/templates/statefulset.yaml) is a fixed number of seconds.
     it('returns without waiting for a launch that has not finished', async () => {
       process.env.AUTO_START_SESSIONS = 'true';
       (repository.find as jest.Mock).mockResolvedValue([{ id: 'a', name: 'A' }]);
@@ -7302,6 +9805,29 @@ describe('SessionService', () => {
       }
     });
 
+    it('stops launching the rest once the shutdown drain begins mid-run', async () => {
+      process.env.AUTO_START_SESSIONS = 'true';
+      (repository.find as jest.Mock).mockResolvedValue([
+        { id: 'a', name: 'A' },
+        { id: 'b', name: 'B' },
+      ]);
+      const startSpy = jest.spyOn(service, 'start').mockImplementation(() => {
+        shutdown.markShuttingDown();
+        return Promise.resolve(undefined as never);
+      });
+
+      jest.useFakeTimers();
+      try {
+        service.onApplicationBootstrap();
+        await jest.advanceTimersByTimeAsync(AUTOSTART_THROTTLE_MS); // the inter-launch throttle
+        await autoStartRun();
+
+        expect(startSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     // The other half of detaching it: a SIGTERM during boot must not leave a browser being launched
     // behind, so the teardown waits for the one in flight rather than racing it.
     it('waits for a launch already in flight before completing shutdown', async () => {
@@ -7328,6 +9854,175 @@ describe('SessionService', () => {
       expect(blocked).toBe('blocked');
       releaseLaunch();
       await destroy;
+    });
+
+    /** An ownership stub for the auto-start run and shutdown; records what releaseAll was told to keep. */
+    const withAutoStartOwnership = () => {
+      const ownership = {
+        kept: [] as string[],
+        claimableWhere: jest.fn().mockReturnValue([{}]),
+        claim: jest.fn().mockResolvedValue(true),
+        release: jest.fn().mockResolvedValue(undefined),
+        isHeldByOtherNode: jest.fn().mockResolvedValue(false),
+        onLeaseLoss: jest.fn(),
+        setEngineLiveness: jest.fn(),
+        startHeartbeat: jest.fn(),
+        stopHeartbeat: jest.fn(),
+        releaseAll: jest.fn((keep: Iterable<string> = []) => {
+          ownership.kept = [...keep];
+          return Promise.resolve();
+        }),
+      };
+      Object.assign(service as unknown as Record<string, unknown>, { ownership });
+      return ownership;
+    };
+
+    // An init stalled on an unreachable WhatsApp Web settles only at its deadline (>= 60s), past
+    // the kill deadline; the destroy is what ends it, so it cannot wait behind the run.
+    it('destroys the engine of a launch in flight instead of waiting for its init to settle', async () => {
+      process.env.AUTO_START_SESSIONS = 'true';
+      const session = createMockSession();
+      (repository.find as jest.Mock).mockResolvedValue([session]);
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      const ownership = withAutoStartOwnership();
+      let resolveInit: () => void = () => undefined;
+      mockEngine.initialize.mockImplementationOnce(() => new Promise<void>(resolve => (resolveInit = resolve)));
+      // As the whatsapp-web.js adapter does: a teardown landing mid-init settles initialize() quietly.
+      mockEngine.destroy.mockImplementationOnce(() => {
+        resolveInit();
+        return Promise.resolve();
+      });
+      const logInfo = jest.spyOn((service as unknown as { logger: { log: jest.Mock } }).logger, 'log');
+      const flush = async (until: () => boolean): Promise<void> => {
+        for (let i = 0; i < 50 && !until(); i++) await new Promise(resolve => setImmediate(resolve));
+      };
+
+      service.onApplicationBootstrap();
+      await flush(() => mockEngine.initialize.mock.calls.length > 0);
+      expect(mockEngine.initialize).toHaveBeenCalledTimes(1);
+      const shutdown = service.onModuleDestroy();
+      await flush(() => mockEngine.destroy.mock.calls.length > 0);
+      const destroyedWhileLaunching = mockEngine.destroy.mock.calls.length;
+      // Stands in for the init deadline, so the shutdown completes either way.
+      resolveInit();
+      await shutdown;
+
+      expect(destroyedWhileLaunching).toBe(1);
+      expect(service.isActive(session.id)).toBe(false);
+      // The run handed its claim back before the shutdown went on to releaseAll.
+      expect(ownership.release).toHaveBeenCalledWith(session.id);
+      expect(ownership.release.mock.invocationCallOrder[0]).toBeLessThan(
+        ownership.releaseAll.mock.invocationCallOrder[0],
+      );
+      expect(ownership.kept).toEqual([]);
+      expect(logInfo).toHaveBeenCalledWith(
+        `Auto-start abandoned for session ${session.name}: shutting down`,
+        expect.objectContaining({ action: 'auto_start_aborted' }),
+      );
+      expect(logInfo).not.toHaveBeenCalledWith(`Auto-started session: ${session.name}`, expect.anything());
+    });
+
+    it('logs a launch whose engine shutdown destroyed during its last row read as abandoned', async () => {
+      process.env.AUTO_START_SESSIONS = 'true';
+      const session = createMockSession();
+      (repository.find as jest.Mock).mockResolvedValue([session]);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      withAutoStartOwnership();
+      let releaseRead: () => void = () => undefined;
+      let readHeld = false;
+      let readsAfterInit = 0;
+      // After initialize() the start reads the row twice: the retired check, then the row it answers
+      // with. The second is held, past every shutdown check of the start.
+      (repository.findOne as jest.Mock).mockImplementation(() => {
+        if (mockEngine.initialize.mock.calls.length === 0 || ++readsAfterInit < 2) return Promise.resolve(session);
+        readHeld = true;
+        return new Promise(resolve => (releaseRead = () => resolve(session)));
+      });
+      const logInfo = jest.spyOn((service as unknown as { logger: { log: jest.Mock } }).logger, 'log');
+      const flush = async (until: () => boolean): Promise<void> => {
+        for (let i = 0; i < 50 && !until(); i++) await new Promise(resolve => setImmediate(resolve));
+      };
+
+      service.onApplicationBootstrap();
+      await flush(() => readHeld);
+      expect(readHeld).toBe(true);
+      const shutdown = service.onModuleDestroy();
+      await flush(() => mockEngine.destroy.mock.calls.length > 0);
+      expect(mockEngine.destroy).toHaveBeenCalledTimes(1);
+      releaseRead();
+      await shutdown;
+
+      expect(service.isActive(session.id)).toBe(false);
+      expect(logInfo).toHaveBeenCalledWith(
+        `Auto-start abandoned for session ${session.name}: shutting down`,
+        expect.objectContaining({ action: 'auto_start_aborted' }),
+      );
+      expect(logInfo).not.toHaveBeenCalledWith(`Auto-started session: ${session.name}`, expect.anything());
+    });
+
+    // A whatsapp-web.js launch still starting Chromium has no browser for the destroy to close, so
+    // its init runs until whatsapp-web.js settles it, at worst to the init deadline (>= 60s);
+    // shutdown must not wait that out, and must not hand away the claim that browser may still use.
+    it('stops waiting for a launch the engine teardown did not end, keeping its claim', async () => {
+      process.env.AUTO_START_SESSIONS = 'true';
+      (repository.find as jest.Mock).mockResolvedValue([{ id: 'a', name: 'A' }]);
+      const ownership = withAutoStartOwnership();
+      let releaseLaunch: () => void = () => undefined;
+      let launchStarted: () => void = () => undefined;
+      const launching = new Promise<void>(resolve => (launchStarted = resolve));
+      // The real start() wraps this, so the launch holds its start reservation as a real one would.
+      jest
+        .spyOn(service as unknown as { claimAndStart: () => Promise<unknown> }, 'claimAndStart')
+        .mockImplementation(() => {
+          launchStarted();
+          return new Promise<never>(resolve => (releaseLaunch = () => resolve(undefined as never)));
+        });
+
+      jest.useFakeTimers();
+      try {
+        service.onApplicationBootstrap();
+        await launching;
+        let completed = false;
+        const destroy = service.onModuleDestroy().then(() => (completed = true));
+        await jest.advanceTimersByTimeAsync(AUTOSTART_SHUTDOWN_WAIT_MS - 1);
+        expect(completed).toBe(false);
+        await jest.advanceTimersByTimeAsync(1);
+
+        expect(completed).toBe(true);
+        await destroy;
+        expect(ownership.releaseAll).toHaveBeenCalledTimes(1);
+        expect(ownership.kept).toEqual(['a']);
+      } finally {
+        jest.useRealTimers();
+        releaseLaunch();
+        await autoStartRun();
+      }
+    });
+
+    it('ends the run without the inter-launch throttle when a launch fails during shutdown', async () => {
+      process.env.AUTO_START_SESSIONS = 'true';
+      (repository.find as jest.Mock).mockResolvedValue([
+        { id: 'a', name: 'A' },
+        { id: 'b', name: 'B' },
+      ]);
+      const startSpy = jest.spyOn(service, 'start').mockImplementationOnce(() => {
+        (service as unknown as { shuttingDown: boolean }).shuttingDown = true;
+        return Promise.reject(new Error('Target closed'));
+      });
+
+      jest.useFakeTimers();
+      try {
+        service.onApplicationBootstrap();
+        let ended = false;
+        void autoStartRun().then(() => (ended = true));
+        await jest.advanceTimersByTimeAsync(AUTOSTART_THROTTLE_MS - 1);
+
+        expect(ended).toBe(true);
+        expect(startSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        jest.useRealTimers();
+      }
     });
   });
 
@@ -7527,6 +10222,16 @@ describe('SessionService', () => {
 
     beforeEach(() => {
       (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      // updateConfig reads the raw column text; serve it from whatever row findOne is mocked to hold.
+      const raw = {
+        select: () => raw,
+        where: () => raw,
+        getRawOne: async () => {
+          const row = (await (repository.findOne as jest.Mock)()) as Session | null;
+          return row ? { config: JSON.stringify(row.config) } : undefined;
+        },
+      };
+      repository.createQueryBuilder = jest.fn().mockReturnValue(raw);
     });
 
     it('reports the documented defaults for a session that has never been configured', async () => {
@@ -7558,8 +10263,8 @@ describe('SessionService', () => {
 
       const result = await service.updateConfig('sess-uuid-1', { maxReconnectAttempts: null });
 
-      // Deleted outright rather than written as null: resolveReconnectConfig reads Number(null) as 0,
-      // so a stored null would mean "never reconnect" — the exact opposite of the default it restores.
+      // Deleted outright rather than written as null, so the stored row reads as the default it restores
+      // and never depends on how a reader interprets a stored null.
       expect(writtenConfig()).not.toHaveProperty('maxReconnectAttempts');
       expect(writtenConfig()).toEqual({ autoRejectCalls: true });
       expect(result.maxReconnectAttempts).toBeNull();

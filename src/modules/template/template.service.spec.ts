@@ -25,6 +25,7 @@ function createMockTemplate(overrides: Partial<Template> = {}): Template {
 describe('TemplateService', () => {
   let service: TemplateService;
   let repository: jest.Mocked<Partial<Repository<Template>>>;
+  let sessionRepository: { exists: jest.Mock };
 
   beforeEach(async () => {
     repository = {
@@ -35,8 +36,14 @@ describe('TemplateService', () => {
       remove: jest.fn().mockResolvedValue(undefined),
     };
 
+    sessionRepository = { exists: jest.fn().mockResolvedValue(true) };
+
     const module: TestingModule = await Test.createTestingModule({
-      providers: [TemplateService, { provide: getRepositoryToken(Template, 'data'), useValue: repository }],
+      providers: [
+        TemplateService,
+        { provide: getRepositoryToken(Template, 'data'), useValue: repository },
+        { provide: getRepositoryToken(Session, 'data'), useValue: sessionRepository },
+      ],
     }).compile();
 
     service = module.get<TemplateService>(TemplateService);
@@ -45,6 +52,16 @@ describe('TemplateService', () => {
   // ── create ────────────────────────────────────────────────────────
 
   describe('create', () => {
+    it('rejects a session that does not exist with 404 before touching the templates table', async () => {
+      sessionRepository.exists.mockResolvedValue(false);
+
+      await expect(service.create('ghost', { name: 'n', body: 'b' })).rejects.toThrow(
+        new NotFoundException("Session with id 'ghost' not found"),
+      );
+      expect(sessionRepository.exists).toHaveBeenCalledWith({ where: { id: 'ghost' } });
+      expect(repository.save).not.toHaveBeenCalled();
+    });
+
     it('should create a template with normalized null header/footer', async () => {
       await service.create('sess-1', { name: 'welcome', body: 'Hi {{name}}' });
 
@@ -139,6 +156,20 @@ describe('TemplateService', () => {
       (repository.findOne as jest.Mock).mockResolvedValue(null);
 
       await expect(service.resolve('sess-1', { templateName: 'nope' })).rejects.toThrow(NotFoundException);
+    });
+
+    // PostgreSQL refuses a NUL in a bound text parameter, so the query would fail as a 500. No stored
+    // name can hold one (the write DTOs refuse it), so the lookup answers 404 without querying.
+    it('should throw NotFoundException for a name containing NUL without querying', async () => {
+      await expect(service.resolve('sess-1', { templateName: 'promo\u0000' })).rejects.toThrow(NotFoundException);
+      expect(repository.findOne).not.toHaveBeenCalled();
+    });
+
+    // Ids are server-generated uuids, so none holds a NUL; the id lookup answers 404 the same way.
+    it('should throw NotFoundException for an id containing NUL without querying', async () => {
+      await expect(service.resolve('sess-1', { templateId: 'abc\u0000' })).rejects.toThrow(NotFoundException);
+      await expect(service.findOne('sess-1', 'abc\u0000')).rejects.toThrow(NotFoundException);
+      expect(repository.findOne).not.toHaveBeenCalled();
     });
 
     // A malformed request, not a missing resource: a client reading 404 as "template deleted" would

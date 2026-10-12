@@ -39,6 +39,7 @@ function createMockSession(overrides: Partial<Session> = {}): Session {
     nodeId: null,
     claimedAt: null,
     leaseExpiresAt: null,
+    desiredState: null,
     nodeUrl: null,
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -77,6 +78,7 @@ describe('SessionService logout() name-scoped teardown fence', () => {
     repository = {
       findOne: jest.fn().mockResolvedValue(createMockSession()),
       update: jest.fn().mockResolvedValue({ affected: 1 }),
+      exists: jest.fn().mockResolvedValue(false),
     };
     const messageRepository = { find: jest.fn().mockResolvedValue([]) };
     const manager = { delete: jest.fn().mockResolvedValue({ affected: 1 }), remove: jest.fn() };

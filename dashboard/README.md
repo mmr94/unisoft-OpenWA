@@ -32,8 +32,8 @@ Modern web dashboard for managing OpenWA WhatsApp API Gateway sessions, webhooks
 
 ### Prerequisites
 
-- Node.js 20+
-- npm or yarn
+- Node.js 22.22.2+ or 24.15+ (jsdom, used by the unit tests, requires it)
+- npm (the lockfile and the `overrides` security pins are npm-specific)
 
 ### Development
 
@@ -90,7 +90,7 @@ For a **split-origin** deployment (dashboard hosted separately from the API), se
 
 ```bash
 VITE_API_URL=http://localhost:2785
-# real-time events (WebSocket) origin; defaults to the page origin
+# real-time events (WebSocket) origin; defaults to VITE_API_URL, else the page origin
 VITE_WS_URL=http://localhost:2785
 ```
 

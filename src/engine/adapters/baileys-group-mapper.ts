@@ -25,13 +25,19 @@ function preferPhoneDialect(jid: string, phoneTwin: string | undefined, normaliz
   return normalizeJid(phoneTwin ?? jid);
 }
 
-function isSelfAdmin(metadata: GroupMetadata, selfJid: string, normalizeJid: NormalizeJid): boolean {
+/** The account's own participant row, or undefined when no row can be identified as the account. */
+export function findSelfParticipant(
+  metadata: GroupMetadata,
+  selfJid: string,
+  normalizeJid: NormalizeJid,
+): GroupMetadata['participants'][number] | undefined {
   const self = userPart(normalizeJid(selfJid));
-  return metadata.participants.some(
-    p =>
-      userPart(preferPhoneDialect(p.id, p.phoneNumber, normalizeJid)) === self &&
-      (p.admin === 'admin' || p.admin === 'superadmin'),
-  );
+  return metadata.participants.find(p => userPart(preferPhoneDialect(p.id, p.phoneNumber, normalizeJid)) === self);
+}
+
+function isSelfAdmin(metadata: GroupMetadata, selfJid: string, normalizeJid: NormalizeJid): boolean {
+  const admin = findSelfParticipant(metadata, selfJid, normalizeJid)?.admin;
+  return admin === 'admin' || admin === 'superadmin';
 }
 
 /** Map a Baileys GroupMetadata to the neutral summary {@link Group}. `selfJid` flags whether WE are an admin. */
@@ -73,9 +79,9 @@ export function mapBaileysGroupInfo(
     createdAt: metadata.creation,
     participants,
     // WhatsApp "announce" = only admins can post. isAnnounce reports the group SETTING; isReadOnly
-    // reports what it means for THIS account, which is the question whatsapp-web.js answers with WA
-    // Web's own per-account flag. Copying announce into both told an admin of an announce-only group
-    // that they could not post, in the one field a client uses to disable its composer.
+    // reports what it means for THIS account. Copying announce into both told an admin of an
+    // announce-only group that they could not post, in the one field a client uses to disable its
+    // composer.
     isAnnounce: metadata.announce,
     isReadOnly: selfJid
       ? Boolean(metadata.announce) && !isSelfAdmin(metadata, selfJid, normalizeJid)

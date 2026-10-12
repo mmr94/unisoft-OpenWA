@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { Trans, useTranslation } from 'react-i18next';
 import {
   Database,
@@ -13,7 +14,7 @@ import {
   Download,
   Upload,
 } from 'lucide-react';
-import { API_BASE_URL } from '../services/api';
+import { API_BASE_URL, type SavedConfig } from '../services/api';
 import { copyToClipboard } from '../utils/clipboard';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { useInfraStatusQuery, useInfraConfigQuery, useEnginesQuery, useCurrentEngineQuery } from '../hooks/queries';
@@ -41,13 +42,20 @@ export function Infrastructure() {
   const { t } = useTranslation();
   useDocumentTitle(t('infrastructure.title'));
   const toast = useToast();
-  const { data: infraStatus, isLoading: loading, isError: statusError } = useInfraStatusQuery();
-  const { data: savedConfig } = useInfraConfigQuery();
+  const { data: infraStatus, isLoading: loading } = useInfraStatusQuery();
+  const { data: savedConfig, isLoading: configLoading } = useInfraConfigQuery();
   const { data: engines = [] } = useEnginesQuery();
   const { data: currentEngineData } = useCurrentEngineQuery();
   const currentEngine = currentEngineData?.engineType ?? '';
 
   const configForm = useInfraConfigForm(infraStatus, savedConfig);
+  const queryClient = useQueryClient();
+  // The saved config as the page first read it. A save refetches the saved config (so the pending-restart
+  // notes see it), but until a restart the database still running is the one read here.
+  const loadedConfig = useRef<SavedConfig | undefined>(undefined);
+  useEffect(() => {
+    if (savedConfig && !loadedConfig.current) loadedConfig.current = savedConfig;
+  }, [savedConfig]);
   const restartFlow = useRestartFlow();
   const dataBackup = useDataBackup();
 
@@ -61,14 +69,16 @@ export function Infrastructure() {
       // empty-database / orphaned-media data move before it happens. A switch is: changing type;
       // flipping built-in↔external (different physical backend); OR retargeting an external Postgres
       // to a different host/port/database (also a different, empty DB). Host/port/db aren't all in
-      // /status, so compare the edited form against the still-cached saved config.
+      // /status, so compare the edited form against the saved config as the page loaded it. A key with
+      // nothing saved reads '', and runs on the same fallback the form was seeded with.
+      const loaded = loadedConfig.current;
       const dbExternalRetarget =
         configForm.dbConfig.type === 'postgres' &&
         !configForm.dbConfig.builtIn &&
-        !!savedConfig &&
-        (configForm.dbConfig.host !== savedConfig.database.host ||
-          configForm.dbConfig.port !== savedConfig.database.port ||
-          configForm.dbConfig.database !== savedConfig.database.database);
+        !!loaded &&
+        (configForm.dbConfig.host !== (loaded.database.host || infraStatus?.database.host || 'localhost') ||
+          configForm.dbConfig.port !== (loaded.database.port || '5432') ||
+          configForm.dbConfig.database !== (loaded.database.database || 'openwa'));
       const dbSwitch =
         !!infraStatus &&
         (configForm.dbConfig.type !== infraStatus.database.type ||
@@ -81,7 +91,16 @@ export function Infrastructure() {
         !!infraStatus &&
         (configForm.storageConfig.type !== infraStatus.storage.type ||
           (configForm.storageConfig.type === 's3' && configForm.storageConfig.builtIn !== infraStatus.storage.builtIn));
-      restartFlow.open({ profiles, dbSwitch, storageSwitch });
+      // The built-in containers running now, so the restart stops each one the new config dropped. With no
+      // status read there is nothing to go on, and nothing is stopped.
+      const running = [
+        infraStatus?.database.type === 'postgres' && infraStatus.database.builtIn && 'postgres',
+        infraStatus?.redis.builtIn && 'redis',
+        infraStatus?.storage.type === 's3' && infraStatus.storage.builtIn && 'minio',
+      ].filter((p): p is string => typeof p === 'string');
+      restartFlow.open({ profiles, running, dbSwitch, storageSwitch });
+      // The form is seeded once, so the refetch keeps any edit in progress.
+      void queryClient.invalidateQueries({ queryKey: ['infra', 'config'] });
     },
   });
 
@@ -98,7 +117,39 @@ export function Infrastructure() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [infraStatus]);
 
-  if (loading) {
+  // Data backup / restore, used to carry data across a database switch (#488). It reads and writes the
+  // running database only, so it is offered even when the saved config could not be read.
+  const dataBackupRow = (
+    <div className="data-migration-row">
+      <div>
+        <strong>{t('infrastructure.migration.backupTitle')}</strong>
+        <small>{t('infrastructure.migration.backupHint')}</small>
+      </div>
+      <div className="data-migration-actions">
+        <button className="btn-secondary btn-sm" onClick={dataBackup.exportBackup} disabled={dataBackup.migrating}>
+          {dataBackup.migrating ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+          {t('infrastructure.migration.export')}
+        </button>
+        <label className="btn-secondary btn-sm" style={{ cursor: dataBackup.migrating ? 'default' : 'pointer' }}>
+          <Upload size={14} />
+          {t('infrastructure.migration.import')}
+          <input
+            type="file"
+            accept="application/json,.json"
+            className="hidden-file-input"
+            disabled={dataBackup.migrating}
+            onChange={e => {
+              const file = e.target.files?.[0];
+              if (file) void dataBackup.importBackup(file);
+              e.target.value = '';
+            }}
+          />
+        </label>
+      </div>
+    </div>
+  );
+
+  if (loading || configLoading) {
     return (
       <div className="infrastructure-page infra-loading">
         <Loader2 className="animate-spin" size={32} />
@@ -108,18 +159,26 @@ export function Infrastructure() {
 
   // If the live infrastructure status can't be loaded, do NOT render the editable form: it would seed
   // from component defaults (sqlite/local/built-in:false) and a Save could flip a running backend to
-  // external+empty. Show an error + retry instead. (#488 review)
-  if (statusError || !infraStatus) {
+  // external+empty. Show an error + retry instead. (#488)
+  // Likewise without the saved config: the database, storage and engine detail fields hydrate only
+  // from it, and a Save sends every one of them.
+  // Keyed on missing data, not on the query's error flag: a failed background refetch keeps the last
+  // good data, and replacing the page then would unmount the form and a restart already in progress.
+  if (!infraStatus || !savedConfig) {
+    const configOnly = !!infraStatus;
     return (
       <div className="infrastructure-page">
         <PageHeader title={t('infrastructure.title')} subtitle={t('infrastructure.subtitle')} />
         <div className="infra-card status-error-card">
           <AlertTriangle size={32} className="status-error-icon" />
-          <p className="status-error-text">{t('infrastructure.statusLoadError')}</p>
+          <p className="status-error-text">
+            {t(configOnly ? 'infrastructure.configLoadError' : 'infrastructure.statusLoadError')}
+          </p>
           <button className="btn-secondary status-error-retry" onClick={() => window.location.reload()}>
             {t('common.retry')}
           </button>
         </div>
+        {configOnly && <section className="infra-card">{dataBackupRow}</section>}
       </div>
     );
   }
@@ -130,18 +189,18 @@ export function Infrastructure() {
   //   - the value WAS saved and the server has not been restarted yet — a restart applies it.
   // Both look identical as "running differs from saved", which is why drift alone used to be reported
   // as an environment pin even on a stock stack with no variable set anywhere (#1082).
+  // Pin-only: PUPPETEER_ARGS cannot go through settingNote, because the running list is re-tokenized and
+  // gains the pinned `--lang` flag, so it never string-compares equal to the saved value. The headless
+  // flag and the two paths do have a running and a saved value, but show only a reported pin as well.
+  const pinNote = (envKey: string) =>
+    infraStatus?.envPinned?.includes(envKey) ? (
+      <p className="env-pin-note">
+        <AlertTriangle size={14} /> {t('infrastructure.envPinNote', { name: envKey })}
+      </p>
+    ) : null;
   const settingNote = (envKey: string, running: unknown, saved: unknown) => {
-    if (infraStatus?.envPinned?.includes(envKey)) {
-      return (
-        <p className="env-pin-note">
-          <AlertTriangle size={14} /> {t('infrastructure.envPinNote', { name: envKey })}
-        </p>
-      );
-    }
-    // Suppressed only while the request is actually in flight. `saving` is that flag; `savePending` is
-    // a latch set once a save SUCCEEDS and cleared only by a restart's page reload, so gating on it
-    // hid this note for the whole life of the page from the first successful save — which is exactly
-    // the state it exists to report, and exactly what the operator who chose "Restart Later" is in.
+    if (infraStatus?.envPinned?.includes(envKey)) return pinNote(envKey);
+    // Hidden only while the save request is in flight (`configSave.saving`).
     const pendingRestart = !configSave.saving && !!infraStatus && !!savedConfig && running !== saved;
     return pendingRestart ? (
       <p className="env-pin-note">
@@ -149,6 +208,19 @@ export function Infrastructure() {
       </p>
     ) : null;
   };
+
+  // Built-in services the restart failed to start or stop. Shown whether or not the server came back:
+  // a service that failed to start is the likeliest reason it did not.
+  const restartWarningBox = restartFlow.restartWarnings.length > 0 && (
+    <div className="migration-warning" role="alert">
+      <AlertTriangle size={18} />
+      <div>
+        {restartFlow.restartWarnings.map((warning, index) => (
+          <p key={index}>{warning}</p>
+        ))}
+      </div>
+    </div>
+  );
 
   return (
     <div className="infrastructure-page">
@@ -335,38 +407,7 @@ export function Infrastructure() {
             <p className="muted-hint">{t('infrastructure.database.migrationsHint')}</p>
           </div>
 
-          {/* Data backup / restore — used to carry data across a database switch (#488). */}
-          <div className="data-migration-row">
-            <div>
-              <strong>{t('infrastructure.migration.backupTitle')}</strong>
-              <small>{t('infrastructure.migration.backupHint')}</small>
-            </div>
-            <div className="data-migration-actions">
-              <button
-                className="btn-secondary btn-sm"
-                onClick={dataBackup.exportBackup}
-                disabled={dataBackup.migrating}
-              >
-                {dataBackup.migrating ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-                {t('infrastructure.migration.export')}
-              </button>
-              <label className="btn-secondary btn-sm" style={{ cursor: dataBackup.migrating ? 'default' : 'pointer' }}>
-                <Upload size={14} />
-                {t('infrastructure.migration.import')}
-                <input
-                  type="file"
-                  accept="application/json,.json"
-                  className="hidden-file-input"
-                  disabled={dataBackup.migrating}
-                  onChange={e => {
-                    const file = e.target.files?.[0];
-                    if (file) void dataBackup.importBackup(file);
-                    e.target.value = '';
-                  }}
-                />
-              </label>
-            </div>
-          </div>
+          {dataBackupRow}
         </section>
 
         {/* Engine */}
@@ -405,7 +446,8 @@ export function Infrastructure() {
             ))}
           </div>
 
-          {/* The actual WhatsApp Web build in use — distinct from the library version above (#488). */}
+          {/* The WhatsApp Web build sessions request as their pin, distinct from the library version above (#488).
+              A page can still run another build; each session logs the one it runs at ready. */}
           {infraStatus?.engine.webVersion !== undefined && (
             <p className="engine-web-version">
               {t('infrastructure.engine.webVersion')}:{' '}
@@ -436,6 +478,7 @@ export function Infrastructure() {
                   <span className="toggle-slider"></span>
                 </label>
               </div>
+              {pinNote('PUPPETEER_HEADLESS')}
               <div className="form-group">
                 <label htmlFor="infra-8">{t('infrastructure.engine.sessionDataPath')}</label>
                 <input
@@ -444,6 +487,7 @@ export function Infrastructure() {
                   value={configForm.engineConfig.sessionDataPath}
                   onChange={e => configForm.updateEngineConfig('sessionDataPath', e.target.value)}
                 />
+                {pinNote('SESSION_DATA_PATH')}
               </div>
               <div className="form-group">
                 <label htmlFor="infra-9">{t('infrastructure.engine.browserArgs')}</label>
@@ -452,8 +496,9 @@ export function Infrastructure() {
                   type="text"
                   value={configForm.engineConfig.browserArgs}
                   onChange={e => configForm.updateEngineConfig('browserArgs', e.target.value)}
-                  placeholder="--no-sandbox --disable-gpu"
+                  placeholder="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu"
                 />
+                {pinNote('PUPPETEER_ARGS')}
               </div>
             </div>
           ) : (
@@ -655,7 +700,7 @@ export function Infrastructure() {
                     ? s3Unreachable
                       ? t('infrastructure.storage.s3Unreachable')
                       : 'S3'
-                    : 'Local'}
+                    : t('infrastructure.storage.local')}
                 </span>
               );
             })()}
@@ -697,6 +742,7 @@ export function Infrastructure() {
                   value={configForm.storageConfig.localPath}
                   onChange={e => configForm.updateStorageConfig('localPath', e.target.value)}
                 />
+                {pinNote('STORAGE_LOCAL_PATH')}
               </div>
             )}
 
@@ -786,7 +832,8 @@ export function Infrastructure() {
             <>
               {restartFlow.restartStatus === 'idle' && t('infrastructure.restart.idleTitle')}
               {restartFlow.restartStatus === 'restarting' && t('infrastructure.restart.restartingTitle')}
-              {restartFlow.restartStatus === 'waiting' && t('infrastructure.restart.waitingTitle')}
+              {(restartFlow.restartStatus === 'waiting' || restartFlow.restartStatus === 'unknown') &&
+                t('infrastructure.restart.waitingTitle')}
               {restartFlow.restartStatus === 'success' && t('infrastructure.restart.successTitle')}
               {restartFlow.restartStatus === 'error' && t('infrastructure.restart.errorTitle')}
             </>
@@ -847,7 +894,7 @@ export function Infrastructure() {
                   style={{
                     width:
                       restartFlow.restartCountdown > 0
-                        ? `${((30 - restartFlow.restartCountdown) / 30) * 100}%`
+                        ? `${((restartFlow.restartTotal - restartFlow.restartCountdown) / restartFlow.restartTotal) * 100}%`
                         : '100%',
                   }}
                 />
@@ -859,13 +906,32 @@ export function Infrastructure() {
           {restartFlow.restartStatus === 'success' && (
             <>
               <CheckCircle size={48} className="restart-status-icon" />
-              <p className="restart-success-msg">{t('infrastructure.restart.successMsg')}</p>
+              {restartFlow.restartWarnings.length === 0 ? (
+                <p className="restart-success-msg">{t('infrastructure.restart.successMsg')}</p>
+              ) : (
+                <>
+                  {restartWarningBox}
+                  <button className="btn-primary" onClick={() => window.location.reload()}>
+                    {t('infrastructure.restart.reload')}
+                  </button>
+                </>
+              )}
+            </>
+          )}
+
+          {restartFlow.restartStatus === 'unknown' && (
+            <>
+              <p className="restart-error-msg">{t('infrastructure.restart.outcomeUnknown')}</p>
+              <button className="btn-primary" onClick={() => window.location.reload()}>
+                {t('infrastructure.restart.reload')}
+              </button>
             </>
           )}
 
           {restartFlow.restartStatus === 'error' && (
             <>
-              <p className="restart-error-msg">{t('infrastructure.restart.errorMsg')}</p>
+              <p className="restart-error-msg">{restartFlow.restartError ?? t('infrastructure.restart.errorMsg')}</p>
+              {restartWarningBox}
               <button className="btn-primary" onClick={() => window.location.reload()}>
                 {t('infrastructure.restart.reload')}
               </button>

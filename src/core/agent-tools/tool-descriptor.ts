@@ -1,6 +1,7 @@
 import type { z } from 'zod';
 import type { ApiKey } from '../../modules/auth/entities/api-key.entity';
 import type { ApiKeyRole } from '../../modules/auth/entities/api-key.entity';
+import type { ChatScopeService } from '../../modules/auth/chat-scope.service';
 
 /** A single agent-invocable capability. Protocol-neutral: no MCP types here. */
 export interface ToolDescriptor<I = unknown> {
@@ -11,7 +12,7 @@ export interface ToolDescriptor<I = unknown> {
   /** Input contract: validates the call AND is advertised to the agent. */
   inputSchema: z.ZodType<I>;
   tier: 'read' | 'write';
-  /** True for irreversible/dangerous ops (none are exposed in v1). */
+  /** True for irreversible or state-overwriting ops; surfaced to MCP clients as destructiveHint. */
   destructive?: boolean;
   /** Safe to repeat without additional effect. Defaults to (tier === 'read'). */
   idempotent?: boolean;
@@ -19,10 +20,14 @@ export interface ToolDescriptor<I = unknown> {
   requiredRole?: ApiKeyRole;
   /** If true, input MUST carry `sessionId`, checked against the key's allowedSessions. */
   sessionScoped?: boolean;
+  /** Allowed chat input fields, a filtered list, or a chat-independent operation. Unmarked tools deny restricted keys. */
+  chatScope?: readonly string[] | 'filtered' | 'agnostic';
+  /** The quote resolves within the authorized chat, as it does on the REST reply route. */
+  chatQuotedAllowed?: boolean;
   /** Result rendering hint for the MCP adapter. Default 'smart'. */
   resultDisposition?: 'json' | 'smart';
   /** Calls the service. Receives validated input + the resolved, scoped key. */
-  handler: (input: I, apiKey: ApiKey) => Promise<unknown>;
+  handler: (input: I, apiKey: ApiKey, chatScope?: ChatScopeService) => Promise<unknown>;
 }
 
 /**
@@ -39,7 +44,7 @@ export interface ToolDescriptor<I = unknown> {
  */
 export type AnyToolDescriptor = Omit<ToolDescriptor, 'inputSchema' | 'handler'> & {
   inputSchema: z.ZodType;
-  handler: (input: never, apiKey: ApiKey) => Promise<unknown>;
+  handler: (input: never, apiKey: ApiKey, chatScope?: ChatScopeService) => Promise<unknown>;
 };
 
 /**

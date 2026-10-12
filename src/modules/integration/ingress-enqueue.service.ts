@@ -1,22 +1,24 @@
 import { Injectable, OnApplicationBootstrap, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectQueue } from '@nestjs/bullmq';
-import { Queue } from 'bullmq';
+import { JobState, Queue } from 'bullmq';
 import { createHash } from 'crypto';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
 import { IngressJobData } from '../queue/processors/ingress.processor';
 import { IntegrationDeliveryFailure } from './entities/integration-delivery-failure.entity';
 import { QUEUE_NAMES } from '../queue/queue-names';
+import { producerReady } from '../queue/redis-connection';
 import { createLogger } from '../../common/services/logger.service';
 import { resolveNonNegativeIntEnv } from '../../config/configuration';
 
 /**
  * Outcome of an enqueue attempt. 'queued' = handed to BullMQ; 'dispatched' = delivered inline; 'failed'
- * = inline dispatch threw and was swallowed (`error` carries the message). enqueue() never throws, so
- * callers use the outcome (not exceptions) to decide durability follow-up: a LIVE ingress delivery must
- * persist a dead-letter row on 'failed' (see buildIngressDeadLetterRow, wired at the IngressService
- * factory) so RedriveService can replay it; RedriveService itself calls enqueue() directly, because a
- * failed replay must keep its EXISTING dead-letter row redrivable rather than write a second one.
+ * = inline dispatch threw and was swallowed (`error` carries the message). enqueue() does not throw
+ * (bar an aborted `signal`, see enqueue), so callers use the outcome (not exceptions) to decide
+ * durability follow-up: a LIVE ingress delivery must persist a dead-letter row on 'failed' (see
+ * buildIngressDeadLetterRow, wired at the IngressService factory) so RedriveService can replay it;
+ * RedriveService itself calls enqueue() directly, because a failed replay must keep its EXISTING
+ * dead-letter row redrivable rather than write a second one.
  */
 export type EnqueueOutcome = { outcome: 'queued' | 'dispatched' | 'failed'; error?: string };
 
@@ -29,9 +31,8 @@ export type EnqueueOutcome = { outcome: 'queued' | 'dispatched' | 'failed'; erro
  * INGRESS_RETRY_DELAY_MS); an invalid value falls back to the default.
  */
 export function resolveIngressJobOptions(): { attempts: number; backoff: { type: 'exponential'; delay: number } } {
-  const attempts = Number(process.env.INGRESS_MAX_ATTEMPTS);
   return {
-    attempts: Number.isInteger(attempts) && attempts >= 1 ? attempts : 3,
+    attempts: resolveNonNegativeIntEnv(process.env.INGRESS_MAX_ATTEMPTS, 0) || 3,
     backoff: { type: 'exponential', delay: resolveNonNegativeIntEnv(process.env.INGRESS_RETRY_DELAY_MS, 5000) },
   };
 }
@@ -43,27 +44,40 @@ export function resolveIngressJobOptions(): { attempts: number; backoff: { type:
  * '0:'-prefixed id ("JobId cannot be '0' or start with '0:'"). Providers send numeric dedup headers
  * (`svix-Id: 12345`), and the redrive path mints `redrive:<uuid>`, so these refusals happen in
  * practice, and because enqueue()'s catch-all treats ANY add() throw as "Redis unreachable", the job
- * silently degraded to inline dispatch with no retry, no backoff, and a blocked redrive loop. Map the
- * refused shapes to a deterministic sha256 prefix: BullMQ's exactly-once dedup only needs the id
- * STABLE per delivery, not recognizable, and the reconciler replays through this same function so
- * its dedup against an earlier enqueue is preserved.
+ * silently degraded to inline dispatch with no retry, no backoff, and a blocked redrive loop. Every id
+ * therefore maps to a deterministic sha256 prefix, which BullMQ always accepts: its exactly-once dedup
+ * only needs the id STABLE per delivery, not recognizable, and the reconciler replays through this
+ * same function so its dedup against an earlier enqueue is preserved.
  *
- * The hash input is namespaced with the plugin/instance pair. BullMQ dedups jobIds across the WHOLE
- * shared ingress queue, while the database dedup is (pluginId, instanceId, providerDeliveryId), and
- * numeric provider ids are exactly the short, per-account sequence style that two instances of one
- * provider can share. Without the namespace, the second instance's delivery would collide with the
- * first's job id and BullMQ would silently discard it (resolved as the existing job, no DLQ row);
- * with it, the queue-level dedup matches the database-level scope. A non-string id (a duplicated
- * header can surface as string[]) is coerced rather than trusted to reach BullMQ's own checks.
+ * The hash input is namespaced with the plugin/instance pair, for EVERY id rather than only the
+ * refused shapes. BullMQ dedups jobIds across the WHOLE shared ingress queue, while the database dedup
+ * is (pluginId, instanceId, providerDeliveryId), and two instances can share a provider id: numeric
+ * per-account sequences, or one Standard Webhooks message fanned out to two endpoints with the same
+ * `webhook-id`. Without the namespace, the second instance's delivery would collide with the first's
+ * job id and BullMQ would silently discard it (resolved as the existing job, no DLQ row); with it, the
+ * queue-level dedup matches the database-level scope. A non-string id (a duplicated header can surface
+ * as string[]) is coerced rather than trusted to reach BullMQ's own checks.
  */
 export function sanitizeIngressJobId(jobId: string, namespace = ''): string {
   const raw = typeof jobId === 'string' ? jobId : String(jobId);
-  const looksInteger = `${parseInt(raw, 10)}` === raw;
-  const badColon = raw.includes(':') && raw.split(':').length !== 3;
-  const zeroPrefixed = raw === '0' || raw.startsWith('0:');
-  if (!looksInteger && !badColon && !zeroPrefixed) return raw;
   return `ing-${createHash('sha256').update(`${namespace}\u0000${raw}`).digest('hex').slice(0, 40)}`;
 }
+
+function queueJobId(data: IngressJobData, jobId: string): string {
+  return sanitizeIngressJobId(jobId, `${data.pluginId}\u0000${data.instanceId}`);
+}
+
+/**
+ * The two ids IngressProcessor re-queues a delivery under when its dead-letter row cannot be written.
+ * A copy that fails the same way re-queues under the other one, so the ids stay fixed and a live copy
+ * can be looked up by id instead of being mistaken for a dead-lettered delivery.
+ */
+export function requeuedJobIds(baseJobId: string): [string, string] {
+  return [`${baseJobId}-requeued-1`, `${baseJobId}-requeued-2`];
+}
+
+// A job in one of these states still owns the delivery, or already delivered it.
+const isLiveOrCompleted = (state: JobState | 'unknown'): state is JobState => state !== 'failed' && state !== 'unknown';
 
 /**
  * Build the dead-letter row for an ingress delivery whose inline-dispatch fallback failed. The shape
@@ -124,7 +138,46 @@ export class IngressEnqueueService implements OnApplicationBootstrap {
     }
   }
 
-  async enqueue(data: IngressJobData, jobId: string): Promise<EnqueueOutcome> {
+  /**
+   * State of the job an earlier enqueue() of this delivery left in the queue, or undefined when the
+   * queue is off, holds no such job, or cannot answer. add() resolves for a duplicate jobId whatever
+   * state the existing job is in, so a caller replaying under the original jobId must look first: a
+   * retained failed job (removeOnFail keeps it for a day) would silently swallow the replay. When that
+   * job failed or is gone, a live or completed re-queued copy (see requeuedJobIds) answers for it: the
+   * copy owns the delivery, so neither a replay nor a dead-letter row may stand in for it.
+   */
+  async existingJobState(data: IngressJobData, jobId: string): Promise<JobState | undefined> {
+    if (!this.config.get<boolean>('queue.enabled', false) || !this.ingressQueue) return undefined;
+    try {
+      await producerReady(this.ingressQueue);
+      const id = queueJobId(data, jobId);
+      const state = await this.ingressQueue.getJobState(id);
+      if (isLiveOrCompleted(state)) return state;
+      for (const copyId of requeuedJobIds(id)) {
+        const copyState = await this.ingressQueue.getJobState(copyId);
+        if (isLiveOrCompleted(copyState)) return copyState;
+      }
+      return state === 'unknown' ? undefined : state;
+    } catch (err) {
+      // Redis unreachable or not yet connected: enqueue() then takes its own inline fallback, as it would
+      // without the probe.
+      this.logger.warn('Ingress job state lookup failed', {
+        pluginId: data.pluginId,
+        instanceId: data.instanceId,
+        deliveryId: data.deliveryId,
+        error: err instanceof Error ? err.message : String(err),
+        action: 'ingress_job_state_lookup_failed',
+      });
+      return undefined;
+    }
+  }
+
+  /**
+   * `signal` lets a caller that stops at shutdown (the reconciler) refuse the inline fallback once it
+   * has aborted: a queue add that fails after the stop rethrows the abort reason instead of
+   * dispatching, since the plugin may already be torn down. That is the only way enqueue() throws.
+   */
+  async enqueue(data: IngressJobData, jobId: string, signal?: AbortSignal): Promise<EnqueueOutcome> {
     const queueEnabled = this.config.get<boolean>('queue.enabled', false);
     const useQueue = queueEnabled && !!this.ingressQueue;
 
@@ -134,16 +187,19 @@ export class IngressEnqueueService implements OnApplicationBootstrap {
         // exponential-backoff attempts so a transient failure retries before landing in the DLQ. The id
         // is sanitized because BullMQ refuses several id shapes at add() (see sanitizeIngressJobId),
         // which would otherwise read as a Redis failure here and fall through to inline dispatch.
+        await producerReady(this.ingressQueue);
         await this.ingressQueue.add('ingress', data, {
-          jobId: sanitizeIngressJobId(jobId, `${data.pluginId}\u0000${data.instanceId}`),
+          jobId: queueJobId(data, jobId),
           ...resolveIngressJobOptions(),
         });
         return { outcome: 'queued' };
       } catch (err) {
         // Redis unreachable (enableOfflineQueue:false makes add() reject) — fall through to inline
-        // dispatch. Without this, the already-persisted event would be lost forever: the throw would
-        // 500 the ingress request, the provider retries, dedup returns "duplicate", and no job was
-        // ever enqueued (no DLQ row either). Mirrors WebhookService's queue-add fallback.
+        // dispatch (before the first connect, producerReady rejects instead). Without this, the
+        // already-persisted event would be lost forever: the throw would 500 the ingress request, the
+        // provider retries, dedup returns "duplicate", and no job was ever enqueued (no DLQ row either).
+        // Mirrors WebhookService's queue-add fallback.
+        signal?.throwIfAborted();
         this.logger.error(
           'Ingress queue add failed; dispatching inline',
           err instanceof Error ? err.message : String(err),

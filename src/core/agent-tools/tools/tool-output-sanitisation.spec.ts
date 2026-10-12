@@ -2,7 +2,7 @@
  * Tests for tool output sanitisation.
  * Each test documents a data-leak or schema bug that was present before the fix.
  */
-import { BadRequestException, HttpException, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, HttpException, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { invokeTool } from '../tool-invoker';
 import { webhookTools } from './webhook.tools';
 import { sessionTools } from './session.tools';
@@ -126,7 +126,7 @@ describe('FIX 2: session tools strip config + proxyUrl', () => {
   it('SessionFindOne output has no config or proxyUrl keys', async () => {
     const sessionSvc = {
       findOne: jest.fn().mockResolvedValue(entity),
-      isActive: jest.fn().mockReturnValue(false),
+      engineLoaded: jest.fn().mockReturnValue(false),
     } as unknown as SessionService;
 
     const tool = sessionTools(sessionSvc).find(t => t.name === 'SessionFindOne')!;
@@ -141,7 +141,7 @@ describe('FIX 2: session tools strip config + proxyUrl', () => {
   it('SessionFindAll output items have no config or proxyUrl keys', async () => {
     const sessionSvc = {
       findAll: jest.fn().mockResolvedValue([entity]),
-      isActive: jest.fn().mockReturnValue(false),
+      engineLoaded: jest.fn().mockReturnValue(false),
     } as unknown as SessionService;
 
     const tool = sessionTools(sessionSvc).find(t => t.name === 'SessionFindAll')!;
@@ -162,7 +162,7 @@ describe('FIX 5: empty sessionId is rejected at validation', () => {
   it('a sessionScoped tool rejects sessionId: "" with BadRequestException', async () => {
     const sessionSvc = {
       findOne: jest.fn().mockResolvedValue(stubSessionEntity()),
-      isActive: jest.fn().mockReturnValue(false),
+      engineLoaded: jest.fn().mockReturnValue(false),
     } as unknown as SessionService;
 
     const tool = sessionTools(sessionSvc).find(t => t.name === 'SessionFindOne')!;
@@ -245,10 +245,11 @@ describe('FIX 7: handleToolError exposes structured BadRequestException detail',
   });
 
   it('NotFoundException with a plain string stays as that string', () => {
-    const err = new BadRequestException('Session x not found');
+    const err = new NotFoundException('Session x not found');
     const result = handleToolError(err);
     const content = (result.content[0] as { type: string; text: string }).text;
-    const payload = JSON.parse(content) as { message: unknown };
+    const payload = JSON.parse(content) as { name: unknown; message: unknown };
+    expect(payload.name).toBe('NotFoundException');
     expect(payload.message).toBe('Session x not found');
   });
 
